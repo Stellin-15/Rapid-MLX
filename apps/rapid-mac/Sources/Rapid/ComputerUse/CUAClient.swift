@@ -7,11 +7,68 @@ struct CUAPlannerOption: Codable, Equatable, Identifiable, Sendable {
     var url: String
     var textOnly: Bool
     var note: String
+    var hasApiKey: Bool
+    var userCreated: Bool
 
     var id: String { name }
 
     var displayName: String {
         "\(name) — \(model)"
+    }
+
+    init(
+        name: String,
+        model: String,
+        url: String,
+        textOnly: Bool,
+        note: String = "",
+        hasApiKey: Bool = false,
+        userCreated: Bool = false
+    ) {
+        self.name = name
+        self.model = model
+        self.url = url
+        self.textOnly = textOnly
+        self.note = note
+        self.hasApiKey = hasApiKey
+        self.userCreated = userCreated
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        model = try container.decode(String.self, forKey: .model)
+        url = try container.decode(String.self, forKey: .url)
+        textOnly = try container.decodeIfPresent(Bool.self, forKey: .textOnly) ?? false
+        note = try container.decodeIfPresent(String.self, forKey: .note) ?? ""
+        // Tolerate older sidecars that predate the settings feature.
+        hasApiKey = try container.decodeIfPresent(Bool.self, forKey: .hasApiKey) ?? false
+        userCreated = try container.decodeIfPresent(Bool.self, forKey: .userCreated) ?? false
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case name, model, url, note
+        case textOnly = "text_only"
+        case hasApiKey = "has_api_key"
+        case userCreated = "user_created"
+    }
+}
+
+/// Body for `POST /v1/cua/planners` (user adds a cloud brain in settings).
+/// Supplying apiKey is the user's consent to send task data to that endpoint.
+struct CUAPlannerCreateRequest: Codable, Equatable, Sendable {
+    var name: String
+    var url: String
+    var model: String
+    var apiKey: String?
+    var reasoningEffort: String?
+    var textOnly: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case name, url, model
+        case apiKey = "api_key"
+        case reasoningEffort = "reasoning_effort"
+        case textOnly = "text_only"
     }
 }
 
@@ -123,6 +180,21 @@ struct CUAClient: CUAAPI, Sendable {
     func planners() async throws -> [CUAPlannerOption] {
         let (data, response) = try await send(path: "/v1/cua/planners", method: "GET")
         return try decode([CUAPlannerOption].self, from: data, response: response)
+    }
+
+    func addPlanner(_ request: CUAPlannerCreateRequest) async throws {
+        let body = try JSONEncoder().encode(request)
+        let (data, response) = try await send(
+            path: "/v1/cua/planners", method: "POST", body: body
+        )
+        try requireSuccess(data, response)
+    }
+
+    func deletePlanner(name: String) async throws {
+        let (data, response) = try await send(
+            path: "/v1/cua/planners/\(name)", method: "DELETE"
+        )
+        try requireSuccess(data, response)
     }
 
     func create(_ request: CUARunRequest) async throws -> String {
