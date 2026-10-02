@@ -10,8 +10,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from vllm_mlx.output_collector import RequestOutputCollector
-from vllm_mlx.runtime.model_performance import (
+from rapid_mlx.output_collector import RequestOutputCollector
+from rapid_mlx.runtime.model_performance import (
     MODEL_LEDGER_REGISTRY_LIMIT,
     RETIRED_MODEL_SNAPSHOT_LIMIT,
     SEEN_REQUEST_ID_LIMIT,
@@ -19,14 +19,14 @@ from vllm_mlx.runtime.model_performance import (
 )
 
 if TYPE_CHECKING:
-    from vllm_mlx.request import Request
-    from vllm_mlx.scheduler import Scheduler
+    from rapid_mlx.request import Request
+    from rapid_mlx.scheduler import Scheduler
 
 
 def _scheduler() -> Scheduler:
     pytest.importorskip("mlx")
 
-    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+    from rapid_mlx.scheduler import Scheduler, SchedulerConfig
 
     tokenizer = MagicMock()
     tokenizer.encode = lambda text: list(range(len(text.split())))
@@ -42,7 +42,7 @@ def _scheduler() -> Scheduler:
 
 
 def _running_request(scheduler: Scheduler, request_id: str) -> Request:
-    from vllm_mlx.request import Request, RequestStatus, SamplingParams
+    from rapid_mlx.request import Request, RequestStatus, SamplingParams
 
     request = Request(
         request_id,
@@ -349,7 +349,7 @@ def test_scheduler_records_explicit_cancellation_once():
 
 
 def test_waiting_cancellation_records_no_unprocessed_prompt_tokens():
-    from vllm_mlx.request import Request, SamplingParams
+    from rapid_mlx.request import Request, SamplingParams
 
     scheduler = _scheduler()
     request = Request("waiting", "queued prompt", SamplingParams(max_tokens=8))
@@ -367,7 +367,7 @@ def test_waiting_cancellation_records_no_unprocessed_prompt_tokens():
 def test_mllm_waiting_cancellation_records_zero_prompt_tokens():
     pytest.importorskip("mlx")
 
-    from vllm_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+    from rapid_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
 
     processor = MagicMock()
     processor.tokenizer = MagicMock()
@@ -390,8 +390,8 @@ def test_mllm_waiting_cancellation_records_zero_prompt_tokens():
 def test_mllm_reset_accounts_waiting_and_running_requests():
     pytest.importorskip("mlx")
 
-    from vllm_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
-    from vllm_mlx.request import RequestStatus
+    from rapid_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+    from rapid_mlx.request import RequestStatus
 
     processor = MagicMock()
     processor.tokenizer = MagicMock()
@@ -460,12 +460,12 @@ def test_scheduler_records_generation_recovery_failures():
 def test_mllm_global_failure_does_not_charge_queued_prompt_tokens():
     pytest.importorskip("mlx")
 
-    from vllm_mlx.mllm_scheduler import (
+    from rapid_mlx.mllm_scheduler import (
         MLLMRequest,
         MLLMScheduler,
         MLLMSchedulerConfig,
     )
-    from vllm_mlx.request import RequestStatus
+    from rapid_mlx.request import RequestStatus
 
     processor = MagicMock()
     processor.tokenizer = MagicMock()
@@ -492,11 +492,129 @@ def test_mllm_global_failure_does_not_charge_queued_prompt_tokens():
     assert performance.prompt_tokens == 5
 
 
+def _make_mllm_scheduler_for_abort():
+    """Minimal MLLMScheduler with one running + one waiting request.
+
+    Mirrors ``test_mllm_global_failure_does_not_charge_queued_prompt_tokens``
+    so ``_fail_all_inflight`` can be driven without a real engine or model.
+    """
+    from rapid_mlx.mllm_scheduler import (
+        MLLMRequest,
+        MLLMScheduler,
+        MLLMSchedulerConfig,
+    )
+    from rapid_mlx.request import RequestStatus
+
+    processor = MagicMock()
+    processor.tokenizer = MagicMock()
+    scheduler = MLLMScheduler(
+        MagicMock(),
+        processor,
+        MLLMSchedulerConfig(),
+        model_name="model-under-test",
+    )
+    running = MLLMRequest(request_id="running", prompt="started")
+    running.status = RequestStatus.RUNNING
+    running.num_prompt_tokens = 5
+    waiting = MLLMRequest(request_id="waiting", prompt="not started")
+    waiting.num_prompt_tokens = 7
+    scheduler.requests = {running.request_id: running, waiting.request_id: waiting}
+    scheduler.running = {running.request_id: running}
+    scheduler.waiting.append(waiting)
+    return scheduler
+
+
+def test_mllm_fail_all_inflight_stamps_classified_abort_code_on_outputs():
+    """#3564: ``_fail_all_inflight`` must classify the underlying failure into
+    a stable, client-safe ``error_kind`` code (OOM vs generic transient) while
+    it still holds the real exception — that code is the ONLY signal that
+    crosses to the route + GUI. A Metal allocation failure must stamp
+    ``insufficient_memory``; an unrelated engine crash must stamp
+    ``engine_aborted``. Neither may leak the raw exception text as the code."""
+    pytest.importorskip("mlx")
+
+    from rapid_mlx.request import (
+        ENGINE_ABORT_CODE_ENGINE_ABORTED,
+        ENGINE_ABORT_CODE_INSUFFICIENT_MEMORY,
+    )
+
+    # Metal's command-buffer OOM status is one collapsed camel-cased token.
+    scheduler = _make_mllm_scheduler_for_abort()
+    output = scheduler._fail_all_inflight(
+        RuntimeError("kIOGPUCommandBufferCallbackErrorOutOfMemory")
+    )
+    assert output.finished_request_ids == {"running", "waiting"}
+    assert output.outputs, "expected per-request outputs to classify"
+    assert all(
+        ro.error_kind == ENGINE_ABORT_CODE_INSUFFICIENT_MEMORY for ro in output.outputs
+    )
+
+    # A generic engine-loop crash is NOT memory-related → transient code.
+    scheduler = _make_mllm_scheduler_for_abort()
+    output = scheduler._fail_all_inflight(
+        RuntimeError("Metal command buffer execution failed")
+    )
+    assert all(
+        ro.error_kind == ENGINE_ABORT_CODE_ENGINE_ABORTED for ro in output.outputs
+    )
+    # The stable code, never the raw text, is what rides on error_kind.
+    assert all(ro.error is not None for ro in output.outputs)
+
+    # #3564 (codex NIT): the raw exception can hold paths, prompt fragments,
+    # or model internals. Neither the client-facing ``error`` message nor the
+    # ``error_kind`` code may carry any of it — only the fixed, curated
+    # per-category text/slug is allowed to cross the trust boundary.
+    secret = "/Users/secret/prompt-and-model-internals.safetensors"
+    scheduler = _make_mllm_scheduler_for_abort()
+    output = scheduler._fail_all_inflight(
+        RuntimeError(f"kIOGPUCommandBufferCallbackErrorOutOfMemory {secret}")
+    )
+    for ro in output.outputs:
+        assert secret not in (ro.error or "")
+        assert secret not in (ro.error_kind or "")
+        assert ro.error_kind == ENGINE_ABORT_CODE_INSUFFICIENT_MEMORY
+
+
+@pytest.mark.asyncio
+async def test_mllm_stream_outputs_raises_faithful_abort_for_classified_code():
+    """#3564: an errored ``RequestOutput`` whose ``error_kind`` is a classified
+    engine-abort code must surface from ``stream_outputs`` as an
+    ``InferenceAbortedError`` carrying that code (not a bare ``ValueError``),
+    so the route can render a structured, faithful 503 instead of a generic
+    500. This exercises the dispatch branch added alongside ``lifecycle``."""
+    pytest.importorskip("mlx")
+
+    import asyncio as _asyncio
+
+    from rapid_mlx.request import (
+        ENGINE_ABORT_CODE_INSUFFICIENT_MEMORY,
+        InferenceAbortedError,
+        RequestOutput,
+    )
+
+    scheduler = _make_mllm_scheduler_for_abort()
+    scheduler.output_queues["running"] = _asyncio.Queue()
+    scheduler.output_queues["running"].put_nowait(
+        RequestOutput(
+            request_id="running",
+            error="MLLM inference was interrupted by a transient engine error; "
+            "retry the request",
+            error_kind=ENGINE_ABORT_CODE_INSUFFICIENT_MEMORY,
+        )
+    )
+
+    with pytest.raises(InferenceAbortedError) as excinfo:
+        async for _ in scheduler.stream_outputs("running"):
+            pass
+
+    assert excinfo.value.error_kind == ENGINE_ABORT_CODE_INSUFFICIENT_MEMORY
+
+
 @pytest.mark.asyncio
 async def test_engine_loop_records_pending_failures():
     pytest.importorskip("mlx")
 
-    from vllm_mlx.engine_core import EngineConfig, EngineCore
+    from rapid_mlx.engine_core import EngineConfig, EngineCore
 
     engine = EngineCore(
         MagicMock(), MagicMock(), EngineConfig(model_name="model-under-test")
@@ -560,7 +678,7 @@ async def test_engine_loop_records_pending_failures():
 async def test_engine_loop_does_not_count_failure_before_scheduler_admission():
     pytest.importorskip("mlx")
 
-    from vllm_mlx.engine_core import EngineConfig, EngineCore
+    from rapid_mlx.engine_core import EngineConfig, EngineCore
 
     engine = EngineCore(
         MagicMock(), MagicMock(), EngineConfig(model_name="model-under-test")
@@ -613,9 +731,9 @@ def test_metrics_renders_model_performance_series():
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
-    from vllm_mlx.config import reset_config
-    from vllm_mlx.routes.metrics import _reset_accumulator_for_tests, router
-    from vllm_mlx.runtime.model_performance import get_model_performance_ledger
+    from rapid_mlx.config import reset_config
+    from rapid_mlx.routes.metrics import _reset_accumulator_for_tests, router
+    from rapid_mlx.runtime.model_performance import get_model_performance_ledger
 
     ledger = get_model_performance_ledger("gemma-4-12b")
     ledger.record_success(
@@ -695,7 +813,7 @@ def test_metrics_renders_model_performance_series():
 
 
 def test_model_performance_renderer_ignores_missing_or_malformed_payload():
-    from vllm_mlx.routes.metrics import _render_model_performance
+    from rapid_mlx.routes.metrics import _render_model_performance
 
     assert _render_model_performance({}) == []
     assert _render_model_performance({"model_performance": "malformed"}) == []
@@ -707,9 +825,9 @@ def test_metrics_preserves_unseen_events_across_scheduler_reloads():
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
-    from vllm_mlx.config import reset_config
-    from vllm_mlx.routes.metrics import _reset_accumulator_for_tests, router
-    from vllm_mlx.runtime.model_performance import get_model_performance_ledger
+    from rapid_mlx.config import reset_config
+    from rapid_mlx.routes.metrics import _reset_accumulator_for_tests, router
+    from rapid_mlx.runtime.model_performance import get_model_performance_ledger
 
     first = get_model_performance_ledger("reloadable-model")
     first.record_success(
@@ -821,7 +939,7 @@ def test_metrics_preserves_unseen_events_across_scheduler_reloads():
 
 
 def test_process_model_registry_is_lru_bounded():
-    from vllm_mlx.runtime.model_performance import (
+    from rapid_mlx.runtime.model_performance import (
         _MODEL_LEDGER_REGISTRY,
         _RETIRED_MODEL_SNAPSHOTS,
         get_model_performance_ledger,

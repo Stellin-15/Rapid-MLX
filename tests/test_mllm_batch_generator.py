@@ -24,11 +24,13 @@ from unittest.mock import MagicMock
 import mlx.core as mx
 import mlx.nn as nn
 
-from vllm_mlx.mllm_batch_generator import (
+from rapid_mlx.mllm_batch_generator import (
+    MLLMBatch,
     MLLMBatchGenerator,
     MLLMBatchRequest,
     _model_supports_vision_feature_cache,
 )
+from rapid_mlx.request import ClientRequestError
 
 
 class _RecordingModel:
@@ -69,6 +71,20 @@ def _make_request(*, pixel_values, extra_kwargs=None) -> MLLMBatchRequest:
         pixel_values=pixel_values,
         extra_kwargs=extra_kwargs or {},
     )
+
+
+@pytest.mark.parametrize(
+    "batch_request",
+    [
+        MLLMBatchRequest(uid=1, request_id="media", prompt=[1], images=["image.png"]),
+        MLLMBatchRequest(uid=2, request_id="empty", prompt=[]),
+        MLLMBatchRequest(uid=3, request_id="non-int", prompt=[1, "2"]),
+    ],
+)
+def test_pretokenized_prompt_rejects_ambiguous_inputs(batch_request):
+    generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+    with pytest.raises(ClientRequestError):
+        generator._preprocess_request(batch_request)
 
 
 def test_run_vision_encoding_passes_pixel_values_none_for_text_only_request():
@@ -732,7 +748,9 @@ def test_step_homogeneous_requests_call_shared_sampler_once(monkeypatch):
         make_sampler_calls.append(kwargs)
         return shared_sampler
 
-    monkeypatch.setattr("vllm_mlx.mllm_batch_generator.make_sampler", fake_make_sampler)
+    monkeypatch.setattr(
+        "rapid_mlx.mllm_batch_generator.make_sampler", fake_make_sampler
+    )
 
     gen = _make_step_stub_generator()
     requests = [
@@ -755,6 +773,73 @@ def test_step_homogeneous_requests_call_shared_sampler_once(monkeypatch):
     assert sampled.shape == (4,)
 
 
+def test_step_homogeneous_requests_forward_min_p_and_top_k(monkeypatch):
+    calls = []
+
+    def fake_make_sampler(**kwargs):
+        calls.append(kwargs)
+        return lambda x: mx.zeros((x.shape[0],), dtype=mx.uint32)
+
+    monkeypatch.setattr(
+        "rapid_mlx.mllm_batch_generator.make_sampler", fake_make_sampler
+    )
+    gen = _make_step_stub_generator()
+    requests = [
+        MLLMBatchRequest(
+            uid=i,
+            request_id=f"r{i}",
+            prompt="hi",
+            temperature=0.5,
+            top_p=0.8,
+            min_p=0.1,
+            top_k=3,
+        )
+        for i in range(2)
+    ]
+
+    MLLMBatchGenerator._step(
+        gen, mx.array([[1], [2]], dtype=mx.uint32), cache=[], requests=requests
+    )
+
+    assert calls == [{"temp": 0.5, "top_p": 0.8, "min_p": 0.1, "top_k": 3}]
+
+
+def test_next_applies_ignore_eos_per_request() -> None:
+    from types import SimpleNamespace
+
+    normal = MLLMBatchRequest(uid=1, request_id="normal", prompt="hi", max_tokens=8)
+    benchmark = MLLMBatchRequest(
+        uid=2, request_id="benchmark", prompt=[1], max_tokens=1, ignore_eos=True
+    )
+    batch = MLLMBatch(
+        uids=[1, 2],
+        request_ids=["normal", "benchmark"],
+        y=mx.array([7, 7]),
+        logprobs=[mx.zeros((8,)), mx.zeros((8,))],
+        max_tokens=[8, 1],
+        num_tokens=[0, 0],
+        cache=[],
+        requests=[normal, benchmark],
+    )
+    generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+    generator.active_batch = batch
+    generator.stop_tokens = {7}
+    generator.unprocessed_requests = []
+    generator.completion_batch_size = 2
+    generator._stats = SimpleNamespace(
+        prompt_time=0.0, generation_time=0.0, generation_tokens=0
+    )
+    generator._step = lambda *_args, **_kwargs: (
+        mx.array([8, 8]),
+        [mx.zeros((8,)), mx.zeros((8,))],
+    )
+
+    responses = generator._next()
+
+    assert [response.finish_reason for response in responses] == ["stop", "length"]
+    assert [response.token_is_stop_token for response in responses] == [True, False]
+
+
 def test_step_request_processor_sees_compute_ahead_token(monkeypatch):
     """Constraints see the token already fed into the decode step.
 
@@ -771,7 +856,7 @@ def test_step_request_processor_sees_compute_ahead_token(monkeypatch):
         return constrained
 
     monkeypatch.setattr(
-        "vllm_mlx.mllm_batch_generator.make_sampler",
+        "rapid_mlx.mllm_batch_generator.make_sampler",
         lambda **_kwargs: lambda logprobs: mx.argmax(logprobs, axis=-1),
     )
     gen = _make_step_stub_generator()
@@ -808,11 +893,11 @@ def test_prefill_first_token_uses_request_logits_processor(monkeypatch):
 
     monkeypatch.setattr(cache_module, "make_prompt_cache", lambda _model: [_Cache()])
     monkeypatch.setattr(
-        "vllm_mlx.mllm_batch_generator.first_incompatible_mllm_cache_type",
+        "rapid_mlx.mllm_batch_generator.first_incompatible_mllm_cache_type",
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
-        "vllm_mlx.mllm_batch_generator.make_sampler",
+        "rapid_mlx.mllm_batch_generator.make_sampler",
         lambda **_kwargs: lambda logprobs: mx.argmax(logprobs, axis=-1),
     )
 
@@ -842,7 +927,9 @@ def test_step_caches_shared_sampler_across_calls(monkeypatch):
         make_sampler_calls.append(kwargs)
         return lambda x: mx.zeros((x.shape[0],), dtype=mx.uint32)
 
-    monkeypatch.setattr("vllm_mlx.mllm_batch_generator.make_sampler", fake_make_sampler)
+    monkeypatch.setattr(
+        "rapid_mlx.mllm_batch_generator.make_sampler", fake_make_sampler
+    )
 
     gen = _make_step_stub_generator()
     requests = [
@@ -871,7 +958,9 @@ def test_step_param_change_invalidates_cached_sampler(monkeypatch):
         make_sampler_calls.append(kwargs)
         return lambda x: mx.zeros((x.shape[0],), dtype=mx.uint32)
 
-    monkeypatch.setattr("vllm_mlx.mllm_batch_generator.make_sampler", fake_make_sampler)
+    monkeypatch.setattr(
+        "rapid_mlx.mllm_batch_generator.make_sampler", fake_make_sampler
+    )
 
     gen = _make_step_stub_generator()
 
@@ -909,7 +998,9 @@ def test_step_heterogeneous_requests_use_per_row_loop(monkeypatch):
         make_sampler_calls.append(kwargs)
         return lambda x: mx.zeros((x.shape[0],), dtype=mx.uint32)
 
-    monkeypatch.setattr("vllm_mlx.mllm_batch_generator.make_sampler", fake_make_sampler)
+    monkeypatch.setattr(
+        "rapid_mlx.mllm_batch_generator.make_sampler", fake_make_sampler
+    )
 
     gen = _make_step_stub_generator()
     req_a = _make_sampling_request(0, 0.7, 0.95)
@@ -927,8 +1018,8 @@ def test_step_heterogeneous_requests_use_per_row_loop(monkeypatch):
         {"temp": 0.3, "top_p": 0.80},
     ]
     # Both got their per-request cache populated for future reuse.
-    assert req_a._cached_sampler[0] == (0.7, 0.95)
-    assert req_b._cached_sampler[0] == (0.3, 0.80)
+    assert req_a._cached_sampler[0] == (0.7, 0.95, 0.0, 0, None, 4)
+    assert req_b._cached_sampler[0] == (0.3, 0.80, 0.0, 0, None, 4)
     # Shared batch sampler must NOT have been populated for the mixed batch
     # (homogeneous fast path is the only writer).
     assert gen._shared_batch_sampler is None
@@ -944,7 +1035,9 @@ def test_step_b1_homogeneous_still_uses_shared_sampler(monkeypatch):
         make_sampler_calls.append(kwargs)
         return lambda x: mx.zeros((x.shape[0],), dtype=mx.uint32)
 
-    monkeypatch.setattr("vllm_mlx.mllm_batch_generator.make_sampler", fake_make_sampler)
+    monkeypatch.setattr(
+        "rapid_mlx.mllm_batch_generator.make_sampler", fake_make_sampler
+    )
 
     gen = _make_step_stub_generator()
     MLLMBatchGenerator._step(
@@ -956,7 +1049,7 @@ def test_step_b1_homogeneous_still_uses_shared_sampler(monkeypatch):
 
     assert len(make_sampler_calls) == 1
     assert gen._shared_batch_sampler is not None
-    assert gen._shared_batch_sampler[0] == (0.7, 0.95)
+    assert gen._shared_batch_sampler[0] == (0.7, 0.95, 0.0, 0, 4)
 
 
 def test_step_batch_uses_dataclass_defaults(monkeypatch):
@@ -969,7 +1062,9 @@ def test_step_batch_uses_dataclass_defaults(monkeypatch):
         make_sampler_calls.append(kwargs)
         return lambda x: mx.zeros((x.shape[0],), dtype=mx.uint32)
 
-    monkeypatch.setattr("vllm_mlx.mllm_batch_generator.make_sampler", fake_make_sampler)
+    monkeypatch.setattr(
+        "rapid_mlx.mllm_batch_generator.make_sampler", fake_make_sampler
+    )
 
     gen = _make_step_stub_generator()
     # Build via positional defaults only — never overriding temp/top_p.
@@ -998,7 +1093,9 @@ def test_step_heterogeneous_then_homogeneous_populates_shared(monkeypatch):
         make_sampler_calls.append(kwargs)
         return lambda x: mx.zeros((x.shape[0],), dtype=mx.uint32)
 
-    monkeypatch.setattr("vllm_mlx.mllm_batch_generator.make_sampler", fake_make_sampler)
+    monkeypatch.setattr(
+        "rapid_mlx.mllm_batch_generator.make_sampler", fake_make_sampler
+    )
 
     gen = _make_step_stub_generator()
 
@@ -1026,7 +1123,7 @@ def test_step_heterogeneous_then_homogeneous_populates_shared(monkeypatch):
         ],
     )
     assert gen._shared_batch_sampler is not None
-    assert gen._shared_batch_sampler[0] == (0.5, 0.85)
+    assert gen._shared_batch_sampler[0] == (0.5, 0.85, 0.0, 0, 4)
     # 3 total: 2 from the het batch + 1 fresh for the new homogeneous key.
     assert len(make_sampler_calls) == 3
 
@@ -1112,7 +1209,7 @@ def test_mllm_scheduler_config_default_vision_budget_covers_screenshot():
     Post-fix the default is 8192, comfortably above the ~2200-token
     Qwen3-VL output for 1920×1080.
     """
-    from vllm_mlx.mllm_scheduler import MLLMSchedulerConfig
+    from rapid_mlx.mllm_scheduler import MLLMSchedulerConfig
 
     cfg = MLLMSchedulerConfig()
     # 1920×1080 Qwen3-VL: ~2200 vision tokens + chat-template + text.
@@ -1128,8 +1225,8 @@ def test_mllm_scheduler_config_default_vision_budget_covers_screenshot():
 
 def test_vision_admission_budget_is_independent_from_prefill_chunk():
     """A profile-tuned 512 chunk must still admit a normal screenshot."""
-    from vllm_mlx.mllm_batch_generator import _prefill_cap_violation
-    from vllm_mlx.mllm_scheduler import MLLMSchedulerConfig
+    from rapid_mlx.mllm_batch_generator import _prefill_cap_violation
+    from rapid_mlx.mllm_scheduler import MLLMSchedulerConfig
 
     cfg = MLLMSchedulerConfig(
         prefill_step_size=512,
@@ -1143,7 +1240,7 @@ def test_vision_admission_budget_is_independent_from_prefill_chunk():
 
 
 def test_vision_budget_keeps_safe_floor_and_larger_operator_value():
-    from vllm_mlx.engine.batched import _resolve_mllm_vision_prefill_token_budget
+    from rapid_mlx.engine.batched import _resolve_mllm_vision_prefill_token_budget
 
     assert (
         _resolve_mllm_vision_prefill_token_budget(
@@ -1184,9 +1281,9 @@ def test_resolve_mllm_prefill_step_size_bumps_text_default_to_mllm_default():
     """
     from types import SimpleNamespace
 
-    from vllm_mlx.engine.batched import _resolve_mllm_prefill_step_size
-    from vllm_mlx.mllm_scheduler import MLLMSchedulerConfig
-    from vllm_mlx.scheduler import SchedulerConfig
+    from rapid_mlx.engine.batched import _resolve_mllm_prefill_step_size
+    from rapid_mlx.mllm_scheduler import MLLMSchedulerConfig
+    from rapid_mlx.scheduler import SchedulerConfig
 
     text_default = SchedulerConfig.__dataclass_fields__["prefill_step_size"].default
     mllm_default = MLLMSchedulerConfig.__dataclass_fields__["prefill_step_size"].default
@@ -1621,14 +1718,14 @@ def test_preprocess_request_derives_stable_content_key(monkeypatch):
     different key. This exercises the real request path (not a manually
     supplied key)."""
     pytest.importorskip("mlx_vlm.vision_cache")
-    import mlx_vlm.utils as _vlm_utils
+    import rapid_mlx.models.mlx_vlm_vendored.inputs as _vlm_inputs
 
     # Stub only the heavy processor call — we test key derivation, not
     # tokenization. ``_preprocess_request`` imports it as
-    # ``from mlx_vlm.utils import prepare_inputs`` at call time, so patching
-    # the module attribute takes effect.
+    # ``from rapid_mlx.models.mlx_vlm_vendored.inputs import prepare_inputs``
+    # at call time, so patching the module attribute takes effect.
     monkeypatch.setattr(
-        _vlm_utils,
+        _vlm_inputs,
         "prepare_inputs",
         lambda *a, **k: {
             "input_ids": mx.array([1, 2, 3]),
@@ -1664,10 +1761,10 @@ def test_preprocess_request_derives_stable_content_key(monkeypatch):
 def test_preprocess_request_no_key_for_unsupported_model(monkeypatch):
     """An unsupported model leaves ``vision_feature_key`` None (the key is only
     computed when the feature is actually wired in)."""
-    import mlx_vlm.utils as _vlm_utils
+    import rapid_mlx.models.mlx_vlm_vendored.inputs as _vlm_inputs
 
     monkeypatch.setattr(
-        _vlm_utils,
+        _vlm_inputs,
         "prepare_inputs",
         lambda *a, **k: {
             "input_ids": mx.array([1, 2, 3]),
@@ -1721,7 +1818,7 @@ def test_prefill_cap_exempts_large_text_only_prompt():
     8192), even though the chunked text-only prefill path could handle it.
     This is the regression the issue's DNF reported.
     """
-    from vllm_mlx.mllm_batch_generator import _prefill_cap_violation
+    from rapid_mlx.mllm_batch_generator import _prefill_cap_violation
 
     req = _text_request(uid=0, token_count=20000)
     assert _prefill_cap_violation([req], prefill_step_size=8192) is None, (
@@ -1735,7 +1832,7 @@ def test_prefill_cap_still_fires_on_large_vision_request():
     (text + vision) token count exceeds ``prefill_step_size × n_vision`` is
     rejected with the actionable message (#682 preserved).
     """
-    from vllm_mlx.mllm_batch_generator import _prefill_cap_violation
+    from rapid_mlx.mllm_batch_generator import _prefill_cap_violation
 
     req = _make_vision_cap_request(uid=0, token_count=20000)
     msg = _prefill_cap_violation([req], prefill_step_size=8192)
@@ -1749,7 +1846,7 @@ def test_prefill_cap_counts_only_vision_requests_in_budget():
     requests; text-only requests are exempt and do not inflate the multiplier
     (#1848).
     """
-    from vllm_mlx.mllm_batch_generator import _prefill_cap_violation
+    from rapid_mlx.mllm_batch_generator import _prefill_cap_violation
 
     # 1 vision request + 1 huge text-only request, cap = 8192 × 1 vision.
     batch = [
@@ -1804,7 +1901,7 @@ def test_prefill_cap_exempts_batch_of_long_text_only_prompts():
     cap is vision-only by design; an all-text-only batch (any count, any
     length) must never violate it (#1848 / #682 contract preserved).
     """
-    from vllm_mlx.mllm_batch_generator import _prefill_cap_violation
+    from rapid_mlx.mllm_batch_generator import _prefill_cap_violation
 
     # 4 concurrent long text-only prompts, all > prefill_step_size.
     batch = [_text_request(uid=i, token_count=20000) for i in range(4)]
@@ -1948,11 +2045,19 @@ def test_exact_prefix_cache_short_prompt_counts_miss_without_lookup():
 
 
 def test_generator_enables_exact_apc_from_pinned_runtime(monkeypatch):
-    from mlx_vlm import apc
+    from rapid_mlx.models.mlx_vlm_vendored import apc
 
     manager = _ExactPrefixCache()
+    seen_overrides = None
+
+    def _from_env(*, overrides):
+        nonlocal seen_overrides
+        seen_overrides = overrides
+        return manager
+
+    monkeypatch.delenv("APC_DISK_ENABLED", raising=False)
     monkeypatch.setattr(apc, "model_apc_mode", lambda _model: "exact")
-    monkeypatch.setattr(apc, "from_env", lambda *, overrides: manager)
+    monkeypatch.setattr(apc, "from_env", _from_env)
     monkeypatch.setattr(apc, "semantic_extra_hash", lambda **_kwargs: 41)
 
     gen = _make_generator(_RecordingModel())
@@ -1960,12 +2065,41 @@ def test_generator_enables_exact_apc_from_pinned_runtime(monkeypatch):
         assert gen._prefix_cache is manager
         assert gen._prefix_cache_mode == "exact"
         assert gen._prefix_cache_extra_hash == 41
+        assert seen_overrides == {
+            "enabled": True,
+            "num_blocks": 0,
+            "disk_enabled": False,
+        }
+    finally:
+        gen.close()
+
+
+def test_generator_preserves_explicit_apc_disk_setting(monkeypatch):
+    from rapid_mlx.models.mlx_vlm_vendored import apc
+
+    manager = _ExactPrefixCache()
+    seen_overrides = None
+
+    def _from_env(*, overrides):
+        nonlocal seen_overrides
+        seen_overrides = overrides
+        return manager
+
+    monkeypatch.setenv("APC_DISK_ENABLED", "1")
+    monkeypatch.setattr(apc, "model_apc_mode", lambda _model: "exact")
+    monkeypatch.setattr(apc, "from_env", _from_env)
+    monkeypatch.setattr(apc, "semantic_extra_hash", lambda **_kwargs: 41)
+
+    gen = _make_generator(_RecordingModel())
+    try:
+        assert gen._prefix_cache is manager
+        assert seen_overrides == {"enabled": True, "num_blocks": 0}
     finally:
         gen.close()
 
 
 def test_generator_keeps_mllm_available_when_exact_apc_init_fails(monkeypatch):
-    from mlx_vlm import apc
+    from rapid_mlx.models.mlx_vlm_vendored import apc
 
     monkeypatch.setattr(
         apc,
@@ -2076,8 +2210,8 @@ def test_bare_generator_without_prefix_cache_keeps_legacy_cold_path():
 
 
 def _make_cache_scheduler(*, batch_generator):
-    from vllm_mlx.mllm_scheduler import MLLMScheduler
-    from vllm_mlx.runtime.model_performance import ModelPerformanceLedger
+    from rapid_mlx.mllm_scheduler import MLLMScheduler
+    from rapid_mlx.runtime.model_performance import ModelPerformanceLedger
 
     scheduler = MLLMScheduler.__new__(MLLMScheduler)
     scheduler._step_executor = None
@@ -2170,3 +2304,473 @@ def test_scheduler_prefix_cache_clear_rejects_active_requests():
         scheduler.clear_prefix_cache(reset_stats=False)
 
     batch_generator.clear_prefix_cache.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Recurrent-state checkpoints on exact APC snapshots (MLLM lane)
+# ---------------------------------------------------------------------------
+
+
+def _make_real_apc_generator(monkeypatch, *, entries: int | None = None):
+    """A bare generator wired to the vendored ``APCManager`` in exact mode
+    (no disk, no block pool), the way ``__init__`` builds it."""
+    from rapid_mlx.models.mlx_vlm_vendored import apc
+
+    if entries is None:
+        monkeypatch.delenv("APC_EXACT_CACHE_ENTRIES", raising=False)
+    else:
+        monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", str(entries))
+    gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+    gen._prefix_cache = apc.from_env(
+        overrides={"enabled": True, "num_blocks": 0, "disk_enabled": False}
+    )
+    gen._prefix_cache_mode = "exact"
+    gen._prefix_cache_extra_hash = 17
+    gen._prefix_cache_hits = 0
+    gen._prefix_cache_misses = 0
+    gen._prefix_cache_evictions_offset = 0
+    gen._prefix_cache_tokens_saved = 0
+    gen._prefix_cache_max_bytes = 0
+    gen._prefix_cache_budget_evictions = 0
+    gen._configure_exact_cache_capacity(gen._prefix_cache)
+    return gen
+
+
+def _hybrid_cache(n_tokens: int, *, state_tag: float):
+    """One mlx-vlm KV layer holding ``n_tokens`` positions (keys encode the
+    position so a rewind is checkable) and one recurrent layer whose state
+    carries ``state_tag``."""
+    from mlx_vlm.models.cache import ArraysCache, KVCache
+
+    kv = KVCache()
+    positions = mx.arange(n_tokens, dtype=mx.float32).reshape(1, 1, n_tokens, 1)
+    kv.update_and_fetch(
+        mx.broadcast_to(positions, (1, 1, n_tokens, 4)), mx.zeros((1, 1, n_tokens, 4))
+    )
+    recurrent = ArraysCache(2)
+    recurrent.cache = [mx.full((1, 2), state_tag), mx.full((1, 3), state_tag)]
+    return [kv, recurrent]
+
+
+def _store_entry_with_checkpoints(gen, token_ids, checkpoint_positions):
+    """Store ``token_ids`` as an exact snapshot whose recurrent layer carries a
+    checkpoint (state tagged with the position) at each requested position."""
+    from rapid_mlx.hybrid_state_checkpoints import record_checkpoints
+
+    cache = _hybrid_cache(len(token_ids), state_tag=float(len(token_ids)))
+    holders = [None, None]
+    for position in checkpoint_positions:
+        cache[1].cache = [
+            mx.full((1, 2), float(position)),
+            mx.full((1, 3), float(position)),
+        ]
+        assert record_checkpoints(cache, holders, position, max_count=8, stride=1)
+    cache[1].cache = [
+        mx.full((1, 2), float(len(token_ids))),
+        mx.full((1, 3), float(len(token_ids))),
+    ]
+    request = _make_ids_request(len(token_ids))
+    request.full_prompt_token_ids = list(token_ids)
+    request.hybrid_checkpoints = holders if checkpoint_positions else None
+    gen._store_exact_text_prefix(request, cache, prefix_len=len(token_ids))
+    return cache
+
+
+def _stored_entries(gen):
+    return list(gen._prefix_cache._exact_cache.values())
+
+
+def test_exact_prefix_snap_resumes_at_checkpoint_below_divergence(monkeypatch, caplog):
+    from rapid_mlx.hybrid_state_checkpoints import collect_checkpoints
+
+    gen = _make_real_apc_generator(monkeypatch)
+    _store_entry_with_checkpoints(gen, list(range(100)), [40, 80])
+    (entry,) = _stored_entries(gen)
+    assert collect_checkpoints(entry.prompt_cache)[1].positions == (40, 80)
+
+    # Shares tokens 0..89 with the snapshot, then diverges: no exact prefix
+    # match, but the checkpoint at 80 is below the divergence.
+    request = _make_ids_request(100)
+    request.input_ids = mx.array(list(range(90)) + [999] * 10, dtype=mx.int32)
+    with caplog.at_level("INFO", logger="rapid_mlx.mllm_batch_generator"):
+        warm = gen._lookup_exact_text_prefix(request)
+
+    assert warm is not None
+    assert request.cached_tokens == 80
+    assert request.input_ids.tolist() == list(range(80, 90)) + [999] * 10
+    assert warm[0].offset == 80
+    assert warm[0].keys[0, 0, :, 0].tolist()[:80] == [float(i) for i in range(80)]
+    assert warm[1].cache[0].tolist() == [[80.0, 80.0]]
+    assert [h.positions if h else None for h in request.hybrid_checkpoints] == [
+        None,
+        (40, 80),
+    ]
+    assert gen.get_prefix_cache_stats()["hits"] == 1
+    assert gen.get_prefix_cache_stats()["tokens_saved"] == 80
+    assert "SNAP prompt_tokens=100 cached=80 remaining=20" in caplog.text
+    # The stored snapshot itself is untouched by the rewind.
+    assert entry.prompt_cache[0].offset == 100
+    assert entry.prompt_cache[1].cache[0].tolist() == [[100.0, 100.0]]
+
+
+def test_exact_prefix_snap_prefers_the_furthest_checkpoint_over_a_shorter_exact_hit(
+    monkeypatch,
+):
+    gen = _make_real_apc_generator(monkeypatch)
+    _store_entry_with_checkpoints(gen, list(range(30)), [])
+    _store_entry_with_checkpoints(gen, list(range(100)), [40, 80])
+
+    request = _make_ids_request(100)
+    request.input_ids = mx.array(list(range(90)) + [999] * 10, dtype=mx.int32)
+    assert gen._lookup_exact_text_prefix(request) is not None
+    assert request.cached_tokens == 80
+
+    # Without a checkpoint below the divergence the exact 30-token hit stands.
+    gen.clear_prefix_cache()
+    _store_entry_with_checkpoints(gen, list(range(30)), [])
+    _store_entry_with_checkpoints(gen, list(range(100)), [95])
+    request = _make_ids_request(100)
+    request.input_ids = mx.array(list(range(90)) + [999] * 10, dtype=mx.int32)
+    assert gen._lookup_exact_text_prefix(request) is not None
+    assert request.cached_tokens == 30
+    assert request.hybrid_checkpoints is None
+
+
+def test_exact_prefix_hit_seeds_the_snapshot_checkpoints(monkeypatch):
+    gen = _make_real_apc_generator(monkeypatch)
+    _store_entry_with_checkpoints(gen, list(range(100)), [40, 80])
+    request = _make_ids_request(105)
+    assert gen._lookup_exact_text_prefix(request) is not None
+    assert request.cached_tokens == 100
+    assert [h.positions if h else None for h in request.hybrid_checkpoints] == [
+        None,
+        (40, 80),
+    ]
+
+
+def test_exact_prefix_snap_drops_checkpoints_past_the_resume_position(monkeypatch):
+    """Checkpoints recorded beyond the divergence carry the *old* prompt's
+    recurrent state; the resumed request must not inherit them."""
+    gen = _make_real_apc_generator(monkeypatch)
+    _store_entry_with_checkpoints(gen, list(range(100)), [40, 80, 95])
+    request = _make_ids_request(100)
+    request.input_ids = mx.array(list(range(90)) + [999] * 10, dtype=mx.int32)
+    warm = gen._lookup_exact_text_prefix(request)
+    assert warm is not None
+    assert request.cached_tokens == 80
+    assert [h.positions if h else None for h in request.hybrid_checkpoints] == [
+        None,
+        (40, 80),
+    ]
+    # Storing the resumed prompt keeps only checkpoints the new prompt owns.
+    request.full_prompt_token_ids = list(range(90)) + [999] * 10
+    gen._store_exact_text_prefix(request, warm, prefix_len=100)
+    from rapid_mlx.hybrid_state_checkpoints import collect_checkpoints
+
+    stored = [e for e in _stored_entries(gen) if e.token_ids[-1] == 999]
+    assert len(stored) == 1
+    assert collect_checkpoints(stored[0].prompt_cache)[1].positions == (40, 80)
+
+
+def test_exact_prefix_snap_refuses_without_a_common_checkpoint(monkeypatch):
+    gen = _make_real_apc_generator(monkeypatch)
+    _store_entry_with_checkpoints(gen, list(range(100)), [95])
+    request = _make_ids_request(100)
+    request.input_ids = mx.array(list(range(90)) + [999] * 10, dtype=mx.int32)
+    assert gen._lookup_exact_text_prefix(request) is None
+    assert request.cached_tokens == 0
+    assert gen.get_prefix_cache_stats()["misses"] == 1
+
+
+def test_exact_cache_capacity_defaults_to_eight_and_honours_env(monkeypatch):
+    gen = _make_real_apc_generator(monkeypatch)
+    assert gen._prefix_cache._exact_cache_max == 8
+    assert gen._prefix_cache_max_bytes > 0
+    gen = _make_real_apc_generator(monkeypatch, entries=3)
+    assert gen._prefix_cache._exact_cache_max == 3
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "lots")
+    assert MLLMBatchGenerator._resolve_exact_cache_entries() == 8
+
+
+def test_exact_cache_capacity_stays_at_mlx_vlm_default_without_a_byte_budget(
+    monkeypatch, caplog
+):
+    """Eight unbudgeted 375 MB snapshots would be a memory-pressure bug, so a
+    failed budget computation keeps mlx-vlm's own capacity (unless the
+    operator asked for a count explicitly)."""
+    from rapid_mlx import memory_cache
+    from rapid_mlx.models.mlx_vlm_vendored import apc
+
+    default = apc.from_env(
+        overrides={"enabled": True, "num_blocks": 0, "disk_enabled": False}
+    )._exact_cache_max
+
+    def _boom(self):
+        raise RuntimeError("no device memory info")
+
+    monkeypatch.setattr(memory_cache.MemoryCacheConfig, "compute_memory_limit", _boom)
+    with caplog.at_level("WARNING", logger="rapid_mlx.mllm_batch_generator"):
+        gen = _make_real_apc_generator(monkeypatch)
+    assert gen._prefix_cache_max_bytes == 0
+    assert gen._prefix_cache._exact_cache_max == default
+    assert "no byte budget for exact entries" in caplog.text
+
+    gen = _make_real_apc_generator(monkeypatch, entries=5)
+    assert gen._prefix_cache._exact_cache_max == 5
+
+    # A manager without the expected store layout is called out loudly.
+    class _Foreign:
+        _exact_cache_max = 2
+
+    foreign = _Foreign()
+    with caplog.at_level("WARNING", logger="rapid_mlx.mllm_batch_generator"):
+        gen._configure_exact_cache_capacity(foreign)
+    assert "does not expose mlx-vlm's exact entry store" in caplog.text
+    gen._configure_exact_cache_capacity(object())
+
+
+def test_exact_cache_byte_budget_evicts_oldest_entries_first(monkeypatch):
+    gen = _make_real_apc_generator(monkeypatch)
+    _store_entry_with_checkpoints(gen, list(range(100)), [40, 80])
+    (entry,) = _stored_entries(gen)
+    one_entry = gen._exact_entry_bytes(entry.prompt_cache)
+    assert one_entry > 0
+    gen._prefix_cache_max_bytes = int(one_entry * 2.5)
+
+    _store_entry_with_checkpoints(gen, list(range(100, 200)), [])
+    _store_entry_with_checkpoints(gen, list(range(200, 300)), [])
+    _store_entry_with_checkpoints(gen, list(range(300, 400)), [])
+    survivors = [e.token_ids[0] for e in _stored_entries(gen)]
+    assert survivors == [200, 300]
+    assert gen._prefix_cache_budget_evictions == 2
+    assert gen.get_prefix_cache_stats()["evictions"] == 2
+
+    # The newest snapshot always survives, even when it alone exceeds the budget.
+    gen._prefix_cache_max_bytes = 1
+    _store_entry_with_checkpoints(gen, list(range(400, 500)), [])
+    assert [e.token_ids[0] for e in _stored_entries(gen)] == [400]
+
+
+class _RecurrentRecordingModel(_ChunkRecordingModel):
+    """Chunk-recording stub that also advances an ``ArraysCache`` state per
+    forward, tagged with the number of tokens seen, like a GDN layer would."""
+
+    def __call__(self, input_ids, cache=None, **kwargs):
+        out = super().__call__(input_ids, cache=cache, **kwargs)
+        seqlen = input_ids.shape[1]
+        for entry in cache or ():
+            if hasattr(entry, "cache") and isinstance(entry.cache, list):
+                # Advance from whatever state the cache already holds so a
+                # resumed snapshot keeps absolute positions.
+                prior = (
+                    entry.cache[0]
+                    if entry.cache and entry.cache[0] is not None
+                    else None
+                )
+                seen = (
+                    float(prior[0, 0].item()) if prior is not None else 0.0
+                ) + seqlen
+                entry.cache = [mx.full((1, 2), seen)]
+        return out
+
+
+def test_text_prefill_records_stride_checkpoints_onto_the_boundary_snapshot(
+    monkeypatch,
+):
+    from mlx_vlm.models.cache import ArraysCache
+
+    from rapid_mlx.hybrid_state_checkpoints import collect_checkpoints
+
+    monkeypatch.setenv("RAPID_MLX_HYBRID_CHECKPOINT_STRIDE", "10")
+    monkeypatch.setenv("RAPID_MLX_HYBRID_CHECKPOINT_MAX", "4")
+    gen = _make_real_apc_generator(monkeypatch)
+    model = _RecurrentRecordingModel()
+    gen.model = model
+    gen.language_model = model.language_model
+    gen.prefill_step_size = 10
+    request = _make_ids_request(40)
+    request.full_prompt_token_ids = list(range(40))
+    request.prefix_boundary = 30
+    cache = [ArraysCache(1)]
+
+    gen._run_vision_encoding(request, cache=cache)
+
+    assert [seqlen for seqlen, _ in model.calls] == [10, 10, 10, 9, 1]
+    # Chunk ends at 10/20/30/39: stride 10 records 10, 20, 30 (39 is too close).
+    assert request.hybrid_checkpoints[0].positions == (10, 20, 30)
+    (entry,) = _stored_entries(gen)
+    assert entry.token_ids == tuple(range(30))
+    holder = collect_checkpoints(entry.prompt_cache)[0]
+    assert holder.positions == (10, 20, 30)
+    assert holder.arrays_at(20)[0].tolist() == [[20.0, 20.0]]
+
+
+def test_text_prefill_checkpoints_continue_from_a_resumed_snapshot(monkeypatch):
+    from mlx_vlm.models.cache import ArraysCache
+
+    monkeypatch.setenv("RAPID_MLX_HYBRID_CHECKPOINT_STRIDE", "5")
+    gen = _make_real_apc_generator(monkeypatch)
+    model = _RecurrentRecordingModel()
+    gen.model = model
+    gen.language_model = model.language_model
+    gen.prefill_step_size = 5
+    request = _make_ids_request(20)
+    request.full_prompt_token_ids = list(range(20))
+    request.cached_tokens = 10
+    request.input_ids = request.input_ids[10:]
+    request.hybrid_checkpoints = None
+    cache = [ArraysCache(1)]
+    cache[0].cache = [mx.full((1, 2), 10.0)]
+
+    gen._run_vision_encoding(request, cache=cache)
+
+    # Positions are absolute prompt offsets: 10 (resumed) + 5 + 4 tokens, and
+    # the recorded state is the one the model held at that position.
+    holder = request.hybrid_checkpoints[0]
+    assert holder.positions == (15,)
+    assert holder.arrays_at(15)[0].tolist() == [[15.0, 15.0]]
+    assert cache[0].cache[0].tolist() == [[20.0, 20.0]]
+
+
+def test_exact_prefix_helpers_refuse_foreign_or_unmatched_entries(monkeypatch):
+    """Every early exit the snapshot helpers take when mlx-vlm's exact store
+    is absent, holds no matching entry, or the store itself declines."""
+    gen = _make_real_apc_generator(monkeypatch)
+    cache = gen._prefix_cache
+    _store_entry_with_checkpoints(gen, list(range(100)), [40, 80])
+
+    # A manager without an in-memory exact store is left alone.
+    assert gen._exact_entries(object()) is None
+    assert gen._stored_entry_checkpoints(object(), list(range(100)), 17) is None
+    holders = [None, object()]
+    gen._attach_stored_checkpoints(
+        object(), list(range(100)), holders, extra_hash=17, prefix_len=100
+    )
+
+    # No entry for these tokens / this extra hash.
+    lock, entries = gen._exact_entries(cache)
+    assert gen._find_exact_entry(entries, list(range(50)), 17) is None
+    assert gen._find_exact_entry(entries, list(range(100)), 18) is None
+    assert gen._stored_entry_checkpoints(cache, list(range(50)), 17) is None
+    gen._attach_stored_checkpoints(
+        cache, list(range(50)), holders, extra_hash=17, prefix_len=50
+    )
+    assert (
+        gen._snap_exact_text_prefix(cache, list(range(101)), 18, min_position=0) is None
+    )
+    (entry,) = _stored_entries(gen)
+    assert len(entries) == 1
+
+    # A store refusal (too short for mlx-vlm's minimum) attaches nothing.
+    request = _make_ids_request(4)
+    request.full_prompt_token_ids = [1, 2, 3, 4]
+    request.hybrid_checkpoints = holders
+    gen._store_exact_text_prefix(request, _hybrid_cache(4, state_tag=4.0), prefix_len=4)
+    assert len(entries) == 1
+
+
+def test_exact_prefix_snap_scans_whole_prefix_and_honours_min_position(monkeypatch):
+    gen = _make_real_apc_generator(monkeypatch)
+    cache = gen._prefix_cache
+    _store_entry_with_checkpoints(gen, list(range(100)), [40, 80])
+
+    # The stored entry is a strict prefix of the prompt: the fast full-slice
+    # comparison finds the common prefix without a token walk.
+    snapped = gen._snap_exact_text_prefix(cache, list(range(120)), 17, min_position=0)
+    assert snapped is not None
+    assert snapped[1] == 80
+    # Nothing beyond min_position to gain: refused.
+    assert (
+        gen._snap_exact_text_prefix(cache, list(range(120)), 17, min_position=80)
+        is None
+    )
+    assert (
+        gen._snap_exact_text_prefix(cache, list(range(120)), 17, min_position=99)
+        is None
+    )
+    # Diverges at 50: the common prefix itself is below min_position.
+    diverged = list(range(50)) + [999] * 70
+    assert gen._snap_exact_text_prefix(cache, diverged, 17, min_position=60) is None
+
+
+def test_exact_prefix_snap_refuses_when_rewind_or_clone_fails(monkeypatch):
+    import rapid_mlx.models.mlx_vlm_vendored.apc_adapters as adapters
+
+    gen = _make_real_apc_generator(monkeypatch)
+    cache = gen._prefix_cache
+    _store_entry_with_checkpoints(gen, list(range(100)), [40, 80])
+    full_ids = list(range(90)) + [999] * 10
+
+    real_clone = adapters.clone_cache_entry
+    monkeypatch.setattr(adapters, "clone_cache_entry", lambda *a, **k: None)
+    assert gen._snap_exact_text_prefix(cache, full_ids, 17, min_position=0) is None
+    monkeypatch.setattr(adapters, "clone_cache_entry", real_clone)
+
+    monkeypatch.setattr(
+        MLLMBatchGenerator, "_rewind_exact_entry", staticmethod(lambda *_: None)
+    )
+    assert gen._snap_exact_text_prefix(cache, full_ids, 17, min_position=0) is None
+
+
+def test_exact_prefix_snap_uses_cache_owned_clone_without_upstream_apc(monkeypatch):
+    """mlx-vlm 0.7.2 cache-owned snapshots remove the lazy APC helper."""
+    import builtins
+
+    gen = _make_real_apc_generator(monkeypatch)
+    cache = gen._prefix_cache
+    _store_entry_with_checkpoints(gen, list(range(100)), [40, 80])
+    full_ids = list(range(90)) + [999] * 10
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "mlx_vlm.apc":
+            raise ModuleNotFoundError(name=name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    assert gen._snap_exact_text_prefix(cache, full_ids, 17, min_position=0) is not None
+
+
+def test_exact_prefix_snap_promotes_only_a_snapshot_that_served(monkeypatch):
+    """LRU order must not move for a candidate whose rewind or clone failed."""
+    import rapid_mlx.models.mlx_vlm_vendored.apc_adapters as adapters
+
+    gen = _make_real_apc_generator(monkeypatch)
+    cache = gen._prefix_cache
+    _store_entry_with_checkpoints(gen, list(range(100)), [40, 80])
+    _store_entry_with_checkpoints(gen, list(range(100, 200)), [])
+    order_before = [e.token_ids[0] for e in _stored_entries(gen)]
+    assert order_before == [0, 100]
+    full_ids = list(range(90)) + [999] * 10
+
+    real_clone = adapters.clone_cache_entry
+    monkeypatch.setattr(adapters, "clone_cache_entry", lambda *a, **k: None)
+    assert gen._snap_exact_text_prefix(cache, full_ids, 17, min_position=0) is None
+    assert [e.token_ids[0] for e in _stored_entries(gen)] == [0, 100]
+    monkeypatch.setattr(adapters, "clone_cache_entry", real_clone)
+
+    snapped = gen._snap_exact_text_prefix(cache, full_ids, 17, min_position=0)
+    assert snapped is not None and snapped[1] == 80
+    assert [e.token_ids[0] for e in _stored_entries(gen)] == [100, 0]
+
+
+def test_rewind_exact_entry_refuses_layers_it_cannot_rewind():
+    from mlx_vlm.models.cache import KVCache
+
+    rewind = MLLMBatchGenerator._rewind_exact_entry
+
+    # Recurrent layer without a checkpoint at the position.
+    cache = _hybrid_cache(100, state_tag=100.0)
+    assert rewind(cache, 50) is None
+
+    # Unknown / non-pageable layer.
+    assert rewind([object()], 0) is None
+
+    # A KV layer that is shorter than the requested position.
+    assert rewind([cache[0]], 150) is None
+
+    # A KV layer whose trim gives back fewer tokens than asked.
+    stubborn = KVCache()
+    stubborn.update_and_fetch(mx.zeros((1, 1, 100, 4)), mx.zeros((1, 1, 100, 4)))
+    stubborn.trim = lambda n: 0
+    assert rewind([stubborn], 50) is None

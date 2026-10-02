@@ -6,7 +6,9 @@ full license texts are reproduced in the linked repositories and — so
 the notices travel with the binary as BSD/MIT ask — inside the shipped
 app itself: the Swift packages linked into the executable under
 `Contents/Resources/Licenses/`, and the bundled Python payload under
-`Contents/Resources/rapid-mlx/site-packages/*.dist-info/licenses/`.
+`Contents/Resources/rapid-mlx/site-packages/*.dist-info/licenses/` or
+`Contents/Resources/rapid-mlx/licenses/` when a wheel does not carry its own
+notice.
 `scripts/build.sh` stages the Swift set from each package's resolved
 checkout and fails the build if any linked package has no license file,
 so this document and the shipped bundle cannot silently disagree (#1596).
@@ -174,6 +176,16 @@ full. The ranges below are the **root manifest's**; the sidecar build pins
 | websockets | `>=12.0` | BSD-3-Clause | https://github.com/python-websockets/websockets |
 | openai-harmony | `>=0.0.8` | Apache-2.0 | https://github.com/openai/harmony |
 | llguidance | `>=1.7.6` | MIT | https://github.com/microsoft/llguidance |
+| pyobjc-core | `==12.2.2` (Darwin `[computer-use]`) | MIT | https://github.com/ronaldoussoren/pyobjc |
+| pyobjc-framework-ApplicationServices | `==12.2.2` (Darwin `[computer-use]`) | MIT | https://github.com/ronaldoussoren/pyobjc |
+| pyobjc-framework-Cocoa | `==12.2.2` (resolved framework closure) | MIT | https://github.com/ronaldoussoren/pyobjc |
+| pyobjc-framework-CoreText | `==12.2.2` (resolved framework closure) | MIT | https://github.com/ronaldoussoren/pyobjc |
+| pyobjc-framework-Quartz | `==12.2.2` (Darwin `[computer-use]`) | MIT | https://github.com/ronaldoussoren/pyobjc |
+
+The five PyObjC distributions share the project MIT notice. Because the core
+and ApplicationServices wheels do not carry a standalone license file, the
+complete copyright and permission notice is staged explicitly at
+`Contents/Resources/rapid-mlx/licenses/PyObjC-MIT.txt`.
 
 Additionally installed by name with `--no-deps`, providing the bounded Desktop
 vision, image, and video runtime paths without their unused heavyweight
@@ -181,9 +193,9 @@ dependency closures:
 
 | Component | Pin | License | Project |
 | --- | --- | --- | --- |
-| mlx-vlm | `==0.6.17` | MIT | https://github.com/Blaizzy/mlx-vlm |
+| mlx-vlm | `==0.7.2` | MIT | https://github.com/Blaizzy/mlx-vlm |
 | Pillow | `>=10.0` | MIT-CMU | https://github.com/python-pillow/Pillow |
-| mflux | `==0.19.0` | MIT | https://github.com/filipstrand/mflux |
+| mflux | `==0.20.0` | MIT | https://github.com/mflux-community/mflux |
 | mlx-video-with-audio | `==0.1.36` | MIT | https://pypi.org/project/mlx-video-with-audio/ |
 | mlx-arsenal | `==0.12.1` | MIT | https://pypi.org/project/mlx-arsenal/ |
 | LTX 2 MLX runtime (`ltx-core-mlx`, `ltx-pipelines-mlx`) | `0.14.15` (`57952288076766abe27dda3a774b2c24f7346977`) | MIT | https://github.com/MrMoferFRAN/ltx-2-mlx |
@@ -224,26 +236,27 @@ revision:
 
 ```bash
 grep -rn "endored from\|orted from\|dapted from\|derive[sd] from" \
-    vllm_mlx/ videox_fun_mlx/
+    rapid_mlx/ videox_fun_mlx/
 ```
 
 The largest and most self-contained components:
 
 | Component | Upstream | Upstream license | In-tree |
 | --- | --- | --- | --- |
-| MLX Stable Audio 3 | https://github.com/Stability-AI/stable-audio-3 | MIT | `vllm_mlx/audio/sa3/` (`LICENSE`, `NOTICE`) |
-| Bonsai Image low-bit FLUX.2 core | https://github.com/PrismML-Eng/mflux-prism (`bcd13e8`) | MIT | `vllm_mlx/image/bonsai_runtime/_vendor/` (`LICENSE`, `NOTICE`) |
+| MLX Stable Audio 3 | https://github.com/Stability-AI/stable-audio-3 | MIT | `rapid_mlx/audio/sa3/` (`LICENSE`, `NOTICE`) |
+| Bonsai Image low-bit FLUX.2 core | https://github.com/PrismML-Eng/mflux-prism (`bcd13e8`) | MIT | `rapid_mlx/image/bonsai_runtime/_vendor/` (`LICENSE`, `NOTICE`) |
 | CogVideoX-Fun MLX | https://github.com/dgrauet/VideoX-Fun-mlx | Apache-2.0 | `videox_fun_mlx/` (`LICENSE`, `NOTICE`) |
-| TurboQuant Metal kernels | https://github.com/arozanov/turboquant-mlx | Apache-2.0 | `vllm_mlx/kernels/turboquant_fused.metal` |
-| GLM-5 Next image processor | https://github.com/jundot/omlx (`c520d7e`) | Apache-2.0 | `vllm_mlx/patches/glm5_next_processor.py` |
-| GLM-5 Next text runtime | https://github.com/Blaizzy/mlx-vlm (`f9e2c50`, `bffd485`) | MIT | `vllm_mlx/patches/glm5_next_runtime.py` |
-| Gemma 4 model classes | https://github.com/Blaizzy/mlx-vlm (v0.6.3) | MIT | `vllm_mlx/models/gemma4_vendored/` |
-| Hunyuan 3 model class | https://github.com/ml-explore/mlx-lm (PR #1211) | MIT | `vllm_mlx/models/hy_v3.py` |
-| DeepSeek V4 model classes | https://github.com/ml-explore/mlx-lm (`_ds4` branch, © Apple Inc.) | MIT | `vllm_mlx/models/deepseek_v4.py`, `deepseek_v4_cache.py`, `deepseek_v4_hyper_connection.py`, `deepseek_v4_switch.py` |
-| Stable Diffusion 3.5 Large MLX runtime | https://github.com/argmaxinc/DiffusionKit (`498e5db`) | MIT | `vllm_mlx/image/sd35_runtime/` (`LICENSE`, `NOTICE`) |
-| MTP speculative-decoding head + generator | https://github.com/ml-explore/mlx-lm (PR #990) | MIT | `vllm_mlx/spec_decode/mtp/head.py`, `generator.py` |
-| Request/status model, adapted | https://github.com/vllm-project/vllm | Apache-2.0 | `vllm_mlx/request.py` |
-| Several tool parsers, ported | https://github.com/vllm-project/vllm, https://github.com/sgl-project/sglang | Apache-2.0 | `vllm_mlx/tool_parsers/` |
+| TurboQuant Metal kernels | https://github.com/arozanov/turboquant-mlx | Apache-2.0 | `rapid_mlx/kernels/turboquant_fused.metal` |
+| GLM-5 Next image processor | https://github.com/jundot/omlx (`c520d7e`) | Apache-2.0 | `rapid_mlx/patches/glm5_next_processor.py` |
+| GLM-5 Next text runtime | https://github.com/Blaizzy/mlx-vlm (`f9e2c50`, `bffd485`) | MIT | `rapid_mlx/patches/glm5_next_runtime.py` |
+| Cache-owned MTP transaction and GLM drafter adapter | https://github.com/Blaizzy/mlx-vlm (PR #2206) | MIT | `rapid_mlx/speculative/native_mtp/transaction.py`, `glm5_compat.py` |
+| Gemma 4 model classes | https://github.com/Blaizzy/mlx-vlm (v0.6.3) | MIT | `rapid_mlx/models/gemma4_vendored/` |
+| Hunyuan 3 model class | https://github.com/ml-explore/mlx-lm (PR #1211) | MIT | `rapid_mlx/models/hy_v3.py` |
+| DeepSeek V4 model classes | https://github.com/ml-explore/mlx-lm (`_ds4` branch, © Apple Inc.) | MIT | `rapid_mlx/models/deepseek_v4.py`, `deepseek_v4_cache.py`, `deepseek_v4_hyper_connection.py`, `deepseek_v4_switch.py` |
+| Stable Diffusion 3.5 Large MLX runtime | https://github.com/argmaxinc/DiffusionKit (`498e5db`) | MIT | `rapid_mlx/image/sd35_runtime/` (`LICENSE`, `NOTICE`) |
+| MTP speculative-decoding head + generator | https://github.com/ml-explore/mlx-lm (PR #990) | MIT | `rapid_mlx/spec_decode/mtp/head.py`, `generator.py` |
+| Request/status model, adapted | https://github.com/vllm-project/vllm | Apache-2.0 | `rapid_mlx/request.py` |
+| Several tool parsers, ported | https://github.com/vllm-project/vllm, https://github.com/sgl-project/sglang | Apache-2.0 | `rapid_mlx/tool_parsers/` |
 
 Two notes on reading that table:
 
@@ -252,7 +265,7 @@ Two notes on reading that table:
   carry a rapid-mlx `SPDX-License-Identifier` header — that stamp reflects
   this repository's own default and does not override the upstream terms
   above.
-* The sibling files under `vllm_mlx/models/deepseek_v4_verify*.py` and
+* The sibling files under `rapid_mlx/models/deepseek_v4_verify*.py` and
   `deepseek_v4_rollback.py` are **first-party** rapid-mlx code (Apache-2.0)
   that happens to share the prefix; they are not vendored.
 

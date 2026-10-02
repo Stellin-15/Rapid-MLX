@@ -16,14 +16,30 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from itertools import product
 from pathlib import Path
 
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 INSTALL_SH = REPO / "install.sh"
-RECOMMENDATIONS = REPO / "vllm_mlx/model_recommendations.json"
+RECOMMENDATIONS = REPO / "rapid_mlx/model_recommendations.json"
 README = REPO / "README.md"
+
+
+def _starter_selection_cases() -> list[tuple[int, tuple[str, ...]]]:
+    payload = json.loads(RECOMMENDATIONS.read_text())
+    ram_tiers = [tier["minimum_memory_mib"] // 1024 for tier in payload["tiers"]]
+    aliases = tuple(
+        dict.fromkeys(
+            pick["alias"] for tier in payload["tiers"] for pick in tier["picks"]
+        )
+    )
+    cached_subsets = [
+        tuple(alias for bit, alias in enumerate(aliases) if mask & (1 << bit))
+        for mask in range(1 << len(aliases))
+    ]
+    return list(product(ram_tiers, cached_subsets))
 
 
 def _select_installer_starter(ram_gb: int, cached: tuple[str, ...] = ()) -> str:
@@ -100,19 +116,60 @@ def test_cached_choice_is_preferred_only_when_it_fits_the_ram_tier():
     assert _select_installer_starter(16, ("qwen3.8-27b-4bit",)) == "qwen3.5-4b-4bit"
 
 
+@pytest.mark.parametrize(
+    ("ram_gb", "cached", "expected"),
+    [
+        (8, ("lfm2.5-2.6b-4bit",), "lfm2.5-2.6b-4bit"),
+        (16, ("lfm2.5-1b-4bit",), "lfm2.5-1b-4bit"),
+    ],
+)
+def test_cached_choice_considers_both_picks_from_fitting_tiers(
+    ram_gb, cached, expected
+):
+    from rapid_mlx.recommendations import select_starter_model
+
+    assert select_starter_model(ram_gb, set(cached)) == expected
+    assert _select_installer_starter(ram_gb, cached) == expected
+
+
+@pytest.mark.parametrize(("ram_gb", "cached"), _starter_selection_cases())
+def test_installer_and_python_starter_selection_agree_for_every_cached_subset(
+    ram_gb, cached
+):
+    """Report cross-language drift instead of silently choosing a side."""
+    from rapid_mlx.recommendations import select_starter_model
+
+    shell_choice = _select_installer_starter(ram_gb, cached)
+    python_choice = select_starter_model(ram_gb, set(cached))
+    assert shell_choice == python_choice, (
+        "install.sh and rapid_mlx.recommendations disagree for "
+        f"RAM={ram_gb} cached={cached}: shell={shell_choice}, python={python_choice}"
+    )
+
+
+def test_unknown_ram_ignores_cached_larger_model_in_both_selectors():
+    from rapid_mlx.recommendations import select_starter_model
+
+    cached = ("lfm2.5-2.6b-4bit",)
+    expected = "lfm2.5-1b-4bit"
+
+    assert select_starter_model(0, set(cached)) == expected
+    assert _select_installer_starter(0, cached) == expected
+
+
 def test_the_banner_prints_a_bare_command_where_no_flags_are_needed():
     text = INSTALL_SH.read_text()
     serve_line = next(
         line
         for line in text.splitlines()
-        if line.strip().startswith("echo ") and "rapid-mlx serve" in line
+        if line.strip().startswith("echo ") and "rapid-mlx chat" in line
     )
     assert "${RECOMMENDED_MODEL}${RECOMMENDED_FLAGS}" in serve_line
 
 
 def test_every_recommended_alias_exists():
     """A typo'd alias turns the install banner into a 404 at first run."""
-    from vllm_mlx.model_aliases import list_aliases
+    from rapid_mlx.model_aliases import list_aliases
 
     known = list_aliases()
     installer_aliases = set()
@@ -315,7 +372,7 @@ def _parse_bundled() -> tuple[str, str]:
 
 def test_quickstart_starter_exists():
     """An unknown starter alias breaks first run for every new user."""
-    from vllm_mlx.model_aliases import list_aliases
+    from rapid_mlx.model_aliases import list_aliases
 
     alias, _ = _parse_quickstart_default()
     assert alias in list_aliases(), f"Quickstart starter is unknown alias {alias!r}"
@@ -325,7 +382,7 @@ def test_quickstart_pinned_repo_matches_the_registry():
     """``hfRepo`` drives the bytes-on-disk progress bar. If it names a
     different repo than the alias resolves to, the download completes
     while the bar sits at 0% — the first-impression path, silently wrong."""
-    from vllm_mlx.model_aliases import resolve_model
+    from rapid_mlx.model_aliases import resolve_model
 
     alias, repo = _parse_quickstart_default()
     assert resolve_model(alias) == repo, (
@@ -394,7 +451,7 @@ def test_retired_starters_are_real_aliases():
     """A typo here silently rescues nobody: the carve-out compares against
     the persisted ``rapid.serve.lastAlias``, so a misspelled entry just
     never matches and the stranded cohort stays stranded."""
-    from vllm_mlx.model_aliases import list_aliases
+    from rapid_mlx.model_aliases import list_aliases
 
     known = list_aliases()
     for alias in _parse_retired_starters():

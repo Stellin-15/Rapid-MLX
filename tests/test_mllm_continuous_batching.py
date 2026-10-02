@@ -66,7 +66,7 @@ class TestMLLMBatchRequest:
 
     def test_create_request(self):
         """Test creating a basic request."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+        from rapid_mlx.mllm_batch_generator import MLLMBatchRequest
 
         req = MLLMBatchRequest(
             uid=0,
@@ -86,7 +86,7 @@ class TestMLLMBatchRequest:
 
     def test_request_defaults(self):
         """Test default values."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+        from rapid_mlx.mllm_batch_generator import MLLMBatchRequest
 
         req = MLLMBatchRequest(
             uid=1,
@@ -107,7 +107,7 @@ class TestMLLMBatchResponse:
 
     def test_create_response(self):
         """Test creating a response."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
+        from rapid_mlx.mllm_batch_generator import MLLMBatchResponse
 
         logprobs = mx.array([0.1, 0.2, 0.3])
 
@@ -126,7 +126,7 @@ class TestMLLMBatchResponse:
 
     def test_finished_response(self):
         """Test response with finish reason."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
+        from rapid_mlx.mllm_batch_generator import MLLMBatchResponse
 
         resp = MLLMBatchResponse(
             uid=0,
@@ -144,7 +144,7 @@ class TestMLLMBatch:
 
     def test_batch_length(self):
         """Test batch length calculation."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatch, MLLMBatchRequest
+        from rapid_mlx.mllm_batch_generator import MLLMBatch, MLLMBatchRequest
 
         requests = [
             MLLMBatchRequest(uid=i, request_id=f"req-{i}", prompt=f"prompt {i}")
@@ -166,7 +166,7 @@ class TestMLLMBatch:
 
     def test_batch_filter(self):
         """Test filtering a batch."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatch, MLLMBatchRequest
+        from rapid_mlx.mllm_batch_generator import MLLMBatch, MLLMBatchRequest
 
         requests = [
             MLLMBatchRequest(uid=i, request_id=f"req-{i}", prompt=f"prompt {i}")
@@ -202,7 +202,7 @@ class TestMLLMBatchStats:
 
     def test_stats_initialization(self):
         """Test stats initialization."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchStats
+        from rapid_mlx.mllm_batch_generator import MLLMBatchStats
 
         stats = MLLMBatchStats()
 
@@ -214,7 +214,7 @@ class TestMLLMBatchStats:
 
     def test_tps_calculation(self):
         """Test tokens per second calculation."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchStats
+        from rapid_mlx.mllm_batch_generator import MLLMBatchStats
 
         stats = MLLMBatchStats()
         stats.prompt_tokens = 100
@@ -227,7 +227,7 @@ class TestMLLMBatchStats:
 
     def test_tps_zero_time(self):
         """Test TPS with zero time."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchStats
+        from rapid_mlx.mllm_batch_generator import MLLMBatchStats
 
         stats = MLLMBatchStats()
 
@@ -239,7 +239,7 @@ class TestMLLMSchedulerConfig:
     """Tests for MLLMSchedulerConfig."""
 
     def test_vision_pixel_bounds_default_off_and_validate(self):
-        from vllm_mlx.mllm_scheduler import MLLMSchedulerConfig
+        from rapid_mlx.mllm_scheduler import MLLMSchedulerConfig
 
         config = MLLMSchedulerConfig()
         assert config.vision_min_pixels == 0
@@ -250,7 +250,7 @@ class TestMLLMSchedulerConfig:
 
     def test_default_config(self):
         """Test default configuration."""
-        from vllm_mlx.mllm_scheduler import MLLMSchedulerConfig
+        from rapid_mlx.mllm_scheduler import MLLMSchedulerConfig
 
         config = MLLMSchedulerConfig()
 
@@ -263,7 +263,7 @@ class TestMLLMSchedulerConfig:
         assert config.vision_cache_size == 100
 
     def test_vision_budget_preserves_direct_large_prefill_compatibility(self):
-        from vllm_mlx.mllm_scheduler import MLLMSchedulerConfig
+        from rapid_mlx.mllm_scheduler import MLLMSchedulerConfig
 
         assert (
             MLLMSchedulerConfig(prefill_step_size=16_384).vision_prefill_token_budget
@@ -283,7 +283,7 @@ class TestMLLMSchedulerConfig:
 
     def test_custom_config(self):
         """Test custom configuration."""
-        from vllm_mlx.mllm_scheduler import MLLMSchedulerConfig
+        from rapid_mlx.mllm_scheduler import MLLMSchedulerConfig
 
         config = MLLMSchedulerConfig(
             max_num_seqs=8,
@@ -303,8 +303,8 @@ class TestMLLMRequest:
 
     def test_create_request(self):
         """Test creating an MLLM request."""
-        from vllm_mlx.mllm_scheduler import MLLMRequest
-        from vllm_mlx.request import RequestStatus
+        from rapid_mlx.mllm_scheduler import MLLMRequest
+        from rapid_mlx.request import RequestStatus
 
         req = MLLMRequest(
             request_id="req-1",
@@ -324,7 +324,7 @@ class TestMLLMSchedulerOutput:
 
     def test_empty_output(self):
         """Test empty scheduler output."""
-        from vllm_mlx.mllm_scheduler import MLLMSchedulerOutput
+        from rapid_mlx.mllm_scheduler import MLLMSchedulerOutput
 
         output = MLLMSchedulerOutput()
 
@@ -338,9 +338,41 @@ class TestMLLMSchedulerOutput:
 class TestMultimodalProcessorBatch:
     """Tests for MultimodalProcessor batch methods."""
 
+    def test_process_resolves_vendored_prepare_inputs(self, monkeypatch):
+        """The second lane-facing call site must use the vendored closure."""
+        from rapid_mlx.models.mlx_vlm_vendored import inputs as vendored_inputs
+        from rapid_mlx.multimodal_processor import MultimodalProcessor
+
+        seen = {}
+
+        def _prepare(processor, **kwargs):
+            seen.update(kwargs)
+            return {
+                "input_ids": mx.array([[1, 2, 3]]),
+                "attention_mask": mx.array([[1, 1, 1]]),
+                "pixel_values": None,
+            }
+
+        monkeypatch.setattr(vendored_inputs, "prepare_inputs", _prepare)
+        processor = MultimodalProcessor(
+            SimpleNamespace(),
+            SimpleNamespace(tokenizer=object()),
+        )
+
+        result = processor.process("hello", add_special_tokens=False)
+
+        assert seen == {
+            "images": None,
+            "prompts": "hello",
+            "image_token_index": None,
+            "add_special_tokens": False,
+        }
+        assert result.input_ids.tolist() == [[1, 2, 3]]
+        assert result.num_tokens == 3
+
     def test_batch_pixel_values_empty(self):
         """Test batching empty pixel values."""
-        from vllm_mlx.multimodal_processor import MultimodalProcessor
+        from rapid_mlx.multimodal_processor import MultimodalProcessor
 
         # Create mock processor
         mock_model = MagicMock()
@@ -353,7 +385,7 @@ class TestMultimodalProcessorBatch:
 
     def test_batch_pixel_values_single(self):
         """Test batching single pixel value."""
-        from vllm_mlx.multimodal_processor import MultimodalProcessor
+        from rapid_mlx.multimodal_processor import MultimodalProcessor
 
         mock_model = MagicMock()
         mock_processor = MagicMock()
@@ -368,7 +400,7 @@ class TestMultimodalProcessorBatch:
 
     def test_batch_pixel_values_multiple(self):
         """Test batching multiple pixel values."""
-        from vllm_mlx.multimodal_processor import MultimodalProcessor
+        from rapid_mlx.multimodal_processor import MultimodalProcessor
 
         mock_model = MagicMock()
         mock_processor = MagicMock()
@@ -385,7 +417,7 @@ class TestMultimodalProcessorBatch:
 
     def test_batch_image_grid_thw(self):
         """Test batching image grid thw."""
-        from vllm_mlx.multimodal_processor import MultimodalProcessor
+        from rapid_mlx.multimodal_processor import MultimodalProcessor
 
         mock_model = MagicMock()
         mock_processor = MagicMock()
@@ -402,7 +434,7 @@ class TestMultimodalProcessorBatch:
 
     def test_prepare_for_batch(self):
         """Test prepare_for_batch method."""
-        from vllm_mlx.multimodal_processor import (
+        from rapid_mlx.multimodal_processor import (
             MultimodalProcessor,
             ProcessedMultimodalInput,
         )
@@ -436,7 +468,7 @@ class TestMultimodalProcessorBatch:
 
     def test_compute_vision_hash(self):
         """Test vision hash computation."""
-        from vllm_mlx.multimodal_processor import MultimodalProcessor
+        from rapid_mlx.multimodal_processor import MultimodalProcessor
 
         mock_model = MagicMock()
         mock_processor = MagicMock()
@@ -457,7 +489,7 @@ class TestVisionCache:
 
     def test_cache_creation(self):
         """Test VLM cache creation."""
-        from vllm_mlx.mllm_cache import MLLMCacheManager
+        from rapid_mlx.mllm_cache import MLLMCacheManager
 
         cache = MLLMCacheManager(max_entries=10)
 
@@ -466,7 +498,7 @@ class TestVisionCache:
 
     def test_cache_miss(self):
         """Test cache miss."""
-        from vllm_mlx.mllm_cache import MLLMCacheManager
+        from rapid_mlx.mllm_cache import MLLMCacheManager
 
         cache = MLLMCacheManager()
 
@@ -478,7 +510,7 @@ class TestVisionCache:
 
     def test_cache_store_and_fetch(self):
         """Test storing and fetching from cache."""
-        from vllm_mlx.mllm_cache import MLLMCacheManager
+        from rapid_mlx.mllm_cache import MLLMCacheManager
 
         cache = MLLMCacheManager()
 
@@ -496,7 +528,7 @@ class TestVisionCache:
 
     def test_cache_eviction(self):
         """Test cache eviction when full."""
-        from vllm_mlx.mllm_cache import MLLMCacheManager
+        from rapid_mlx.mllm_cache import MLLMCacheManager
 
         cache = MLLMCacheManager(max_entries=2)
 
@@ -522,7 +554,7 @@ class TestVisionEmbeddingCacheHash:
 
     def test_image_order_produces_different_hashes(self):
         """Reversed image order must produce a different cache key."""
-        from vllm_mlx.vision_embedding_cache import compute_images_hash
+        from rapid_mlx.vision_embedding_cache import compute_images_hash
 
         h1 = compute_images_hash(["img_a.jpg", "img_b.jpg"])
         h2 = compute_images_hash(["img_b.jpg", "img_a.jpg"])
@@ -533,7 +565,7 @@ class TestVisionEmbeddingCacheHash:
         import os
         import tempfile
 
-        from vllm_mlx.vision_embedding_cache import compute_image_hash
+        from rapid_mlx.vision_embedding_cache import compute_image_hash
 
         # Create two files with identical first 64KB but different tails
         prefix = b"\x00" * 65536
@@ -559,7 +591,7 @@ class TestVideoFpsForwarding:
 
     def test_mllm_request_carries_video_params(self):
         """MLLMRequest should store video_fps and video_max_frames."""
-        from vllm_mlx.mllm_scheduler import MLLMRequest
+        from rapid_mlx.mllm_scheduler import MLLMRequest
 
         req = MLLMRequest(
             request_id="test-video",
@@ -572,7 +604,7 @@ class TestVideoFpsForwarding:
 
     def test_batch_request_carries_video_params(self):
         """MLLMBatchRequest should store video_fps and video_max_frames."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
+        from rapid_mlx.mllm_batch_generator import MLLMBatchRequest
 
         req = MLLMBatchRequest(
             uid=0,
@@ -586,7 +618,7 @@ class TestVideoFpsForwarding:
 
     def test_add_request_forwards_video_params(self):
         """add_request should store video params on the MLLMRequest."""
-        from vllm_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+        from rapid_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
 
         mock_model = MagicMock()
         mock_processor = MagicMock()
@@ -607,7 +639,7 @@ class TestVideoFpsForwarding:
 
     def test_schedule_waiting_forwards_video_params(self):
         """_schedule_waiting should copy video params to MLLMBatchRequest."""
-        from vllm_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+        from rapid_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
 
         mock_model = MagicMock()
         mock_processor = MagicMock()
@@ -633,6 +665,114 @@ class TestVideoFpsForwarding:
         assert batch_req.video_fps == 3.0
         assert batch_req.video_max_frames == 24
 
+    def test_schedule_waiting_forwards_exact_benchmark_contract(self):
+        """Pre-tokenized work and ignore-EOS remain request-local."""
+        from rapid_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+
+        mock_model = MagicMock()
+        mock_processor = MagicMock()
+        mock_processor.tokenizer = MagicMock()
+        scheduler = MLLMScheduler(mock_model, mock_processor, MLLMSchedulerConfig())
+
+        scheduler.add_request(
+            prompt=[11, 12, 13],
+            ignore_eos=True,
+            top_k=7,
+            min_p=0.05,
+            seed=23,
+        )
+        scheduler._schedule_waiting()
+
+        assert scheduler.batch_generator is not None
+        batch_req = scheduler.batch_generator.unprocessed_requests[0]
+        assert batch_req.prompt == [11, 12, 13]
+        assert batch_req.ignore_eos is True
+        assert batch_req.top_k == 7
+        assert batch_req.min_p == 0.05
+        assert batch_req.seed == 23
+
+    def test_ignore_eos_suppresses_only_model_control_stops(self):
+        from rapid_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            _is_control_stop_token,
+        )
+
+        normal = MLLMBatchRequest(uid=1, request_id="normal", prompt="hi")
+        benchmark = MLLMBatchRequest(
+            uid=2, request_id="benchmark", prompt=[1, 2], ignore_eos=True
+        )
+
+        assert _is_control_stop_token(99, {99}, normal) is True
+        assert _is_control_stop_token(99, {99}, benchmark) is False
+        assert _is_control_stop_token(98, {99}, benchmark) is False
+
+    def test_request_sampler_uses_every_registered_sampling_control(self, monkeypatch):
+        from rapid_mlx import mllm_batch_generator as batch_module
+        from rapid_mlx.mllm_batch_generator import MLLMBatchRequest, _request_sampler
+
+        observed = []
+
+        def fake_sampler(**kwargs):
+            observed.append(("unseeded", kwargs))
+            return object()
+
+        def fake_seeded_sampler(**kwargs):
+            observed.append(("seeded", kwargs))
+            return object()
+
+        monkeypatch.setattr(batch_module, "make_sampler", fake_sampler)
+        monkeypatch.setattr(batch_module, "make_seeded_sampler", fake_seeded_sampler)
+
+        request = MLLMBatchRequest(
+            uid=1,
+            request_id="sampled",
+            prompt=[1, 2],
+            temperature=0.7,
+            top_p=0.9,
+            top_k=11,
+            min_p=0.04,
+        )
+        first = _request_sampler(request)
+        assert _request_sampler(request) is first
+        assert observed == [
+            (
+                "unseeded",
+                {"temp": 0.7, "top_p": 0.9, "min_p": 0.04, "top_k": 11},
+            )
+        ]
+
+        request.seed = 29
+        seeded = _request_sampler(request)
+        assert seeded is not first
+        assert observed[-1] == (
+            "seeded",
+            {
+                "seed": 29,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "min_p": 0.04,
+                "top_k": 11,
+            },
+        )
+
+    def test_pretokenized_text_prompt_bypasses_processor_round_trip(self):
+        """Exact registered IDs must reach MLX without decode/re-tokenize."""
+        from rapid_mlx.mllm_batch_generator import (
+            MLLMBatchGenerator,
+            MLLMBatchRequest,
+        )
+
+        generator = object.__new__(MLLMBatchGenerator)
+        request = MLLMBatchRequest(
+            uid=1, request_id="benchmark", prompt=[101, 202, 303]
+        )
+
+        generator._preprocess_request(request)
+
+        assert request.input_ids.tolist() == [[101, 202, 303]]
+        assert request.pixel_values is None
+        assert request.extra_kwargs == {}
+
 
 @_skip_no_mlx_lm
 class TestMLLMEosContract:
@@ -645,7 +785,7 @@ class TestMLLMEosContract:
         multimodal model resolves ``<|endoftext|>`` as its model EOS.  The
         latter is the token emitted by the affected title-generation path.
         """
-        from vllm_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+        from rapid_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
 
         tokenizer = SimpleNamespace(eos_token_id=248046)
         processor = SimpleNamespace(tokenizer=tokenizer)
@@ -660,7 +800,7 @@ class TestMLLMEosContract:
 
     def test_nested_text_config_eos_is_a_supported_fallback(self):
         """Raw config-shaped MLLM models may retain EOS under text_config."""
-        from vllm_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+        from rapid_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
 
         processor = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=11))
         model = SimpleNamespace(config={"text_config": {"eos_token_id": [12, 13]}})
@@ -670,7 +810,7 @@ class TestMLLMEosContract:
         assert scheduler.stop_tokens == {11, 12, 13}
 
     def test_boolean_model_eos_is_not_a_token_id(self):
-        from vllm_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+        from rapid_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
 
         processor = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=11))
         model = SimpleNamespace(config=SimpleNamespace(eos_token_id=True))
@@ -681,7 +821,7 @@ class TestMLLMEosContract:
 
     def test_request_logits_processor_reaches_batch_generator(self):
         """Structured-output state stays request-local through admission."""
-        from vllm_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+        from rapid_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
 
         constraint = MagicMock()
         processor = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=7))
@@ -704,7 +844,7 @@ class TestMLLMSchedulerStopSequences:
 
     def test_mllm_request_carries_stop(self):
         """MLLMRequest should carry text-based stop sequences."""
-        from vllm_mlx.mllm_scheduler import MLLMRequest
+        from rapid_mlx.mllm_scheduler import MLLMRequest
 
         req = MLLMRequest(
             request_id="test-stop",
@@ -715,7 +855,7 @@ class TestMLLMSchedulerStopSequences:
 
     def test_mllm_request_default_stop_empty(self):
         """MLLMRequest.stop should default to empty list."""
-        from vllm_mlx.mllm_scheduler import MLLMRequest
+        from rapid_mlx.mllm_scheduler import MLLMRequest
 
         req = MLLMRequest(request_id="test-default", prompt="Hello")
         assert req.stop == []
@@ -724,13 +864,13 @@ class TestMLLMSchedulerStopSequences:
         """Empty stop entries are ineffective and must not bypass streaming text
         accumulation.
         """
-        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
-        from vllm_mlx.mllm_scheduler import (
+        from rapid_mlx.mllm_batch_generator import MLLMBatchResponse
+        from rapid_mlx.mllm_scheduler import (
             MLLMRequest,
             MLLMScheduler,
             MLLMSchedulerConfig,
         )
-        from vllm_mlx.request import SamplingParams
+        from rapid_mlx.request import SamplingParams
 
         class SegmentDetok:
             def __init__(self):
@@ -790,13 +930,13 @@ class TestMLLMSchedulerStopSequences:
 
     def test_process_batch_responses_stop_string(self):
         """_process_batch_responses should finish request when stop string found."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
-        from vllm_mlx.mllm_scheduler import (
+        from rapid_mlx.mllm_batch_generator import MLLMBatchResponse
+        from rapid_mlx.mllm_scheduler import (
             MLLMRequest,
             MLLMScheduler,
             MLLMSchedulerConfig,
         )
-        from vllm_mlx.request import SamplingParams
+        from rapid_mlx.request import SamplingParams
 
         # Create scheduler with mocks
         mock_model = MagicMock()
@@ -858,13 +998,13 @@ class TestMLLMSchedulerStopSequences:
         token, making no-match streaming O(n^2). The rolling tail
         matcher should need zero full decodes until an actual match.
         """
-        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
-        from vllm_mlx.mllm_scheduler import (
+        from rapid_mlx.mllm_batch_generator import MLLMBatchResponse
+        from rapid_mlx.mllm_scheduler import (
             MLLMRequest,
             MLLMScheduler,
             MLLMSchedulerConfig,
         )
-        from vllm_mlx.request import SamplingParams
+        from rapid_mlx.request import SamplingParams
 
         class FakeDetok:
             last_segment = ""
@@ -926,13 +1066,13 @@ class TestMLLMSchedulerStopSequences:
         nothing, otherwise stop trimming can leak or drop bytes at that
         boundary.
         """
-        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
-        from vllm_mlx.mllm_scheduler import (
+        from rapid_mlx.mllm_batch_generator import MLLMBatchResponse
+        from rapid_mlx.mllm_scheduler import (
             MLLMRequest,
             MLLMScheduler,
             MLLMSchedulerConfig,
         )
-        from vllm_mlx.request import SamplingParams
+        from rapid_mlx.request import SamplingParams
 
         class BufferingDetok:
             def __init__(self):
@@ -991,13 +1131,13 @@ class TestMLLMSchedulerStopSequences:
 
     def test_stop_string_split_across_chunks_does_not_leak_prefix(self):
         """Hold back enough tail text to hide stop prefixes split by chunks."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
-        from vllm_mlx.mllm_scheduler import (
+        from rapid_mlx.mllm_batch_generator import MLLMBatchResponse
+        from rapid_mlx.mllm_scheduler import (
             MLLMRequest,
             MLLMScheduler,
             MLLMSchedulerConfig,
         )
-        from vllm_mlx.request import SamplingParams
+        from rapid_mlx.request import SamplingParams
 
         class SegmentDetok:
             def __init__(self):
@@ -1056,13 +1196,13 @@ class TestMLLMSchedulerStopSequences:
 
     def test_stop_holdback_flushes_when_generation_finishes_without_match(self):
         """A no-match terminal chunk must release the held stop tail."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
-        from vllm_mlx.mllm_scheduler import (
+        from rapid_mlx.mllm_batch_generator import MLLMBatchResponse
+        from rapid_mlx.mllm_scheduler import (
             MLLMRequest,
             MLLMScheduler,
             MLLMSchedulerConfig,
         )
-        from vllm_mlx.request import SamplingParams
+        from rapid_mlx.request import SamplingParams
 
         class SegmentDetok:
             def __init__(self):
@@ -1123,13 +1263,13 @@ class TestMLLMSchedulerStopSequences:
 
     def test_terminal_stop_check_does_not_rematch_already_emitted_text(self):
         """Terminal holdback search must ignore stop strings already emitted."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
-        from vllm_mlx.mllm_scheduler import (
+        from rapid_mlx.mllm_batch_generator import MLLMBatchResponse
+        from rapid_mlx.mllm_scheduler import (
             MLLMRequest,
             MLLMScheduler,
             MLLMSchedulerConfig,
         )
-        from vllm_mlx.request import SamplingParams
+        from rapid_mlx.request import SamplingParams
 
         class EmptyTerminalDetok:
             last_segment = ""
@@ -1188,13 +1328,13 @@ class TestMLLMSchedulerStopSequences:
 
     def test_terminal_finalize_suffix_is_streamed_through_stop_flush(self):
         """EOF detokenizer suffix must reach streaming clients as new_text."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
-        from vllm_mlx.mllm_scheduler import (
+        from rapid_mlx.mllm_batch_generator import MLLMBatchResponse
+        from rapid_mlx.mllm_scheduler import (
             MLLMRequest,
             MLLMScheduler,
             MLLMSchedulerConfig,
         )
-        from vllm_mlx.request import SamplingParams
+        from rapid_mlx.request import SamplingParams
 
         class FinalizingDetok:
             last_segment = ""
@@ -1253,13 +1393,13 @@ class TestMLLMSchedulerStopSequences:
 
     def test_short_initial_stop_holdback_flushes_on_empty_terminal_chunk(self):
         """Held text shorter than the stop lookbehind must not be dropped."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
-        from vllm_mlx.mllm_scheduler import (
+        from rapid_mlx.mllm_batch_generator import MLLMBatchResponse
+        from rapid_mlx.mllm_scheduler import (
             MLLMRequest,
             MLLMScheduler,
             MLLMSchedulerConfig,
         )
-        from vllm_mlx.request import SamplingParams
+        from rapid_mlx.request import SamplingParams
 
         class SegmentDetok:
             def __init__(self):
@@ -1320,13 +1460,13 @@ class TestMLLMSchedulerStopSequences:
 
     def test_stop_holdback_flushes_on_backend_stop_finish(self):
         """Backend stop-token finish must still release safe held text."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
-        from vllm_mlx.mllm_scheduler import (
+        from rapid_mlx.mllm_batch_generator import MLLMBatchResponse
+        from rapid_mlx.mllm_scheduler import (
             MLLMRequest,
             MLLMScheduler,
             MLLMSchedulerConfig,
         )
-        from vllm_mlx.request import SamplingParams
+        from rapid_mlx.request import SamplingParams
 
         class SegmentDetok:
             def __init__(self):
@@ -1387,13 +1527,13 @@ class TestMLLMSchedulerStopSequences:
 
     def test_backend_stop_finish_trims_stop_marker_and_keeps_prefix(self):
         """Backend stop finish trims the marker but keeps visible prefix text."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
-        from vllm_mlx.mllm_scheduler import (
+        from rapid_mlx.mllm_batch_generator import MLLMBatchResponse
+        from rapid_mlx.mllm_scheduler import (
             MLLMRequest,
             MLLMScheduler,
             MLLMSchedulerConfig,
         )
-        from vllm_mlx.request import SamplingParams
+        from rapid_mlx.request import SamplingParams
 
         class SegmentDetok:
             def __init__(self):
@@ -1456,13 +1596,13 @@ class TestMLLMSchedulerStopSequences:
 
     def test_backend_stop_finish_flushes_visible_text_without_stop_match(self):
         """Backend stop finish without a user stop match still emits text."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
-        from vllm_mlx.mllm_scheduler import (
+        from rapid_mlx.mllm_batch_generator import MLLMBatchResponse
+        from rapid_mlx.mllm_scheduler import (
             MLLMRequest,
             MLLMScheduler,
             MLLMSchedulerConfig,
         )
-        from vllm_mlx.request import SamplingParams
+        from rapid_mlx.request import SamplingParams
 
         class SegmentDetok:
             def __init__(self):
@@ -1524,13 +1664,13 @@ class TestMLLMSchedulerStopSequences:
 
     def test_backend_stop_token_without_user_stop_is_not_decoded(self):
         """Backend EOS/stop token ids must not leak as visible text."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
-        from vllm_mlx.mllm_scheduler import (
+        from rapid_mlx.mllm_batch_generator import MLLMBatchResponse
+        from rapid_mlx.mllm_scheduler import (
             MLLMRequest,
             MLLMScheduler,
             MLLMSchedulerConfig,
         )
-        from vllm_mlx.request import SamplingParams
+        from rapid_mlx.request import SamplingParams
 
         class SegmentDetok:
             last_segment = ""
@@ -1585,13 +1725,13 @@ class TestMLLMSchedulerStopSequences:
 
     def test_backend_stop_with_bad_detokenizer_segment_does_not_fallback_decode(self):
         """A broken detokenizer must not make backend stop ids visible."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
-        from vllm_mlx.mllm_scheduler import (
+        from rapid_mlx.mllm_batch_generator import MLLMBatchResponse
+        from rapid_mlx.mllm_scheduler import (
             MLLMRequest,
             MLLMScheduler,
             MLLMSchedulerConfig,
         )
-        from vllm_mlx.request import SamplingParams
+        from rapid_mlx.request import SamplingParams
 
         class BadDetok:
             last_segment = object()
@@ -1648,13 +1788,13 @@ class TestMLLMSchedulerStopSequences:
 
     def test_backend_stop_token_finalizes_buffered_visible_text(self):
         """EOS/control stop tokens should flush buffered pre-EOS text."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
-        from vllm_mlx.mllm_scheduler import (
+        from rapid_mlx.mllm_batch_generator import MLLMBatchResponse
+        from rapid_mlx.mllm_scheduler import (
             MLLMRequest,
             MLLMScheduler,
             MLLMSchedulerConfig,
         )
-        from vllm_mlx.request import SamplingParams
+        from rapid_mlx.request import SamplingParams
 
         class BufferingDetok:
             last_segment = ""
@@ -1711,13 +1851,13 @@ class TestMLLMSchedulerStopSequences:
 
     def test_empty_terminal_chunk_scans_held_stop_before_flush(self):
         """Terminal empty chunks must not flush a held stop sequence."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
-        from vllm_mlx.mllm_scheduler import (
+        from rapid_mlx.mllm_batch_generator import MLLMBatchResponse
+        from rapid_mlx.mllm_scheduler import (
             MLLMRequest,
             MLLMScheduler,
             MLLMSchedulerConfig,
         )
-        from vllm_mlx.request import SamplingParams
+        from rapid_mlx.request import SamplingParams
 
         class SegmentDetok:
             last_segment = ""
@@ -1779,13 +1919,13 @@ class TestMLLMSchedulerStopSequences:
 
     def test_length_terminal_held_stop_reports_stop_finish_reason(self):
         """A terminal held user stop should override backend length finish."""
-        from vllm_mlx.mllm_batch_generator import MLLMBatchResponse
-        from vllm_mlx.mllm_scheduler import (
+        from rapid_mlx.mllm_batch_generator import MLLMBatchResponse
+        from rapid_mlx.mllm_scheduler import (
             MLLMRequest,
             MLLMScheduler,
             MLLMSchedulerConfig,
         )
-        from vllm_mlx.request import SamplingParams
+        from rapid_mlx.request import SamplingParams
 
         class SegmentDetok:
             last_segment = ""
@@ -1840,7 +1980,7 @@ class TestMLLMSchedulerStopSequences:
 
     def test_add_request_forwards_stop(self):
         """add_request should store stop sequences on the MLLMRequest."""
-        from vllm_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+        from rapid_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
 
         mock_model = MagicMock()
         mock_processor = MagicMock()
@@ -1865,9 +2005,9 @@ class TestPrefillErrorCleanup:
         """step() error path must remove failed requests from batch generator."""
         import asyncio
 
-        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
-        from vllm_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
-        from vllm_mlx.request import RequestStatus
+        from rapid_mlx.mllm_batch_generator import MLLMBatchRequest
+        from rapid_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+        from rapid_mlx.request import ClientRequestError, RequestStatus
 
         mock_model = MagicMock()
         mock_processor = MagicMock()
@@ -1885,7 +2025,7 @@ class TestPrefillErrorCleanup:
 
         # Manually insert a request as if it was scheduled
         req_id = "bad-req"
-        from vllm_mlx.mllm_scheduler import MLLMRequest
+        from rapid_mlx.mllm_scheduler import MLLMRequest
 
         scheduler.requests[req_id] = MLLMRequest(
             request_id=req_id,
@@ -1906,8 +2046,11 @@ class TestPrefillErrorCleanup:
         scheduler.request_id_to_uid[req_id] = 42
         scheduler.uid_to_request_id[42] = req_id
 
-        # Make next() raise to simulate prefill error
-        bg.next = MagicMock(side_effect=ValueError("prompt too large"))
+        # Make next() raise the typed client-error shape used by prompt/media
+        # validation. This branch must stay distinct from runtime failures:
+        # bounded input diagnostics are logged without a crash traceback and
+        # retain their HTTP 400 classification.
+        bg.next = MagicMock(side_effect=ClientRequestError("prompt too large"))
 
         scheduler.step()
 
@@ -1916,12 +2059,12 @@ class TestPrefillErrorCleanup:
         # Scheduler bookkeeping should be clean
         assert req_id not in scheduler.running
         assert req_id not in scheduler.request_id_to_uid
-        # Error output should have been queued. finish_reason is "length"
-        # (OpenAI-spec-compliant abort signal), not the legacy "error"
-        # literal — see scheduler.py rationale.
+        # Error output should have been queued with the client-owned type.
         queued = scheduler.output_queues[req_id].get_nowait()
         assert queued.finished is True
-        assert queued.finish_reason == "length"
+        assert queued.finish_reason == "error"
+        assert queued.error == "prompt too large"
+        assert queued.error_kind == "invalid_request"
         performance = scheduler.performance.snapshot()
         assert performance.requests_failed == 1
         assert performance.prompt_tokens == 7
@@ -1930,8 +2073,8 @@ class TestPrefillErrorCleanup:
         """A good request after a failed one should not be affected."""
         import asyncio
 
-        from vllm_mlx.mllm_batch_generator import MLLMBatchRequest
-        from vllm_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+        from rapid_mlx.mllm_batch_generator import MLLMBatchRequest
+        from rapid_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
 
         mock_model = MagicMock()
         mock_processor = MagicMock()
@@ -1976,8 +2119,8 @@ class TestDeferredAbortWaitingDeque:
 
     def test_do_abort_removes_waiting_when_request_none(self):
         """_do_abort_request should remove from waiting even if request already cleaned."""
-        from vllm_mlx.request import Request, RequestStatus, SamplingParams
-        from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+        from rapid_mlx.request import Request, RequestStatus, SamplingParams
+        from rapid_mlx.scheduler import Scheduler, SchedulerConfig
 
         mock_model = MagicMock()
         mock_tokenizer = MagicMock()
@@ -2019,7 +2162,7 @@ class TestMLLMAbortMissingRequest:
     must not raise on the new token-credit dereference (codex post-v0.6.14)."""
 
     def test_do_abort_request_when_request_missing(self):
-        from vllm_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+        from rapid_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
 
         mock_model = MagicMock()
         mock_processor = MagicMock()
@@ -2055,7 +2198,7 @@ class TestMLLMSchedulerIntegration:
         """Test single MLLM request."""
         from mlx_vlm import load
 
-        from vllm_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+        from rapid_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
 
         # Load a small model
         model, processor = load("mlx-community/Qwen3-VL-4B-Instruct-3bit")
@@ -2090,7 +2233,7 @@ class TestMLLMSchedulerIntegration:
         """Test multiple concurrent MLLM requests."""
         from mlx_vlm import load
 
-        from vllm_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+        from rapid_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
 
         model, processor = load("mlx-community/Qwen3-VL-4B-Instruct-3bit")
 
@@ -2130,7 +2273,7 @@ class TestMLLMSchedulerIntegration:
         """Test streaming MLLM generation."""
         from mlx_vlm import load
 
-        from vllm_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+        from rapid_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
 
         model, processor = load("mlx-community/Qwen3-VL-4B-Instruct-3bit")
 
@@ -2178,8 +2321,8 @@ class TestMLLMSchedulerErrorPropagation:
         must raise ValueError instead of yielding the fake-success output."""
         import asyncio
 
-        from vllm_mlx.mllm_scheduler import MLLMScheduler
-        from vllm_mlx.request import RequestOutput
+        from rapid_mlx.mllm_scheduler import MLLMScheduler
+        from rapid_mlx.request import RequestOutput
 
         sched = MLLMScheduler.__new__(MLLMScheduler)
         sched.output_queues = {}
@@ -2209,8 +2352,8 @@ class TestMLLMSchedulerErrorPropagation:
         """Only scheduler-vetted public errors cross the route trust boundary."""
         import asyncio
 
-        from vllm_mlx.mllm_scheduler import MLLMScheduler
-        from vllm_mlx.request import ClientRequestError, RequestOutput
+        from rapid_mlx.mllm_scheduler import MLLMScheduler
+        from rapid_mlx.request import ClientRequestError, RequestOutput
 
         sched = MLLMScheduler.__new__(MLLMScheduler)
         sched.output_queues = {}
@@ -2238,8 +2381,8 @@ class TestMLLMSchedulerErrorPropagation:
         unchanged — the error check is additive, not a behavior swap."""
         import asyncio
 
-        from vllm_mlx.mllm_scheduler import MLLMScheduler
-        from vllm_mlx.request import RequestOutput
+        from rapid_mlx.mllm_scheduler import MLLMScheduler
+        from rapid_mlx.request import RequestOutput
 
         sched = MLLMScheduler.__new__(MLLMScheduler)
         sched.output_queues = {}
@@ -2275,8 +2418,8 @@ class TestMLLMSchedulerErrorPropagation:
         """
         import asyncio
 
-        from vllm_mlx.mllm_scheduler import MLLMScheduler
-        from vllm_mlx.request import RequestOutput
+        from rapid_mlx.mllm_scheduler import MLLMScheduler
+        from rapid_mlx.request import RequestOutput
 
         sched = MLLMScheduler.__new__(MLLMScheduler)
         sched.output_queues = {}

@@ -30,9 +30,9 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from vllm_mlx.share import cli as share_cli
-from vllm_mlx.share import quicksilver as qs
-from vllm_mlx.share import ws_tunnel
+from rapid_mlx.share import cli as share_cli
+from rapid_mlx.share import quicksilver as qs
+from rapid_mlx.share import ws_tunnel
 
 SHARE_KEY = "qspsk-" + "k" * 32
 PROVIDER_KEY = "qsppk-" + "p" * 32
@@ -58,7 +58,7 @@ def _make_args(**overrides) -> argparse.Namespace:
         model="qwen3.6-35b",
         _original_alias=None,
         port=18765,
-        thinking=False,
+        thinking=None,
         cors_origins=None,
         rate_limit=None,
         chat_frontend=None,
@@ -1363,7 +1363,7 @@ def test_heartbeat_404_beats_on_and_logs_once(caplog):
 
     with (
         patch.object(qs, "_open", fake_urlopen),
-        caplog.at_level(logging.INFO, logger="vllm_mlx.share.quicksilver"),
+        caplog.at_level(logging.INFO, logger="rapid_mlx.share.quicksilver"),
     ):
         hb._beat_once()
         hb._beat_once()
@@ -1450,7 +1450,7 @@ def test_heartbeat_stop_warns_when_thread_survives_join(caplog):
     hb = _hb()
     hb._thread = MagicMock()
     hb._thread.is_alive.return_value = True
-    with caplog.at_level(logging.WARNING, logger="vllm_mlx.share.quicksilver"):
+    with caplog.at_level(logging.WARNING, logger="rapid_mlx.share.quicksilver"):
         hb.stop()
     assert "one final request" in caplog.text
 
@@ -1555,6 +1555,50 @@ def test_run_share_first_run_registers_caches_and_prints_keyless_banner(capsys):
     serve.terminate.assert_called_once()
 
 
+def test_glm_flash_banner_prints_prompt_envelope(capsys):
+    tunnel = _fake_tunnel()
+    serve, ctrl_c = _patched_run_env(None)
+    ctxs = _run_patches(serve, lambda **kw: tunnel, ctrl_c) + (
+        patch.object(
+            qs,
+            "_open",
+            lambda req, timeout=None: _FakeResp(
+                _register_payload(model="glm-5.3-flash")
+            ),
+        ),
+        patch.object(qs, "_Heartbeat", return_value=_fake_heartbeat_class()),
+    )
+    with _enter(*ctxs):
+        qs.run_share(_make_args(model="glm-5.3-flash", provider_key=PROVIDER_KEY))
+
+    assert "max prompt 16384 tokens" in capsys.readouterr().out
+
+
+def test_glm_flash_banner_prints_explicit_prompt_override(capsys):
+    tunnel = _fake_tunnel()
+    serve, ctrl_c = _patched_run_env(None)
+    ctxs = _run_patches(serve, lambda **kw: tunnel, ctrl_c) + (
+        patch.object(
+            qs,
+            "_open",
+            lambda req, timeout=None: _FakeResp(
+                _register_payload(model="glm-5.3-flash")
+            ),
+        ),
+        patch.object(qs, "_Heartbeat", return_value=_fake_heartbeat_class()),
+    )
+    with _enter(*ctxs):
+        qs.run_share(
+            _make_args(
+                model="glm-5.3-flash",
+                provider_key=PROVIDER_KEY,
+                _passthrough=["--max-prompt-tokens=8192"],
+            )
+        )
+
+    assert "max prompt 8192 tokens" in capsys.readouterr().out
+
+
 def test_run_share_serve_uses_served_model_name_catalog_id():
     """§5.4 + readiness: the pool addresses the node by its catalog id while the
     serve alias differs, so serve is spawned with --served-model-name=<catalog
@@ -1591,7 +1635,7 @@ def test_run_share_serve_uses_served_model_name_catalog_id():
 
 def test_top_level_cli_accepts_known_quicksilver_catalog_id(monkeypatch):
     """The global alias guard must let the pool resolver map catalog ids."""
-    from vllm_mlx import cli as top_cli
+    from rapid_mlx import cli as top_cli
 
     called = MagicMock()
     monkeypatch.setattr(
@@ -2377,7 +2421,7 @@ def test_save_cache_preserves_primary_error_when_tmp_cleanup_fails():
 
 
 def test_resolve_serve_hf_path_uses_profile_and_falls_back():
-    import vllm_mlx.model_aliases as aliases
+    import rapid_mlx.model_aliases as aliases
 
     with patch.object(aliases, "resolve_profile", return_value={"hf_path": "org/repo"}):
         assert qs._resolve_serve_hf_path("alias") == "org/repo"
@@ -2393,9 +2437,9 @@ def test_wire_urls_require_a_host_even_with_secure_scheme():
 
 
 def test_hardware_info_is_best_effort(monkeypatch):
-    import vllm_mlx
+    import rapid_mlx
 
-    monkeypatch.delattr(vllm_mlx, "__version__")
+    monkeypatch.delattr(rapid_mlx, "__version__")
     with patch.object(qs.subprocess, "run", side_effect=OSError("no sysctl")):
         assert qs._hardware_info() == {}
 
@@ -2948,3 +2992,283 @@ def test_ws_exception_falls_back_to_socket_close_code():
     ):
         asyncio.run(client.run())
     assert client.close_code == 1008
+
+
+# ───────────────── glm-5.3-flash: reasoning-required listing ─────────────────
+
+
+def _run_share_capture_extra(**args_over) -> list[str]:
+    tunnel = _fake_tunnel()
+    serve, ctrl_c = _patched_run_env(None)
+    spawned: dict = {}
+
+    def fake_spawn(**kw):
+        spawned.update(kw)
+        return serve
+
+    model = args_over.get("quicksilver_model") or args_over.get("model")
+    ctxs = _run_patches(serve, lambda **kw: tunnel, ctrl_c) + (
+        patch.object(
+            qs,
+            "_open",
+            lambda req, timeout=None: _FakeResp(_register_payload(model=model)),
+        ),
+        patch.object(qs, "_Heartbeat", return_value=_fake_heartbeat_class()),
+    )
+    with _enter(*ctxs, patch.object(share_cli, "_spawn_serve", side_effect=fake_spawn)):
+        qs.run_share(_make_args(provider_key=PROVIDER_KEY, **args_over))
+    return spawned["extra_args"]
+
+
+def test_glm_flash_catalog_resolves_both_directions():
+    assert qs.resolve_catalog(_make_args(model="glm-5.3-flash")) == (
+        "glm-5.3-flash",
+        "glm5.3-flash-4bit",
+    )
+    assert qs.resolve_catalog(_make_args(model="glm5.3-flash-4bit")) == (
+        "glm-5.3-flash",
+        "glm5.3-flash-4bit",
+    )
+
+
+def test_glm_flash_never_gets_no_thinking_injected():
+    # Upstream 400s reasoning.enabled=false for this listing; a node that
+    # suppressed reasoning would diverge from the cloud contract.
+    extra = _run_share_capture_extra(model="glm-5.3-flash")
+    assert "--no-thinking" not in extra
+    assert extra == [
+        "--max-num-seqs",
+        "2",
+        "--default-reasoning-effort",
+        "low",
+        "--max-prompt-tokens",
+        "16384",
+        "--served-model-name",
+        "glm-5.3-flash",
+    ]
+
+
+def test_glm_flash_gets_low_default_reasoning_effort():
+    """#3714: the template defaults to ``Reasoning Effort: Max``; the cloud
+    origin answers trivial prompts in a few tokens, so the node must too."""
+    extra = _run_share_capture_extra(model="glm-5.3-flash")
+    assert extra[extra.index("--default-reasoning-effort") + 1] == "low"
+
+
+@pytest.mark.parametrize(
+    "passthrough",
+    [["--default-reasoning-effort", "high"], ["--default-reasoning-effort=high"]],
+)
+def test_glm_flash_explicit_default_effort_passthrough_replaces_injection(passthrough):
+    extra = _run_share_capture_extra(model="glm-5.3-flash", _passthrough=passthrough)
+    assert (
+        extra.count("--default-reasoning-effort")
+        + sum(t.startswith("--default-reasoning-effort=") for t in extra)
+        == 1
+    )
+    assert "low" not in extra
+    assert extra[-len(passthrough) :] == passthrough
+
+
+@pytest.mark.parametrize(
+    "passthrough",
+    [["--default-reasoning-effort", "none"], ["--default-reasoning-effort=none"]],
+)
+def test_glm_flash_default_effort_none_is_rejected_before_registration(
+    passthrough, capsys
+):
+    """Codex r1: ``none`` translates to ``enable_thinking=False`` for every
+    bare request — the same contract breach the ``--no-thinking`` guard
+    exists for, so it is refused the same way."""
+    with pytest.raises(SystemExit) as exc:
+        _run_share_capture_extra(model="glm-5.3-flash", _passthrough=passthrough)
+    assert exc.value.code == 2
+    assert "reasoning always on" in capsys.readouterr().err
+
+
+def test_glm_flash_default_effort_last_occurrence_wins_for_the_guard():
+    """argparse store semantics: ``none`` overridden by a later ``low`` is
+    what serve runs with, so it passes."""
+    extra = _run_share_capture_extra(
+        model="glm-5.3-flash",
+        _passthrough=[
+            "--default-reasoning-effort=none",
+            "--default-reasoning-effort",
+            "low",
+        ],
+    )
+    assert extra.count("--default-reasoning-effort") == 1
+
+
+def test_other_catalogs_get_no_default_reasoning_effort():
+    extra = _run_share_capture_extra(model="qwen3.6-35b")
+    assert "--default-reasoning-effort" not in extra
+
+
+def test_glm_flash_gets_safe_prompt_cap_and_explicit_override_wins():
+    default = _run_share_capture_extra(model="glm-5.3-flash")
+    assert default[default.index("--max-prompt-tokens") + 1] == "16384"
+
+    explicit = _run_share_capture_extra(
+        model="glm-5.3-flash", _passthrough=["--max-prompt-tokens=8192"]
+    )
+    assert "--max-prompt-tokens" not in explicit
+    assert explicit.count("--max-prompt-tokens=8192") == 1
+
+
+def test_other_catalogs_get_no_prompt_cap():
+    extra = _run_share_capture_extra(model="qwen3.6-35b")
+    assert not any(t.startswith("--max-prompt-tokens") for t in extra)
+
+
+def test_glm_flash_explicit_no_thinking_passthrough_is_rejected(capsys):
+    with pytest.raises(SystemExit) as raised:
+        _run_share_capture_extra(model="glm-5.3-flash", _passthrough=["--no-thinking"])
+    assert raised.value.code == 2
+    assert "reasoning always on" in capsys.readouterr().err
+
+
+def test_glm_flash_attached_value_no_thinking_is_rejected_before_registration(capsys):
+    """``--no-thinking=false`` is still the flag to serve's parser (which
+    rejects the attached value); pool mode must refuse it before registering."""
+    with pytest.raises(SystemExit) as exc:
+        _run_share_capture_extra(
+            model="glm-5.3-flash", _passthrough=["--no-thinking=false"]
+        )
+    assert exc.value.code == 2
+    assert "reasoning always on" in capsys.readouterr().err
+
+
+def test_glm_flash_explicit_top_level_no_thinking_is_rejected(capsys):
+    """``share glm-5.3-flash --quicksilver --no-thinking`` (the parsed option,
+    not a passthrough token) must be rejected the same way, not silently
+    ignored while the child runs with reasoning on."""
+    with pytest.raises(SystemExit) as exc:
+        _run_share_capture_extra(model="glm-5.3-flash", thinking=False)
+    assert exc.value.code == 2
+    assert "reasoning always on" in capsys.readouterr().err
+
+
+def test_other_catalogs_still_get_no_thinking():
+    assert "--no-thinking" in _run_share_capture_extra(model="qwen3.6-35b")
+
+
+# ───────────────── registration: max_concurrency + detail shape ─────────────────
+
+
+@pytest.mark.parametrize(
+    "passthrough, expected",
+    [
+        ([], 2),
+        (["--max-num-seqs", "8"], 8),
+        (["--max-num-seqs=4"], 4),
+        (["--max-num-seqs", "64"], 64),
+        # argparse store semantics: the last occurrence is what serve runs with
+        (["--max-num-seqs", "8", "--max-num-seqs", "1"], 1),
+        (["--max-num-seqs=1", "--max-num-seqs", "8"], 8),
+        # every spelling argparse's ``type=int`` accepts is accepted here too
+        (["--max-num-seqs=+4"], 4),
+        (["--max-num-seqs", " 3 "], 3),
+    ],
+)
+def test_pool_max_concurrency_mirrors_serve_slots(passthrough, expected):
+    assert qs._pool_max_concurrency(passthrough) == expected
+
+
+@pytest.mark.parametrize(
+    "passthrough",
+    [
+        ["--max-num-seqs", "0"],
+        ["--max-num-seqs", "999"],
+        ["--max-num-seqs", "lots"],
+        ["--max-num-seqs"],
+        ["--max-num-seqs", "--foo", "--max-num-seqs", "4"],
+        ["--max-num-seqs", "lots", "--max-num-seqs", "4"],
+        ["--max-num-seqs", "4", "--max-num-seqs", "--foo"],
+    ],
+)
+def test_pool_max_concurrency_rejects_out_of_range(passthrough):
+    # Validated, never clamped: the advertised slot count must be exactly
+    # what the child serve admits, so an unservable value fails before
+    # registration instead of registering a capacity the node can't honor.
+    with pytest.raises(qs.QuickSilverError, match="between 1 and 64"):
+        qs._pool_max_concurrency(passthrough)
+
+
+def test_register_advertises_max_concurrency():
+    calls: list = []
+
+    def fake_urlopen(req, timeout=None):
+        calls.append(req)
+        return _FakeResp(_register_payload())
+
+    with patch.object(qs, "_open", fake_urlopen):
+        qs.register_node("https://pay.test", PROVIDER_KEY, "qwen3.6-35b", "al", "w")
+        qs.register_node(
+            "https://pay.test",
+            PROVIDER_KEY,
+            "qwen3.6-35b",
+            "al",
+            "w",
+            max_concurrency=8,
+        )
+    assert json.loads(calls[0].data)["max_concurrency"] == 2
+    assert json.loads(calls[1].data)["max_concurrency"] == 8
+
+
+def test_run_share_registers_with_passthrough_slot_count():
+    calls: list = []
+    tunnel = _fake_tunnel()
+    serve, ctrl_c = _patched_run_env(None)
+
+    def fake_urlopen(req, timeout=None):
+        calls.append(req)
+        return _FakeResp(_register_payload())
+
+    ctxs = _run_patches(serve, lambda **kw: tunnel, ctrl_c) + (
+        patch.object(qs, "_open", fake_urlopen),
+        patch.object(qs, "_Heartbeat", return_value=_fake_heartbeat_class()),
+    )
+    with _enter(*ctxs):
+        qs.run_share(
+            _make_args(provider_key=PROVIDER_KEY, _passthrough=["--max-num-seqs", "3"])
+        )
+    register = [r for r in calls if r.full_url.endswith("/v1/pool/nodes/register")]
+    assert json.loads(register[0].data)["max_concurrency"] == 3
+
+
+@pytest.mark.parametrize(
+    "body, expected",
+    [
+        (b'{"error":{"message":"bad model"}}', "bad model"),
+        (b'{"error":{"code":"E1"}}', "E1"),
+        (b'{"detail":"max_concurrency must be >= 1"}', "max_concurrency must be >= 1"),
+        (
+            b'{"detail":[{"loc":["body","model"],"msg":"field required"}]}',
+            '"field required"',
+        ),
+        (b"plain text", "plain text"),
+    ],
+)
+def test_error_detail_reads_error_and_fastapi_detail_shapes(body, expected):
+    assert expected in qs._error_detail(body)
+
+
+def test_rejected_no_thinking_never_registers():
+    # The contract check runs before registration so a refused invocation
+    # leaves no remote node behind (codex r4).
+    calls: list = []
+
+    def fake_urlopen(req, timeout=None):
+        calls.append(req)
+        return _FakeResp(_register_payload(model="glm-5.3-flash"))
+
+    with patch.object(qs, "_open", fake_urlopen), pytest.raises(SystemExit):
+        qs.run_share(
+            _make_args(
+                model="glm-5.3-flash",
+                provider_key=PROVIDER_KEY,
+                _passthrough=["--no-thinking"],
+            )
+        )
+    assert calls == []

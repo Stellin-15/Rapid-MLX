@@ -5,6 +5,47 @@ import Testing
 @MainActor
 @Suite("Custom instructions")
 struct CustomInstructionsTests {
+    @Test("Personal Intelligence keeps custom instructions out of quoted context")
+    func personalIntelligenceSeparatesTrustedInstructions() throws {
+        let (defaults, name) = freshDefaults()
+        defer { defaults.removePersistentDomain(forName: name) }
+        let config = CustomInstructionsConfig(defaults: defaults)
+        config.global = "Always answer in Spanish."
+        let model = ChatViewModel(
+            customInstructions: config,
+            persistsConversations: false
+        )
+        model.setConversationInstructions("Keep answers concise.")
+        #expect(model.beginAgentTurn("Remember project Cedar", alias: "model") {})
+        model.completeAgentTurn("Understood.")
+
+        let instructions = try #require(model.personalIntelligenceTrustedInstructions())
+        let context = try #require(model.personalIntelligenceLocalContext())
+        #expect(instructions.contains("Always answer in Spanish."))
+        #expect(instructions.contains("Keep answers concise."))
+        #expect(!context.contains("Always answer in Spanish."))
+        #expect(!context.contains("Keep answers concise."))
+        #expect(context.contains("Remember project Cedar"))
+    }
+
+    @Test("Personal Intelligence instructions use the server's Unicode-scalar limit")
+    func personalIntelligenceInstructionWireLimit() throws {
+        let (defaults, name) = freshDefaults()
+        defer { defaults.removePersistentDomain(forName: name) }
+        let config = CustomInstructionsConfig(defaults: defaults)
+        config.global = String(repeating: "👨‍👩‍👧‍👦", count: 4_000)
+        let model = ChatViewModel(
+            customInstructions: config,
+            persistsConversations: false
+        )
+        model.setConversationInstructions("Conversation wins.")
+
+        let instructions = try #require(model.personalIntelligenceTrustedInstructions())
+        #expect(instructions.unicodeScalars.count <= 8_192)
+        #expect(instructions.contains("Conversation wins."))
+        #expect(instructions.contains("</conversation_instructions>"))
+    }
+
     private static func source(_ relativePath: String) throws -> String {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -57,20 +98,18 @@ struct CustomInstructionsTests {
         let user = ChatMessage(role: .user, content: "Hello", status: .complete)
         let result = ChatViewModel.addingInstructionLayers(
             to: [user],
-            ambientPreamble: nil,
             global: " \n ",
             conversation: ""
         )
         #expect(result == [user])
     }
 
-    @Test("Ambient, existing, global, and conversation layers share one ordered system row")
+    @Test("Existing, global, and conversation layers share one ordered system row")
     func layersMergeInOrder() {
         let existing = ChatMessage(role: .system, content: "App system", status: .complete)
         let user = ChatMessage(role: .user, content: "Hello", status: .complete)
         let result = ChatViewModel.addingInstructionLayers(
             to: [existing, user],
-            ambientPreamble: "Ambient",
             global: "  Global  ",
             conversation: "Conversation\n"
         )
@@ -79,8 +118,6 @@ struct CustomInstructionsTests {
         #expect(result.first?.role == .system)
         #expect(
             result.first?.content == """
-            Ambient
-
             App system
 
             [GLOBAL USER INSTRUCTIONS]
@@ -99,12 +136,12 @@ struct CustomInstructionsTests {
     @Test("Effective prompt preview uses the wire assembly and includes automatic context")
     func effectivePromptPreviewUsesWireAssembly() {
         let preview = ChatViewModel.effectiveSystemPrompt(
-            dateContext: "[CURRENT DATE AND TIME]\nToday is Tuesday, August 25, 2026.",
+            dateContext: "[CURRENT DATE]\nToday is Tuesday, August 25, 2026.",
             global: "Reply in plain language.",
             conversation: "Use bullet points."
         )
 
-        #expect(preview.hasPrefix("[CURRENT DATE AND TIME]"))
+        #expect(preview.hasPrefix("[CURRENT DATE]"))
         #expect(preview.contains("[GLOBAL USER INSTRUCTIONS]"))
         #expect(preview.contains("Reply in plain language."))
         #expect(preview.contains("[CONVERSATION INSTRUCTIONS - HIGHEST USER PRIORITY]"))
@@ -137,10 +174,18 @@ struct CustomInstructionsTests {
             conversation: "Conversation"
         )
 
-        #expect(before.contains("Tuesday, August 25, 2026"))
-        #expect(before.contains("11:59 PM (GMT, GMT)"))
-        #expect(after.contains("Wednesday, August 26, 2026"))
-        #expect(after.contains("12:01 AM (GMT, GMT)"))
+        #expect(before.contains("Tuesday, August 25, 2026 (GMT)"))
+        #expect(after.contains("Wednesday, August 26, 2026 (GMT)"))
+        #expect(before != after)
+        // The preview shows what Rapid actually sends in the system row, and
+        // since 0.14.1 that is the DATE only — the wall clock rides each user
+        // turn instead, because a minute-resolution string at the head of the
+        // prompt costs the engine's prefix cache a full re-prefill of the
+        // conversation (measured 7.3 s vs 0.6 s). A preview that still quoted
+        // a time would be showing a system row the app never sends.
+        #expect(!before.contains("11:59 PM"))
+        #expect(!after.contains("12:01 AM"))
+        #expect(!before.contains("[MESSAGE SENT]"))
 
         var tokyo = utc
         tokyo.timeZone = try #require(TimeZone(identifier: "Asia/Tokyo"))
@@ -150,8 +195,7 @@ struct CustomInstructionsTests {
             global: "Global",
             conversation: "Conversation"
         )
-        #expect(tokyoPreview.contains("Wednesday, August 26, 2026"))
-        #expect(tokyoPreview.contains("8:59 AM (GMT+9, Asia/Tokyo)"))
+        #expect(tokyoPreview.contains("Wednesday, August 26, 2026 (Asia/Tokyo)"))
         #expect(tokyoPreview != before)
     }
 
@@ -168,6 +212,10 @@ struct CustomInstructionsTests {
         #expect(editor.contains("this prompt wins."))
         #expect(editor.contains("DisclosureGroup(\"Effective System Prompt\""))
         #expect(editor.contains("Tool and attachment context may be added when you send."))
+        // The system row no longer carries the wall clock, so the caption has
+        // to say where it went — otherwise the preview reads as "the model
+        // does not know what time it is".
+        #expect(editor.contains("Each message you send carries the time you sent it."))
         #expect(editor.contains("TimelineView(.periodic(from: .now, by: 60))"))
         #expect(editor.contains("at: context.date"))
         #expect(editor.contains("calendar: .autoupdatingCurrent"))
@@ -183,7 +231,6 @@ struct CustomInstructionsTests {
     func conversationLayerHasExplicitPrecedence() {
         let result = ChatViewModel.addingInstructionLayers(
             to: [ChatMessage(role: .user, content: "Test", status: .complete)],
-            ambientPreamble: nil,
             global: "Reply only in Simplified Chinese.",
             conversation: "Reply only in English."
         )
@@ -239,21 +286,6 @@ struct CustomInstructionsTests {
                 "If they conflict with the global user instructions above, follow THESE conversation instructions."
             )
         )
-    }
-
-    @Test("Removing ambient guidance preserves every user-authored layer")
-    func ambientRemovalPreservesCustomLayers() {
-        let merged = ChatViewModel.addingInstructionLayers(
-            to: [ChatMessage(role: .user, content: "Hello", status: .complete)],
-            ambientPreamble: "Ambient",
-            global: "Global",
-            conversation: "Conversation"
-        )
-        let result = ChatViewModel.removingLeadingSystemComponent("Ambient", from: merged)
-        #expect(result.first?.content.hasPrefix("[GLOBAL USER INSTRUCTIONS]") == true)
-        #expect(result.first?.content.contains("Global") == true)
-        #expect(result.first?.content.contains("[CONVERSATION INSTRUCTIONS") == true)
-        #expect(result.first?.content.contains("Conversation") == true)
     }
 
     @Test("Conversation instructions persist and restore with their own chat")
@@ -321,7 +353,6 @@ struct CustomInstructionsTests {
 
         let wire = ChatViewModel.addingInstructionLayers(
             to: [ChatMessage(role: .user, content: "Next turn", status: .complete)],
-            ambientPreamble: nil,
             global: model.customInstructions.global,
             conversation: model.conversationInstructions
         )

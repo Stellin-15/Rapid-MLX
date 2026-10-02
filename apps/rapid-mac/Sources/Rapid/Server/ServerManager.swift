@@ -2,6 +2,31 @@ import Darwin
 import Foundation
 import Observation
 
+extension SidecarStartupFailure {
+    /// Actionable copy shown when the sidecar exits before becoming ready.
+    var message: String {
+        let extraName = extra?.displayName ?? "Optional"
+        switch reason {
+        case .runtimeExtraMissing:
+            return "The installed engine doesn't include \(extraName) support. Open Startup Log for installation details."
+        case .runtimeDependencyMissing:
+            return "\(extraName) support is missing a required runtime dependency. Open Startup Log for setup details."
+        case .pythonVersionUnsupported:
+            return "The installed engine's Python version can't run \(extraName) models. Open Startup Log for the required version."
+        case .runtimeIncompatible:
+            return "The installed \(extraName) runtime isn't compatible with this engine. Open Startup Log for repair details."
+        case .runtimeBroken:
+            return "The installed \(extraName) runtime couldn't load. Open Startup Log for repair details."
+        case .modelNotFound:
+            return "Model not found on Hugging Face. Check the name or pick another model."
+        case .modelGated:
+            return "This model is private, gated, or does not exist on Hugging Face. If you have access, accept the licence on Hugging Face and sign in (huggingface-cli login or HF_TOKEN); otherwise check the name with rapid-mlx models."
+        case .hubOffline:
+            return "Could not reach Hugging Face. Check your connection or choose an already-downloaded model."
+        }
+    }
+}
+
 /// FIFO state machine for memory-risk confirmations. A request token is
 /// present for ``ensureServing`` callers that must await their own answer;
 /// direct ``start`` calls still queue a prompt but retain no result.
@@ -31,6 +56,7 @@ final class MemoryLoadConfirmationQueue {
 
         var warning: ModelSizing.MemoryWarning
         var requestID: UUID?
+        var onboardingEngineAttemptToken: UUID?
         var phase: Phase = .awaitingDecision
         var launchComplete = false
     }
@@ -43,8 +69,20 @@ final class MemoryLoadConfirmationQueue {
         return pending.first?.warning
     }
 
-    func enqueue(warning: ModelSizing.MemoryWarning, requestID: UUID?) {
-        pending.append(Pending(warning: warning, requestID: requestID))
+    func enqueue(
+        warning: ModelSizing.MemoryWarning,
+        requestID: UUID?,
+        onboardingEngineAttemptToken: UUID? = nil
+    ) {
+        pending.append(Pending(
+            warning: warning,
+            requestID: requestID,
+            onboardingEngineAttemptToken: onboardingEngineAttemptToken
+        ))
+    }
+
+    func onboardingEngineAttemptToken(warningID: UUID) -> UUID? {
+        pending.first { $0.warning.id == warningID }?.onboardingEngineAttemptToken
     }
 
     /// Replace the measured facts for the visible decision without changing
@@ -532,6 +570,23 @@ final class ServerManager {
         return true
     }
 
+    @discardableResult
+    func refreshEffectiveRuntimeConfig() async -> Bool {
+        guard case .ready = state else {
+            effectiveRuntimeConfig = nil
+            return false
+        }
+        guard let snapshot = await EffectiveRuntimeConfigClient().fetch(
+            port: activePort,
+            bearer: activeBearer
+        ) else {
+            effectiveRuntimeConfig = nil
+            return false
+        }
+        effectiveRuntimeConfig = snapshot
+        return true
+    }
+
     func confirmPendingModelSwitch(_ request: PendingModelSwitch) {
         resolvePendingModelSwitch(request, approved: true)
     }
@@ -634,6 +689,10 @@ final class ServerManager {
     /// Bounded to `logBufferCapacity` entries.
     private(set) var logLines: [String] = []
 
+    /// Structured failure accepted from this child's stderr during startup.
+    /// The UI uses only its closed message/action mapping, never raw stderr.
+    private(set) var startupFailure: SidecarStartupFailure?
+
     /// Most recent in-process residency load rejections, keyed by the alias
     /// that failed. Per-alias rather than a single global slot so two
     /// concurrent loads of DIFFERENT models cannot clobber each other across
@@ -697,6 +756,10 @@ final class ServerManager {
     /// where an auto-start or model selection could otherwise race a second
     /// model into memory.
     private var communityBenchmarkReservations: Set<UUID> = []
+    /// Alias displaced by the first reservation in a serialized benchmark
+    /// ownership chain. Captured on MainActor at the reservation boundary.
+    private var communityBenchmarkDisplacedAlias: String?
+    private var communityBenchmarkRestorationInFlight = false
     private var communityBenchmarkWaiters: [
         (
             id: UUID,
@@ -775,6 +838,10 @@ final class ServerManager {
     /// the 8000…8009 legacy window) the value is republished so
     /// ChatViewModel re-targets the chat client URL.
     private(set) var activePort: Int = PortSweep.defaultPort
+
+    /// Exact engine-construction values and provenance reported by rapid-mlx.
+    /// Desktop renders this read-only and never reimplements resolver policy.
+    private(set) var effectiveRuntimeConfig: EffectiveRuntimeConfigSnapshot?
 
     /// Issue #17 desktop-half: active bearer secret. Generated or restored
     /// by ``start()`` under the user's lifetime policy and handed to the child via the
@@ -860,6 +927,19 @@ final class ServerManager {
         activeBearer = bearer
         activeServerSessionID = bearer == nil ? nil : UUID()
         activeModelProfile = nil
+        effectiveRuntimeConfig = nil
+    }
+
+    /// Retrigger the read-only runtime snapshot after a new child becomes
+    /// ready. The session ID changes at spawn time, before the endpoint can
+    /// answer; readiness therefore has to be part of the task identity too.
+    var effectiveRuntimeConfigRefreshID: String {
+        let readiness: String
+        switch state {
+        case .ready: readiness = "ready"
+        default: readiness = "not-ready"
+        }
+        return "\(activeServerSessionID?.uuidString ?? "none"):\(readiness)"
     }
 
     func applyActiveModelProfile(_ profile: ServerModelProfile, forAlias alias: String) {
@@ -1598,12 +1678,20 @@ final class ServerManager {
     internal func _testSimulateChildExit(
         expectedStop: Bool,
         status: Int32,
-        reason: Process.TerminationReason
+        reason: Process.TerminationReason,
+        startupFailure: SidecarStartupFailure? = nil,
+        readyObserved: Bool = false
     ) {
         let stubChild = ProcessGroupChild.testStub()
         self.child = stubChild
         self.expectedStop = expectedStop
-        handleChildExit(process: stubChild, status: status, reason: reason)
+        handleChildExit(
+            process: stubChild,
+            status: status,
+            reason: reason,
+            startupFailure: startupFailure,
+            readyObserved: readyObserved
+        )
     }
 
     // MARK: - Persisted "last served" alias (v0.5.3 auto-restart)
@@ -1920,6 +2008,10 @@ final class ServerManager {
                 await refreshResidency()
                 if replacementGroup != nil {
                     state = .ready(alias: trimmed)
+                    DesktopFunnelReporter.enqueueEngineOutcomeIfArmed(
+                        .engineReady,
+                        alias: trimmed
+                    )
                 }
                 if replacementGroup == .assistant {
                     recordReadySelection(
@@ -2367,6 +2459,9 @@ final class ServerManager {
     private func activatePendingMemoryLoad(
         _ warning: ModelSizing.MemoryWarning
     ) async {
+        let onboardingAttemptToken = memoryConfirmations.onboardingEngineAttemptToken(
+            warningID: warning.id
+        )
         let provider = memorySnapshotProvider
         let snapshot = await Task.detached(priority: .utility) {
             provider()
@@ -2385,6 +2480,9 @@ final class ServerManager {
         } ?? false
         if plannedReleaseChanged {
             memoryConfirmations.cancelChecking(warningID: warning.id)
+            if let onboardingAttemptToken {
+                DesktopFunnelReporter.releaseOnboardingEngineAttempt(onboardingAttemptToken)
+            }
             return
         }
 
@@ -2420,8 +2518,12 @@ final class ServerManager {
             isAutoRespawn: currentWarning.isAutoRespawn,
             bypassMemoryGuard: true,
             videoOutputDirectory: currentWarning.videoOutputDirectory,
-            estimatedMemoryGB: currentWarning.footprintGB
+            estimatedMemoryGB: currentWarning.footprintGB,
+            onboardingEngineAttemptToken: onboardingAttemptToken
         )
+        if let onboardingAttemptToken {
+            DesktopFunnelReporter.releaseOnboardingEngineAttempt(onboardingAttemptToken)
+        }
         memoryConfirmRunning.remove(seq)
         memoryConfirmations.completeConfirmedLaunch(warningID: currentWarning.id)
     }
@@ -2440,10 +2542,16 @@ final class ServerManager {
         // load that was never started, so any launch still in flight belongs
         // to an EARLIER confirmation and its waiter must not be told it
         // finished.
-        _ = memoryConfirmations.resolveCurrent(
+        let onboardingAttemptToken = memoryConfirmations.onboardingEngineAttemptToken(
+            warningID: warning.id
+        )
+        let cancelled = memoryConfirmations.resolveCurrent(
             warningID: warning.id,
             decision: .cancelled
         )
+        if cancelled != nil, let onboardingAttemptToken {
+            DesktopFunnelReporter.releaseOnboardingEngineAttempt(onboardingAttemptToken)
+        }
     }
 
     func start(
@@ -2456,7 +2564,8 @@ final class ServerManager {
         memoryAdmission: MemoryAdmissionContext? = nil,
         catalogEntryHint: CatalogEntryHint? = nil,
         videoOutputDirectory: String? = nil,
-        estimatedMemoryGB: Double? = nil
+        estimatedMemoryGB: Double? = nil,
+        onboardingEngineAttemptToken: UUID? = nil
     ) async {
         guard !communityBenchmarkReserved else { return }
         // Issue #278: a manual restart is the user taking over the
@@ -2476,13 +2585,17 @@ final class ServerManager {
         guard !didSignalShutdown else { return }
         guard let binary = binaryPath else {
             state = .missing
+            DesktopFunnelReporter.enqueueEngineOutcomeIfArmed(
+                .engineStartFailed,
+                alias: alias
+            )
             return
         }
         let trimmedAlias = alias.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedAlias.isEmpty else { return }
         // Reject anything that could be misread as an extra argv flag
         // or that would inject newlines / control bytes into the log
-        // stream. Alias grammar in vllm_mlx/aliases.json is
+        // stream. Alias grammar in rapid_mlx/aliases.json is
         // ``[a-z0-9._-]`` and the longest registered entry is ~32
         // chars; cap conservatively at 128 so a typo doesn't generate
         // a giant child argv. [codex audit r1 ServerManager.swift:308]
@@ -2490,6 +2603,10 @@ final class ServerManager {
             state = .crashed(
                 alias: trimmedAlias,
                 message: "That model name isn't valid. Pick a model from the bar at the top."
+            )
+            DesktopFunnelReporter.enqueueEngineOutcomeIfArmed(
+                .engineStartFailed,
+                alias: trimmedAlias
             )
             return
         }
@@ -2569,8 +2686,14 @@ final class ServerManager {
                 )
                 memoryConfirmations.enqueue(
                     warning: warning,
-                    requestID: memoryRequestID
+                    requestID: memoryRequestID,
+                    onboardingEngineAttemptToken: onboardingEngineAttemptToken
                 )
+                if let onboardingEngineAttemptToken {
+                    DesktopFunnelReporter.retainOnboardingEngineAttempt(
+                        onboardingEngineAttemptToken
+                    )
+                }
                 // The user is now the decision-maker for this alias, so a
                 // queued auto-respawn must not answer for them. Parking a
                 // load leaves ``state`` untouched — still ``.crashed`` when
@@ -2703,6 +2826,7 @@ final class ServerManager {
         // Clear the log tail from any previous run so the user only
         // sees output relevant to the current process.
         logLines.removeAll(keepingCapacity: true)
+        startupFailure = nil
         downloadProgress.reset()
         // Stop any leftover byte monitor from a previous .starting
         // cycle before kicking a new one — defensive in case the
@@ -2784,6 +2908,10 @@ final class ServerManager {
                 alias: trimmedAlias,
                 message: "Couldn't start the model — another app may already be using what Rapid needs to run. Quit other local AI apps or development servers, then click Restart."
             )
+            DesktopFunnelReporter.enqueueEngineOutcomeIfArmed(
+                .engineStartFailed,
+                alias: trimmedAlias
+            )
             return
         }
         activePort = resolvedPort
@@ -2805,6 +2933,10 @@ final class ServerManager {
             state = .crashed(
                 alias: trimmedAlias,
                 message: "Couldn't start the model securely. Restart Rapid-MLX; if this keeps happening, please file a bug."
+            )
+            DesktopFunnelReporter.enqueueEngineOutcomeIfArmed(
+                .engineStartFailed,
+                alias: trimmedAlias
             )
             return
         }
@@ -2867,9 +2999,18 @@ final class ServerManager {
             defaultPreset: catalogEntry?.speculativeDecodingPreset,
             userOverrides: safeUserOverrides
         )
-        let performanceFlags = Self.mergedPerformanceFlags(
+        let mergedPerformanceFlags = Self.mergedPerformanceFlags(
             recommended: desktopDefaults,
             userOverrides: compatibleUserOverrides
+        )
+        let performanceFlags = Self.speculativeTextLaneFlags(
+            requested: Self.speculativeDecodingRequested(
+                defaultPreset: catalogEntry?.speculativeDecodingPreset,
+                userOverrides: compatibleUserOverrides
+            ),
+            supportsImageInput: catalogSupportsImageInput,
+            userOverrides: safeUserOverrides,
+            existing: mergedPerformanceFlags
         )
         var extraFlags = performanceFlags
         extraFlags.append(contentsOf: Self.residentLaunchFlags(
@@ -2929,10 +3070,15 @@ final class ServerManager {
         // non-blocking; each is constructed here while the handle is live.
         let stdoutDrainer = PipeDrainer(stdoutPipe.fileHandleForReading)
         let stderrDrainer = PipeDrainer(stderrPipe.fileHandleForReading)
-        let makeChunkHandler: (PipeDrainer) -> @Sendable (FileHandle) -> Void = { drainer in
+        let startupFailureCapture = SidecarStartupFailureCapture()
+        let makeChunkHandler: (
+            PipeDrainer,
+            SidecarStartupFailureCapture.Source
+        ) -> @Sendable (FileHandle) -> Void = { drainer, source in
             { [weak self] _ in
                 let data = drainer.drain().data
                 guard !data.isEmpty else { return }
+                startupFailureCapture.ingest(data, source: source)
                 guard let text = String(data: data, encoding: .utf8) else { return }
                 // rapid-mlx's HuggingFace tqdm output uses '\r' to refresh
                 // in place when stderr is not a TTY. Treat both as
@@ -2947,8 +3093,14 @@ final class ServerManager {
                 }
             }
         }
-        stdoutPipe.fileHandleForReading.readabilityHandler = makeChunkHandler(stdoutDrainer)
-        stderrPipe.fileHandleForReading.readabilityHandler = makeChunkHandler(stderrDrainer)
+        stdoutPipe.fileHandleForReading.readabilityHandler = makeChunkHandler(
+            stdoutDrainer,
+            .sidecarStdout
+        )
+        stderrPipe.fileHandleForReading.readabilityHandler = makeChunkHandler(
+            stderrDrainer,
+            .sidecarStderr
+        )
 
         // Termination handler fires on a background queue — must hop
         // back to MainActor before touching state.
@@ -3006,13 +3158,27 @@ final class ServerManager {
             ) { [weak self] proc in
                 let status = proc.terminationStatus
                 let reason = proc.terminationReason
+                let stderrTail = stderrDrainer.drain().data
+                startupFailureCapture.ingest(stderrTail, source: .sidecarStderr)
+                let startupSnapshot = startupFailureCapture.snapshotAtTermination()
+                let tailLines = String(data: stderrTail, encoding: .utf8)?
+                    .split(whereSeparator: { $0 == "\r" || $0 == "\n" })
+                    .map(String.init)
+                    .filter { !$0.isEmpty } ?? []
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     guard self.child === proc else {
                         // Stale termination from a replaced child — drop.
                         return
                     }
-                    self.handleChildExit(process: proc, status: status, reason: reason)
+                    self.appendLogLines(tailLines)
+                    self.handleChildExit(
+                        process: proc,
+                        status: status,
+                        reason: reason,
+                        startupFailure: startupSnapshot.failure,
+                        readyObserved: startupSnapshot.readyObserved
+                    )
                 }
             }
         } catch {
@@ -3031,6 +3197,10 @@ final class ServerManager {
             // (principle: error copy must be human + actionable).
             print("[server] failed to start the model: \(error.localizedDescription)")
             state = .crashed(alias: trimmedAlias, message: "Couldn't start the model. Restart Rapid-MLX and try again.")
+            DesktopFunnelReporter.enqueueEngineOutcomeIfArmed(
+                .engineStartFailed,
+                alias: trimmedAlias
+            )
             isOperating = false
             return
         }
@@ -3115,7 +3285,7 @@ final class ServerManager {
             if tick > lastProgressAt {
                 lastProgressAt = tick
             }
-            if await probeHealth() {
+            if await probeHealth(startupFailureCapture: startupFailureCapture) {
                 // PR #26 codex meta-review finding 4 (P2): re-check
                 // child identity AFTER the await. ``start()`` is
                 // main-actor reentrant across the ``probeHealth``
@@ -3135,6 +3305,10 @@ final class ServerManager {
                     && !performanceFlags.contains("--no-mllm")
                     && !performanceFlags.contains("--text-only")
                 state = .ready(alias: trimmedAlias)
+                DesktopFunnelReporter.enqueueEngineOutcomeIfArmed(
+                    .engineReady,
+                    alias: trimmedAlias
+                )
                 // Issue #270: mark the spawn cycle as "demonstrably
                 // healthy" so a subsequent ``handleChildExit`` knows
                 // an auto-respawn is worth attempting.
@@ -3253,7 +3427,7 @@ final class ServerManager {
         // its cancelled subprocess. Serialize benchmark ownership so two
         // heavyweight local runners never overlap in unified memory.
         let reservation = UUID()
-        if communityBenchmarkReserved {
+        if communityBenchmarkReserved || communityBenchmarkRestorationInFlight {
             let waiterID = UUID()
             _ = try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation {
@@ -3277,6 +3451,15 @@ final class ServerManager {
             }
         } else {
             communityBenchmarkReservations.insert(reservation)
+            switch state {
+            case .ready(let alias), .starting(let alias):
+                communityBenchmarkDisplacedAlias = alias
+            case .crashed, .stopped, .idle, .missing:
+                // A failed post-benchmark restore retains its alias so the next
+                // serialized release gets a real retry path. Do not erase it
+                // merely because the failed start left the server stopped.
+                break
+            }
         }
         try throwIfCommunityBenchmarkCancelled(reservation)
         cancelAutoRespawn()
@@ -3317,14 +3500,59 @@ final class ServerManager {
     }
 
     /// Release the lifecycle reservation after the benchmark subprocess has
-    /// exited. The prior model is intentionally not auto-restored in the
-    /// internal beta; the user can start it again explicitly.
-    func finishCommunityBenchmark(_ reservation: UUID) {
-        guard communityBenchmarkReservations.remove(reservation) != nil else { return }
+    /// exited. The manager returns the alias atomically captured by the first
+    /// reservation only when the final serialized reservation is released;
+    /// ContentView then restores it through the ordinary Start path because
+    /// only the UI owns the catalog hint and readiness behavior.
+    @discardableResult
+    func finishCommunityBenchmark(_ reservation: UUID) -> String? {
+        guard communityBenchmarkReservations.remove(reservation) != nil else { return nil }
         if !communityBenchmarkReserved, !communityBenchmarkWaiters.isEmpty {
             let next = communityBenchmarkWaiters.removeFirst()
             communityBenchmarkReservations.insert(next.reservation)
             next.continuation.resume(returning: next.reservation)
+        }
+        guard !communityBenchmarkReserved else { return nil }
+        defer { communityBenchmarkDisplacedAlias = nil }
+        return communityBenchmarkDisplacedAlias
+    }
+
+    /// Release the final benchmark owner only after its displaced model has
+    /// finished restoring. New benchmark owners queue behind that restoration,
+    /// so they cannot race another heavyweight process into unified memory.
+    func finishCommunityBenchmark(
+        _ reservation: UUID,
+        restoringWith restore: @escaping @MainActor (String) async -> Bool
+    ) {
+        guard communityBenchmarkReservations.remove(reservation) != nil else { return }
+        guard !communityBenchmarkReserved else { return }
+        if !communityBenchmarkWaiters.isEmpty {
+            let next = communityBenchmarkWaiters.removeFirst()
+            communityBenchmarkReservations.insert(next.reservation)
+            next.continuation.resume(returning: next.reservation)
+            return
+        }
+        let alias = communityBenchmarkDisplacedAlias
+        communityBenchmarkDisplacedAlias = nil
+        guard let alias else { return }
+        communityBenchmarkRestorationInFlight = true
+        Task { @MainActor [weak self] in
+            let restored = await restore(alias)
+            guard let self else { return }
+            self.communityBenchmarkRestorationInFlight = false
+            if !restored || !self.communityBenchmarkWaiters.isEmpty {
+                // The resumed owner will stop the model we just restored.
+                // Preserve that identity across the serialized ownership
+                // chain so the final owner restores it again on release. A
+                // failed restore is retained even without a waiter, giving a
+                // later benchmark release a bounded recovery opportunity.
+                self.communityBenchmarkDisplacedAlias = alias
+            }
+            if !self.communityBenchmarkWaiters.isEmpty {
+                let next = self.communityBenchmarkWaiters.removeFirst()
+                self.communityBenchmarkReservations.insert(next.reservation)
+                next.continuation.resume(returning: next.reservation)
+            }
         }
     }
 
@@ -3635,6 +3863,12 @@ final class ServerManager {
             }
             if let message = reason {
                 state = .crashed(alias: alias, message: message)
+                if !spawnCycleReachedReady {
+                    DesktopFunnelReporter.enqueueEngineOutcomeIfArmed(
+                        .engineStartFailed,
+                        alias: alias
+                    )
+                }
             } else {
                 state = .stopped
             }
@@ -3648,7 +3882,9 @@ final class ServerManager {
     private func handleChildExit(
         process: ProcessGroupChild,
         status: Int32,
-        reason: Process.TerminationReason
+        reason: Process.TerminationReason,
+        startupFailure capturedStartupFailure: SidecarStartupFailure? = nil,
+        readyObserved: Bool = false
     ) {
         let alias: String
         switch state {
@@ -3707,7 +3943,7 @@ final class ServerManager {
         // ``shutdownSync()`` / ``dismissTerminalState()``) so passing
         // ``reachedReadyThisCycle = false`` here just clears
         // ``readyAt`` without touching ``autoRespawnAttempts``.
-        let reachedReadyThisCycle = spawnCycleReachedReady
+        let reachedReadyThisCycle = spawnCycleReachedReady || readyObserved
         applyChildExitBudgetReset(reachedReadyThisCycle: !wasExpected && reachedReadyThisCycle)
         // #20: the child is gone (clean exit or crash). The next
         // launch must not pick up a record pointing at this PID,
@@ -3737,22 +3973,33 @@ final class ServerManager {
             ProcessGroupChild.reapProcessGroupInBackground(processGroupID: process.processGroupID)
         }
         let message: String
-        switch reason {
-        case .exit:
-            message = status == 0
-                ? "The model stopped on its own (no restart was requested)."
-                : "The model stopped unexpectedly."
-        case .uncaughtSignal:
-            // SIGKILL (9) on a model process is almost always the macOS
-            // memory pressure killer — surface an OOM-aware, actionable
-            // message instead of a raw signal number.
-            message = status == 9
-                ? "The model ran out of memory and was stopped. Try a smaller model, or close other apps to free up memory."
-                : "The model stopped unexpectedly."
-        @unknown default:
-            message = "The model stopped unexpectedly."
+        if !reachedReadyThisCycle, let capturedStartupFailure {
+            startupFailure = capturedStartupFailure
+            message = capturedStartupFailure.message
+        } else {
+            switch reason {
+            case .exit:
+                message = status == 0
+                    ? "The model stopped on its own (no restart was requested)."
+                    : "The model stopped unexpectedly."
+            case .uncaughtSignal:
+                // SIGKILL (9) on a model process is almost always the macOS
+                // memory pressure killer — surface an OOM-aware, actionable
+                // message instead of a raw signal number.
+                message = status == 9
+                    ? "The model ran out of memory and was stopped. Try a smaller model, or close other apps to free up memory."
+                    : "The model stopped unexpectedly."
+            @unknown default:
+                message = "The model stopped unexpectedly."
+            }
         }
         state = .crashed(alias: alias, message: message)
+        if !reachedReadyThisCycle {
+            DesktopFunnelReporter.enqueueEngineOutcomeIfArmed(
+                .engineStartFailed,
+                alias: alias
+            )
+        }
         // Issue #270: silent idle-state crash. The user closed every
         // chat window via Cmd+W and then rapid-mlx died (OOM, SIGSEGV,
         // model worker hang). Previously the desktop stayed alive but
@@ -4046,9 +4293,19 @@ final class ServerManager {
         // carry no signal a human would want to read.
         var displayable: [String] = []
         displayable.reserveCapacity(lines.count)
+        //
+        // 0.14.1 dogfood: the app's own ``/healthz`` and
+        // ``/v1/models/residency`` poll loops each produce a uvicorn
+        // access line, and between them they evicted the whole ring
+        // buffer within minutes of idling — a user who opened the
+        // drawer saw the app talking to itself and nothing else. Same
+        // treatment as the byte heartbeat, same reasoning; see
+        // ``ServerLogNoise``, which keeps FAILED polls so a broken
+        // server still shows up here.
         for line in lines {
             downloadProgress.ingest(line)
-            if !DownloadProgress.isHeartbeatLogLine(line) {
+            if !DownloadProgress.isHeartbeatLogLine(line),
+               !ServerLogNoise.isAppPollAccessLine(line) {
                 displayable.append(line)
             }
         }
@@ -4066,17 +4323,33 @@ final class ServerManager {
     /// client and v0.2 has no binary-size constraint to justify
     /// reinventing it. A 1.5 s per-request timeout keeps the poll
     /// loop responsive.
-    private func probeHealth() async -> Bool {
+    private func probeHealth(
+        startupFailureCapture: SidecarStartupFailureCapture? = nil
+    ) async -> Bool {
         guard let url = URL(string: "http://\(host):\(activePort)/healthz") else { return false }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
+        request.applyRapidClientHeader()
         request.timeoutInterval = 1.5
-        do {
-            let (_, response) = try await healthSession.data(for: request)
-            guard let http = response as? HTTPURLResponse else { return false }
-            return (200..<300).contains(http.statusCode)
-        } catch {
-            return false
+        return await withCheckedContinuation { continuation in
+            healthSession.dataTask(with: request) { _, response, error in
+                let statusCode = error == nil
+                    ? (response as? HTTPURLResponse)?.statusCode
+                    : nil
+                let succeeded: Bool
+                if let startupFailureCapture {
+                    // This executes in URLSession's completion before the
+                    // awaiting MainActor continuation or a child-exit task can
+                    // run. The gate records readiness and seals stderr under
+                    // one lock shared with the termination snapshot.
+                    succeeded = startupFailureCapture.recordHealthResponse(
+                        statusCode: statusCode
+                    )
+                } else {
+                    succeeded = statusCode.map { (200..<300).contains($0) } ?? false
+                }
+                continuation.resume(returning: succeeded)
+            }.resume()
         }
     }
 
@@ -4334,7 +4607,47 @@ final class ServerManager {
         if speculativePreset?.isDefaultEnabled == true,
            !flags.contains("--speculative-config") {
             flags.append(contentsOf: speculativePreset?.launchFlags ?? [])
+        } else if speculativePreset?.defaultEnabled == false,
+                  !flags.contains("--speculative-config"),
+                  !flags.contains("--no-spec-decode") {
+            // Some specialized aliases enable their paired runtime in the
+            // engine unless Desktop states an opinion. An explicit catalog
+            // false therefore has to cross the process boundary; treating it
+            // like an omitted legacy field would make an untouched OFF toggle
+            // launch accelerated anyway.
+            flags.append("--no-spec-decode")
         }
+        return speculativeTextLaneFlags(
+            requested: speculativePreset?.isDefaultEnabled == true,
+            existing: flags
+        )
+    }
+
+    /// Speculative decoding and the process-wide vision lane are mutually
+    /// exclusive in the engine. Resolve that contract once for catalog
+    /// defaults and user overrides so Desktop never launches a contradictory
+    /// `--mllm --speculative-config` process. Text acceleration wins only when
+    /// it was actually requested; disabling it restores Desktop's normal
+    /// vision-by-default policy on the next restart.
+    nonisolated internal static func speculativeTextLaneFlags(
+        requested: Bool,
+        supportsImageInput: Bool = false,
+        userOverrides: [String] = [],
+        existing: [String]
+    ) -> [String] {
+        let modalityFlags: Set<String> = ["--mllm", "--no-mllm", "--text-only"]
+        if requested {
+            var flags = existing.filter { !modalityFlags.contains($0) }
+            flags.append("--text-only")
+            return flags
+        }
+        guard supportsImageInput,
+              existing.contains("--no-spec-decode"),
+              modalityFlags.isDisjoint(with: Set(userOverrides)) else {
+            return existing
+        }
+        var flags = existing.filter { !modalityFlags.contains($0) }
+        flags.append("--mllm")
         return flags
     }
 
@@ -4536,7 +4849,7 @@ final class ServerManager {
     ///     before we build this list, so it can't be misread as a flag.
     ///   * Explicit ``--cors-origins http://127.0.0.1 http://localhost``
     ///     (issue #306). Without this flag the sidecar defaults to
-    ///     ``["*"]`` (``vllm_mlx/cli.py:899``); a wildcard CORS
+    ///     ``["*"]`` (``rapid_mlx/cli.py:899``); a wildcard CORS
     ///     allowlist combined with #303 (bearer env not yet enforced
     ///     as 401) would let any drive-by webpage drive the user's
     ///     local model via ``fetch``. Today's bundled build (v0.7.37)
@@ -4719,7 +5032,9 @@ final class ServerManager {
     /// Desktop-injected (always added, override the allowlist):
     /// ``RAPID_MLX_API_KEY`` (bearer; argv stays clean per #271),
     /// ``PYTHONUNBUFFERED`` (so tqdm reaches our log tail),
-    /// ``HF_HUB_DISABLE_PROGRESS_BARS`` (force bars on), plus
+    /// ``HF_HUB_DISABLE_PROGRESS_BARS`` (force bars on),
+    /// ``RAPID_MLX_PROCESS_ROLE=desktop-sidecar`` (telemetry role; never
+    /// ambient-spoofable), plus
     /// ``HF_HUB_DISABLE_XET`` / ``HF_HUB_DOWNLOAD_TIMEOUT`` (with
     /// ambient pass-through so the power-user override channel
     /// survives the allowlist).
@@ -4891,7 +5206,7 @@ final class ServerManager {
         // Forwarding launchd's PATH verbatim breaks every stdio MCP server
         // the user configures: the engine resolves ``uvx`` / ``npx`` /
         // ``docker`` with ``shutil.which`` against THIS PATH and fails with
-        // "Command 'uvx' not found in PATH" (``vllm_mlx/mcp/security.py``).
+        // "Command 'uvx' not found in PATH" (``rapid_mlx/mcp/security.py``).
         // The same config works when the app is launched from a terminal,
         // so the bug only reproduces via Finder/Dock — i.e. only for real
         // users, never in a developer's own terminal-launched run.
@@ -4907,6 +5222,7 @@ final class ServerManager {
         )
 
         // Layer 2: desktop-injected, always.
+        env = EngineProcessEnvironment.sidecar(env)
         if !bearer.isEmpty {
             env["RAPID_MLX_API_KEY"] = bearer
         }
@@ -5220,7 +5536,7 @@ final class ProcessGroupChild: @unchecked Sendable {
         for (k, v) in environmentAdditions {
             merged[k] = v
         }
-        let envp = merged
+        let envp = EngineProcessEnvironment.sidecar(merged)
             .map { "\($0.key)=\($0.value)" }
             .sorted()
 

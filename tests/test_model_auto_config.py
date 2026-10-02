@@ -6,9 +6,9 @@ from unittest import mock
 
 import pytest
 
-from vllm_mlx import model_aliases
-from vllm_mlx import model_auto_config as auto_config_mod
-from vllm_mlx.model_auto_config import (
+from rapid_mlx import model_aliases
+from rapid_mlx import model_auto_config as auto_config_mod
+from rapid_mlx.model_auto_config import (
     ModelConfig,
     _deepseek_template_family,
     _reset_resolution_log_cache,
@@ -19,7 +19,7 @@ from vllm_mlx.model_auto_config import (
     get_profile,
     warn_misbound_deepseek_v3_parser,
 )
-from vllm_mlx.model_metadata import ModelMetadata
+from rapid_mlx.model_metadata import ModelMetadata
 
 
 class TestDetectModelConfig:
@@ -382,6 +382,50 @@ class TestDetectModelConfig:
         assert cfg.reasoning_parser == "qwen3"
         assert cfg.is_hybrid is False
         assert cfg.supports_spec_decode is True
+
+    # Bonsai 2 (prism-ml/Ternary-Bonsai-2-*) — a Qwen3.5-class checkpoint
+    # served as a rotated 2-bit Hadamard pack whose custom top-level
+    # ``model_type=prism_hadamard_qwen35`` keeps the generic qwen3.5 regexes
+    # from firing on the raw HF path. Without the family regex, a user who
+    # serves the repo id directly (as in #3547) gets no reasoning parser and
+    # sees the bare ``<think>`` scratchpad in ``content``. Both the aliased
+    # 27B and an un-aliased sibling (8B, regex-only path) must wire the
+    # Qwen3 reasoning contract. The registered 27B checkpoint pins its
+    # published named-XML tool wire; an unknown sibling retains the
+    # conservative family fallback until its template is reviewed.
+    @pytest.mark.parametrize(
+        ("model_path", "tool_parser"),
+        [
+            (
+                "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit",
+                "qwen3_coder_xml",
+            ),
+            ("prism-ml/Ternary-Bonsai-2-8B-mlx-2bit", "hermes"),
+        ],
+    )
+    def test_bonsai2_hadamard(self, model_path, tool_parser):
+        cfg = detect_model_config(model_path)
+        assert cfg is not None
+        assert cfg.tool_call_parser == tool_parser
+        assert cfg.reasoning_parser == "qwen3"
+
+    def test_bonsai2_regex_does_not_match_v1_sibling(self):
+        # The trailing-separator lookahead in the ``ternary-bonsai-2`` regex
+        # must not fire on the v1 ``Ternary-Bonsai-27B`` pack ("bonsai-2" vs
+        # "bonsai-27"), whose text-backbone lane is pinned non-hybrid via its
+        # own alias and must not inherit the v2 family stamp.
+        from rapid_mlx.model_auto_config import _MODEL_PATTERNS
+
+        bonsai2_regexes = [
+            pat
+            for pat, _ in _MODEL_PATTERNS
+            if pat.search("prism-ml/Ternary-Bonsai-2-27B-mlx-2bit")
+            and "bonsai" in pat.pattern.lower()
+        ]
+        assert bonsai2_regexes, "expected a bonsai-2 family regex"
+        for pat in bonsai2_regexes:
+            assert not pat.search("prism-ml/Ternary-Bonsai-27B-mlx-2bit")
+            assert not pat.search("prism-ml/Ternary-Bonsai-8B-mlx-2bit")
 
     # VibeThinker (Weibo AI reasoning family; 1.5B base = Qwen2.5-Math-1.5B,
     # 3B base = Qwen2.5-Coder-3B). Verify both the alias paths
@@ -1112,7 +1156,7 @@ class TestVisibility:
     def test_mtp_default_probe_fails_closed_when_cli_import_is_unavailable(
         self, monkeypatch
     ):
-        monkeypatch.setitem(sys.modules, "vllm_mlx.cli", None)
+        monkeypatch.setitem(sys.modules, "rapid_mlx.cli", None)
         assert auto_config_mod._serve_mtp_default_on("qwen3.8-27b-4bit") is False
 
     def test_native_mtp_default_on_label(self, monkeypatch):
@@ -1182,7 +1226,7 @@ class TestVisibility:
         assert "no MTP/drafter" not in table
 
     def test_table_hybrid_sidecar_alias_spec_row_keeps_lane_split(self):
-        # Same contradiction, hybrid opt-in variant: ``qwen3.6-35b-4bit`` has a
+        # Same contradiction, hybrid default-on variant: ``qwen3.6-35b-4bit`` has a
         # registered sidecar AND a hybrid arch. ``disabled (hybrid
         # arch)`` is true of the STANDARD lane only — the row must say
         # so, because the MTP sidecar lane is available.
@@ -1191,9 +1235,9 @@ class TestVisibility:
         assert cfg.is_hybrid is True
         assert (cfg.mtp_draft_model or "").strip()
         table = format_profile_table("qwen3.6-35b-4bit", cfg)
-        assert "✗ off (MTP opt-in: --speculative-config)" in table
+        assert "✓ default-on (MTP)" in table
         assert "✗ disabled (hybrid arch)" not in table
-        assert "MTP path         : sidecar (opt-in: --speculative-config)" in table
+        assert "MTP path         : sidecar (default; --no-spec-decode off)" in table
         # codex r1: the Suffix-tier note must be sidecar-aware on the
         # hybrid branch too — bare "hybrid arch" would re-deny the lane
         # the Spec-decode row just acknowledged.
@@ -1355,8 +1399,10 @@ class TestVisibility:
         matched_allowed = {
             "native",
             "native (opt-in: --speculative-config)",
+            "native (default; --no-spec-decode off)",
             "sidecar",
             "sidecar (opt-in: --speculative-config)",
+            "sidecar (default; --no-spec-decode off)",
             "disabled",
         }
         probes = [
@@ -1433,8 +1479,8 @@ class TestVisibility:
         # name regex — so deleting Qwen handling from ``_NATIVE_MTP_NAME_RE``
         # would break this test (the shipped Qwen3.5 aliases all have spec
         # decode OFF, which alone can't catch a native-regex regression).
-        from vllm_mlx.model_auto_config import _mtp_path_label
-        from vllm_mlx.model_profile import ModelProfile
+        from rapid_mlx.model_auto_config import _mtp_path_label
+        from rapid_mlx.model_profile import ModelProfile
 
         for name in ("some-org/Qwen3.5-9B-custom-4bit", "some-org/Qwen3.6-9B-4bit"):
             stub = ModelProfile(hf_path=name)  # spec decode defaults True
@@ -1445,8 +1491,8 @@ class TestVisibility:
         # IS in the model-name segment (direct HF path, no parser stamp
         # because it's an unaliased path routed through the regex), it
         # must still label sidecar / KV-share yes.
-        from vllm_mlx.model_auto_config import _kv_share_label, _mtp_path_label
-        from vllm_mlx.model_profile import ModelProfile
+        from rapid_mlx.model_auto_config import _kv_share_label, _mtp_path_label
+        from rapid_mlx.model_profile import ModelProfile
 
         # No parser stamp, spec on — the name segment carries ``gemma-4``.
         stub = ModelProfile(hf_path="some-org/gemma-4-9b-custom-4bit")
@@ -1460,8 +1506,8 @@ class TestVisibility:
         # (the trailing ``gemma-4`` is provenance and is ignored). The
         # resolver is name-based, so parser stamps here are irrelevant —
         # this documents leading-token precedence, not stamp precedence.
-        from vllm_mlx.model_auto_config import _kv_share_label, _mtp_path_label
-        from vllm_mlx.model_profile import ModelProfile
+        from rapid_mlx.model_auto_config import _kv_share_label, _mtp_path_label
+        from rapid_mlx.model_profile import ModelProfile
 
         stub = ModelProfile(hf_path="some-org/Hy3-distilled-from-Gemma-4-8bit")
         assert _mtp_path_label(stub.hf_path, stub) == "native"
@@ -1472,8 +1518,8 @@ class TestVisibility:
         # may prepend a quantization/format prefix before the architecture
         # token. Those must still resolve to the family, while a mid-name
         # provenance token (not a known prefix) stays rejected.
-        from vllm_mlx.model_auto_config import _kv_share_label, _mtp_path_label
-        from vllm_mlx.model_profile import ModelProfile
+        from rapid_mlx.model_auto_config import _kv_share_label, _mtp_path_label
+        from rapid_mlx.model_profile import ModelProfile
 
         for name, mtp, kv in (
             ("some-org/quantized-gemma-4-12b", "sidecar", "yes (default)"),
@@ -1493,8 +1539,8 @@ class TestVisibility:
         # contains ``hy3``, ``megemma4x`` contains ``gemma4`` — and (b)
         # LATER provenance tokens — ``Llama-3-Distilled-from-Gemma-4`` is a
         # Llama, ``Mistral-merge-of-Qwen3.5`` is a Mistral.
-        from vllm_mlx.model_auto_config import _kv_share_label, _mtp_path_label
-        from vllm_mlx.model_profile import ModelProfile
+        from rapid_mlx.model_auto_config import _kv_share_label, _mtp_path_label
+        from rapid_mlx.model_profile import ModelProfile
 
         for name in (
             "some-org/Llama-3-hy3per-8B",
@@ -1512,8 +1558,8 @@ class TestVisibility:
         # the architecture; the later token is provenance. ``Qwen3.5-gemma-
         # 4-merge`` is a Qwen3.5-architecture merge → native; ``gemma-4-
         # qwen3.5-merge`` leads with Gemma 4 → sidecar / KV-share yes.
-        from vllm_mlx.model_auto_config import _kv_share_label, _mtp_path_label
-        from vllm_mlx.model_profile import ModelProfile
+        from rapid_mlx.model_auto_config import _kv_share_label, _mtp_path_label
+        from rapid_mlx.model_profile import ModelProfile
 
         qwen_lead = ModelProfile(hf_path="some-org/Qwen3.5-gemma-4-merge-8bit")
         assert _mtp_path_label(qwen_lead.hf_path, qwen_lead) == "native"
@@ -1528,8 +1574,8 @@ class TestVisibility:
         # match on the full path) does NOT override the architecture-
         # position name marker: ``Qwen3.5-…`` leads with Qwen3.5, so it
         # stays native even with a stray gemma4 stamp.
-        from vllm_mlx.model_auto_config import _kv_share_label, _mtp_path_label
-        from vllm_mlx.model_profile import ModelProfile
+        from rapid_mlx.model_auto_config import _kv_share_label, _mtp_path_label
+        from rapid_mlx.model_profile import ModelProfile
 
         stamped = ModelProfile(
             hf_path="some-org/Qwen3.5-gemma-4-merge-8bit",
@@ -2115,7 +2161,7 @@ class TestWarnMisboundDeepseekV3Parser:
         ],
     )
     def test_v4_v5_classifier_matches_auto_detect_parser(self, model_path):
-        from vllm_mlx.model_auto_config import (
+        from rapid_mlx.model_auto_config import (
             _DEEPSEEK_V3_FAMILY_PARSERS,
             _classify_deepseek_template_name,
         )
@@ -2319,7 +2365,7 @@ class TestMistralFamilyToolParser:
     def test_alias_tool_parser_is_the_registered_mistral_parser(self, alias):
         # Belt-and-suspenders: the resolved name must map to a real,
         # registered parser class so serve time doesn't fall back silently.
-        from vllm_mlx.tool_parsers import ToolParserManager
+        from rapid_mlx.tool_parsers import ToolParserManager
 
         cfg = detect_model_config(alias)
         assert cfg is not None
@@ -2532,7 +2578,7 @@ class TestMistralFamilyToolParser:
         NOT wrongly exempted. Also cross-checks the discovered set against
         the static ``_MISTRAL_ALIASES`` list so the two never drift apart.
         """
-        from vllm_mlx.model_aliases import list_profiles
+        from rapid_mlx.model_aliases import list_profiles
 
         discovered = set()
         offenders = []
@@ -3147,8 +3193,8 @@ def test_registry_invariant_default_on_implies_declared_mechanism(
     would boot MTP by default while the info table claims opt-in/disabled
     — the exact registry-vs-reality split this PR closes. Every shipped
     alias must keep the two views consistent."""
-    from vllm_mlx.model_aliases import list_profiles
-    from vllm_mlx.model_auto_config import detect_model_config
+    from rapid_mlx.model_aliases import list_profiles
+    from rapid_mlx.model_auto_config import detect_model_config
 
     # Hermeticity (round-3 review on #3266): list_profiles() merges the
     # host's user-alias file, which is outside the conftest env

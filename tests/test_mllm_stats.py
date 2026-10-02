@@ -14,10 +14,10 @@ import time
 from collections import deque
 from types import SimpleNamespace
 
-from vllm_mlx.engine.batched import BatchedEngine
-from vllm_mlx.mllm_scheduler import MLLMRequest, MLLMScheduler
-from vllm_mlx.request import RequestStatus
-from vllm_mlx.runtime.model_performance import ModelPerformanceLedger
+from rapid_mlx.engine.batched import BatchedEngine
+from rapid_mlx.mllm_scheduler import MLLMRequest, MLLMScheduler
+from rapid_mlx.request import RequestStatus
+from rapid_mlx.runtime.model_performance import ModelPerformanceLedger
 
 
 class _FakeDetokenizer:
@@ -66,6 +66,8 @@ def test_batched_engine_promotes_mllm_stats_to_common_top_level():
                 "num_requests_processed": 3,
                 "total_prompt_tokens": 40,
                 "total_completion_tokens": 7,
+                "num_repetition_loop_stops": 4,
+                "num_repetition_loop_breaks": 0,
                 "prefix_cache": {
                     "hits": 2,
                     "misses": 1,
@@ -96,6 +98,8 @@ def test_batched_engine_promotes_mllm_stats_to_common_top_level():
     assert stats["num_requests_processed"] == 3
     assert stats["total_prompt_tokens"] == 40
     assert stats["total_completion_tokens"] == 7
+    assert stats["num_repetition_loop_stops"] == 4
+    assert stats["num_repetition_loop_breaks"] == 0
     assert stats["prefix_cache"]["tokens_saved"] == 30
     assert stats["model_performance"]["model_name"] == "gemma-test"
     assert stats["steps_executed"] == 12

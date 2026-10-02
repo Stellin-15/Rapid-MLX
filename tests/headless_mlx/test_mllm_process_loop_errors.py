@@ -11,12 +11,152 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from vllm_mlx.mllm_scheduler import MLLMRequest, MLLMScheduler  # noqa: E402
+from rapid_mlx.mllm_batch_generator import MLLMBatchResponse  # noqa: E402
+from rapid_mlx.mllm_scheduler import (  # noqa: E402
+    MLLMRequest,
+    MLLMScheduler,
+    MLLMSchedulerConfig,
+)
+from rapid_mlx.request import (  # noqa: E402
+    ClientRequestError,
+    InferenceAbortedError,
+    RequestOutput,
+    RequestStatus,
+    SamplingParams,
+)
+
+
+def _repetition_scheduler() -> MLLMScheduler:
+    tokenizer = MagicMock()
+    tokenizer.decode = lambda tokens, **_kwargs: " ".join(map(str, tokens))
+    tokenizer.eos_token_id = 0
+    processor = MagicMock()
+    processor.tokenizer = tokenizer
+    scheduler = MLLMScheduler(
+        MagicMock(),
+        processor,
+        MLLMSchedulerConfig(enable_vision_cache=False),
+        model_name="headless-mllm-repetition-test",
+    )
+    scheduler.batch_generator = MagicMock()
+    return scheduler
+
+
+def _repeating_mllm_request(scheduler: MLLMScheduler) -> MLLMRequest:
+    pattern = list(range(61))
+    request = MLLMRequest(
+        request_id="vision-repeat",
+        prompt="extract the table",
+        images=["statement.png"],
+        sampling_params=SamplingParams(max_tokens=32_768),
+    )
+    request.status = RequestStatus.RUNNING
+    request.output_tokens = pattern * 3
+    request.num_output_tokens = len(request.output_tokens)
+    scheduler.running[request.request_id] = request
+    scheduler.uid_to_request_id[7] = request.request_id
+    return request
+
+
+def test_mllm_repetition_stop_retires_live_row_without_mlx() -> None:
+    scheduler = _repetition_scheduler()
+    request = _repeating_mllm_request(scheduler)
+    response = MLLMBatchResponse(
+        uid=7,
+        request_id=request.request_id,
+        token=0,
+        logprobs=None,
+        finish_reason=None,
+    )
+
+    outputs, finished = scheduler._process_batch_responses([response])
+
+    assert finished == {request.request_id}
+    assert request.status == RequestStatus.FINISHED_ABORTED
+    assert outputs[0].finish_reason == "abort"
+    assert outputs[0].error_kind == "repetition"
+    assert "period_tokens=61" in (outputs[0].error or "")
+    scheduler.batch_generator.remove.assert_called_once_with([7])
+    assert scheduler.num_repetition_loop_stops == 1
+
+
+def test_mllm_repetition_stop_refuses_unowned_batch_row() -> None:
+    scheduler = _repetition_scheduler()
+    request = _repeating_mllm_request(scheduler)
+    scheduler.batch_generator = None
+    response = MLLMBatchResponse(
+        uid=7,
+        request_id=request.request_id,
+        token=0,
+        logprobs=None,
+        finish_reason=None,
+    )
+
+    with pytest.raises(RuntimeError, match="without a batch generator"):
+        scheduler._process_batch_responses([response])
+
+
+@pytest.mark.asyncio
+async def test_mllm_repetition_stop_streams_valid_partial_response() -> None:
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.output_queues = {"vision-repeat": asyncio.Queue()}
+    scheduler.abort_request = MagicMock()
+    await scheduler.output_queues["vision-repeat"].put(
+        RequestOutput(
+            request_id="vision-repeat",
+            output_text="partial valid answer",
+            finished=True,
+            finish_reason="abort",
+            error="Model generation aborted: exact repetition loop detected",
+            error_kind="repetition",
+        )
+    )
+
+    outputs = [output async for output in scheduler.stream_outputs("vision-repeat")]
+
+    assert len(outputs) == 1
+    assert outputs[0].output_text == "partial valid answer"
+    assert outputs[0].finish_reason == "length"
+    assert outputs[0].error is None
+    scheduler.abort_request.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_kind", "expected_error"),
+    [
+        ("lifecycle", InferenceAbortedError),
+        ("invalid_request", ClientRequestError),
+        (None, ValueError),
+    ],
+)
+async def test_mllm_non_repetition_errors_keep_existing_exception_contract(
+    error_kind: str | None,
+    expected_error: type[Exception],
+) -> None:
+    """The repetition exception must not soften unrelated error classes."""
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.output_queues = {"failed": asyncio.Queue()}
+    scheduler.abort_request = MagicMock()
+    await scheduler.output_queues["failed"].put(
+        RequestOutput(
+            request_id="failed",
+            finished=True,
+            finish_reason="abort",
+            error="terminal failure",
+            error_kind=error_kind,
+        )
+    )
+
+    with pytest.raises(expected_error, match="terminal failure"):
+        _ = [output async for output in scheduler.stream_outputs("failed")]
+
+    scheduler.abort_request.assert_not_called()
 
 
 def test_batch_generator_uses_worker_default_stream(monkeypatch) -> None:
     """Construction binds each generator lifetime to its worker's stream."""
-    from vllm_mlx import mllm_batch_generator as module
+    from rapid_mlx import mllm_batch_generator as module
 
     stream = object()
     monkeypatch.setattr(module.mx, "default_device", lambda: "gpu")
@@ -36,7 +176,7 @@ def test_batch_generator_close_tolerates_retired_worker_stream(
     monkeypatch, caplog
 ) -> None:
     """A stale thread-local stream cannot prevent wired-limit cleanup."""
-    from vllm_mlx import mllm_batch_generator as module
+    from rapid_mlx import mllm_batch_generator as module
 
     generator = module.MLLMBatchGenerator.__new__(module.MLLMBatchGenerator)
     generator._stream = object()
@@ -63,7 +203,7 @@ def test_batch_generator_prefill_enters_owned_stream(monkeypatch) -> None:
 
     from mlx_lm.models import cache as cache_module
 
-    from vllm_mlx import mllm_batch_generator as module
+    from rapid_mlx import mllm_batch_generator as module
 
     owned_stream = object()
     entered: list[object] = []
@@ -78,6 +218,7 @@ def test_batch_generator_prefill_enters_owned_stream(monkeypatch) -> None:
     generator._stream = owned_stream
     generator.vision_prefill_token_budget = 8192
     generator.allow_arrays_cache = False
+    generator._media_structural_singleton = False
     generator._stats = SimpleNamespace(prompt_tokens=0)
     generator._preprocess_request = lambda _request: None
     generator._run_vision_encoding = lambda *_args, **_kwargs: (_ for _ in ()).throw(
@@ -100,7 +241,7 @@ def test_batch_generator_next_uses_owned_stream(monkeypatch) -> None:
     """Each decode step runs in the same worker-owned stream context."""
     from contextlib import contextmanager
 
-    from vllm_mlx import mllm_batch_generator as module
+    from rapid_mlx import mllm_batch_generator as module
 
     owned_stream = object()
     entered: list[object] = []
@@ -221,7 +362,19 @@ async def test_process_loop_failure_unblocks_every_inflight_request() -> None:
     for output in outputs[:-1]:
         assert output.finished is True
         assert output.finish_reason == "length"
-        assert output.error == "MLLM inference failed due to an internal engine error"
+        assert output.error == (
+            "MLLM inference was interrupted by a transient engine error; "
+            "retry the request"
+        )
+        # #3564: a FATAL process-loop failure (here a non-memory ``TypeError``)
+        # is now classified into a stable engine-abort code, not the opaque
+        # ``lifecycle`` tag, so the route + GUI can reflect the category. The
+        # step error carries no memory signal, so it classifies as the generic
+        # transient ``engine_aborted`` (a Metal allocation failure would be
+        # ``insufficient_memory``). The genuinely CANCELLED request above keeps
+        # its explicit ``lifecycle`` kind — classification never clobbers a kind
+        # the abort path already stamped.
+        assert output.error_kind == "engine_aborted"
         assert "mask" not in output.error
     assert scheduler._step_no_queue.call_count == 1
     batch_generator.close.assert_called_once_with()
@@ -236,8 +389,10 @@ async def test_process_loop_failure_unblocks_every_inflight_request() -> None:
     assert not scheduler._aborted_queue_ids
 
 
-def test_scheduler_step_does_not_turn_internal_failure_into_fake_success() -> None:
-    """A model/runtime error must terminate as an error without leaking details."""
+def test_scheduler_step_marks_internal_failure_retryable_without_leaking_details(
+    caplog,
+) -> None:
+    """A runtime batch failure is an observable, retryable lifecycle error."""
     scheduler = MLLMScheduler.__new__(MLLMScheduler)
     request = MLLMRequest(request_id="runtime-failure", prompt="hello")
     scheduler.requests = {request.request_id: request}
@@ -263,6 +418,37 @@ def test_scheduler_step_does_not_turn_internal_failure_into_fake_success() -> No
     terminal = output.outputs[0]
     assert terminal.finished is True
     assert terminal.finish_reason == "length"
-    assert terminal.error == "MLLM inference failed due to an internal engine error"
+    assert terminal.error == (
+        "MLLM inference was interrupted by a transient engine error; retry the request"
+    )
+    assert terminal.error_kind == "lifecycle"
     assert "/Users/example" not in terminal.error
+    assert "RuntimeError" in caplog.text
+    assert request.request_id in caplog.text
+    assert "private runtime detail" in caplog.text
     scheduler.batch_generator.remove.assert_called_once_with([42])
+
+
+@pytest.mark.asyncio
+async def test_scheduler_internal_failure_streams_as_retryable_503_class() -> None:
+    """The scheduler-to-route boundary preserves the retryable error type."""
+    scheduler = MLLMScheduler.__new__(MLLMScheduler)
+    scheduler.output_queues = {"failed": asyncio.Queue()}
+    scheduler.abort_request = MagicMock()
+    await scheduler.output_queues["failed"].put(
+        RequestOutput(
+            request_id="failed",
+            finished=True,
+            finish_reason="abort",
+            error=(
+                "MLLM inference was interrupted by a transient engine error; "
+                "retry the request"
+            ),
+            error_kind="lifecycle",
+        )
+    )
+
+    with pytest.raises(InferenceAbortedError, match="retry the request"):
+        _ = [output async for output in scheduler.stream_outputs("failed")]
+
+    scheduler.abort_request.assert_not_called()

@@ -7,7 +7,7 @@ AXApplication title="Rapid-MLX"
           AXButton id="Sidebar.NewChat" desc="New Chat" enabled=true
           AXButton id="Sidebar.Images" desc="Images" enabled=true
           AXButton id="Sidebar.Audio" desc="Audio" enabled=true
-          AXButton id="Sidebar.Launch" desc="Launch" enabled=true
+          AXButton id="Sidebar.Launch" desc="Agent" enabled=true
           AXScrollArea
             AXButton id="Sidebar.Folder.Toggle.Golden-Work" desc="Golden Work (1)" enabled=true
             AXButton id="Sidebar.Conversation.Pin.<uuid>" desc="Pin conversation" help="Pin conversation" enabled=true
@@ -39,6 +39,7 @@ AXApplication title="Rapid-MLX"
             AXTextArea id="rapid.chat.compose" desc="Message compose field" value=empty
           AXButton id="ChatView.AddAttachments" desc="Add attachments" help="Add photos or files" enabled=true
           AXButton id="ChatView.ConversationInstructions" desc="Conversation system prompt" help="Conversation system prompt" enabled=true
+          AXButton id="ChatView.PersonalIntelligence.Toggle" desc="Personal Intelligence" value=text enabled=true
           AXPopUpButton id="ModelPickerBar.ModelMenu" desc="Model" help="Choose which model to run" value=text enabled=true
           AXButton id="ModelPickerBar.ModelInfo" desc="Show model details" help="Show model details" enabled=true
           AXButton id="ChatView.SendOrStopButton" desc="Send message" enabled=false

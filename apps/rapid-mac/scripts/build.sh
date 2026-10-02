@@ -27,19 +27,213 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="$ROOT/.build/release"
 APP="$ROOT/build/Rapid-MLX Desktop.app"
 CONTENTS="$APP/Contents"
+CUA_HELPER="$CONTENTS/Helpers/Rapid Computer Use.app"
+CUA_HELPER_EXECUTABLE="$CUA_HELPER/Contents/MacOS/RapidComputerUse"
 
 CONFIG="${RAPID_BUILD_CONFIG:-release}"
 
+# A signed release spends roughly the same amount of time compiling Swift as it
+# does assembling and signing the Python sidecar.  They share only read-only
+# source inputs and write to disjoint staging directories, so the release action
+# may overlap them on the same trusted runner.  Local/ad-hoc builds retain the
+# serial path (and its sidecar cache) unless explicitly promoted to a signed
+# build by the caller.
+ENGINE_ROOT="${RAPID_MLX_ENGINE_ROOT:-$(cd "$ROOT/../.." && pwd)}"
+SKIP_SIDECAR="${SKIP_SIDECAR:-0}"
+SIDECAR_SCRIPT="${RAPID_SIDECAR_SCRIPT:-$ROOT/scripts/build-sidecar.sh}"
+SIDECAR_STAGE="${RAPID_SIDECAR_STAGE:-$ROOT/build/sidecar-stage}"
+SIDECAR_CACHE_STAMP="$SIDECAR_STAGE/.rapid-sidecar-cache-key"
+PARALLEL_SIDECAR_BUILD="${PARALLEL_SIDECAR_BUILD:-0}"
+SIDECAR_BUILD_PID=""
+SIDECAR_BUILD_PGID=""
+SIDECAR_BUILD_LOG=""
+SIDECAR_BUILD_READY=""
+SIDECAR_BUILD_STARTED=0
+PARALLEL_SIDECAR_COMPLETE=0
+
+# A build host is never a telemetry user. This reaches both serial and
+# process-group sidecar builders and every staged-engine check they perform.
+export RAPID_MLX_TELEMETRY=0 DO_NOT_TRACK=1
+
+validate_sidecar_stage_for_rebuild() {
+    local requested="$1"
+    local canonical
+    canonical="$(python3 - "$requested" <<'PY'
+import os
+import sys
+
+print(os.path.realpath(sys.argv[1]))
+PY
+)"
+    if [[ -z "$requested" || "$requested" != /* \
+        || "$canonical" == "/" \
+        || "$(basename "$canonical")" != "sidecar-stage" \
+        || "$canonical" == "$ROOT" \
+        || "$canonical" == "$ENGINE_ROOT" \
+        || "$ROOT" == "$canonical"/* \
+        || "$ENGINE_ROOT" == "$canonical"/* ]]; then
+        echo "ERR: refusing unsafe sidecar staging path: ${requested:-<empty>}" >&2
+        exit 1
+    fi
+    SIDECAR_STAGE="$canonical"
+    SIDECAR_CACHE_STAMP="$SIDECAR_STAGE/.rapid-sidecar-cache-key"
+}
+
+terminate_parallel_sidecar_group() {
+    local pgid="$1"
+    [[ -n "$pgid" ]] || return 0
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    for _ in {1..40}; do
+        kill -0 -- "-$pgid" 2>/dev/null || return 0
+        sleep 0.05
+    done
+    echo "warning: sidecar process group $pgid ignored SIGTERM; sending SIGKILL" >&2
+    kill -KILL -- "-$pgid" 2>/dev/null || true
+}
+
+cleanup_parallel_sidecar() {
+    local status=$?
+    if [[ -n "$SIDECAR_BUILD_PGID" ]]; then
+        # The launcher creates a dedicated session whose id matches its pid.
+        # Terminate the entire group so pip/build subprocesses cannot outlive
+        # an early Swift/app failure on a persistent runner.
+        terminate_parallel_sidecar_group "$SIDECAR_BUILD_PGID"
+    fi
+    if [[ -n "$SIDECAR_BUILD_PID" ]]; then
+        wait "$SIDECAR_BUILD_PID" 2>/dev/null || true
+        if [[ -f "$SIDECAR_BUILD_LOG" ]]; then
+            echo "==> sidecar build log (app build exited before join)"
+            cat "$SIDECAR_BUILD_LOG"
+            rm -f "$SIDECAR_BUILD_LOG"
+        fi
+    fi
+    [[ -z "$SIDECAR_BUILD_READY" ]] || rm -f "$SIDECAR_BUILD_READY"
+    return "$status"
+}
+trap cleanup_parallel_sidecar EXIT
+
+join_parallel_sidecar() {
+    [[ -n "$SIDECAR_BUILD_PID" ]] || return 0
+    echo "==> waiting for parallel rapid-mlx sidecar"
+    SIDECAR_JOIN_STARTED=$SECONDS
+    if wait "$SIDECAR_BUILD_PID"; then
+        SIDECAR_BUILD_STATUS=0
+    else
+        SIDECAR_BUILD_STATUS=$?
+    fi
+    SIDECAR_BUILD_SECONDS=$((SECONDS - SIDECAR_BUILD_STARTED))
+    SIDECAR_JOIN_SECONDS=$((SECONDS - SIDECAR_JOIN_STARTED))
+    rm -f "$SIDECAR_BUILD_READY"
+    SIDECAR_BUILD_READY=""
+    cat "$SIDECAR_BUILD_LOG"
+    rm -f "$SIDECAR_BUILD_LOG"
+    if [[ "$SIDECAR_BUILD_STATUS" -ne 0 ]]; then
+        terminate_parallel_sidecar_group "$SIDECAR_BUILD_PGID"
+        SIDECAR_BUILD_PID=""
+        SIDECAR_BUILD_PGID=""
+        echo "ERR: parallel rapid-mlx sidecar build failed ($SIDECAR_BUILD_STATUS)" >&2
+        exit "$SIDECAR_BUILD_STATUS"
+    fi
+    if kill -0 -- "-$SIDECAR_BUILD_PGID" 2>/dev/null; then
+        terminate_parallel_sidecar_group "$SIDECAR_BUILD_PGID"
+        SIDECAR_BUILD_PID=""
+        SIDECAR_BUILD_PGID=""
+        echo "ERR: parallel sidecar launcher exited with live descendants" >&2
+        exit 1
+    fi
+    SIDECAR_BUILD_PID=""
+    SIDECAR_BUILD_PGID=""
+    PARALLEL_SIDECAR_COMPLETE=1
+    echo "::notice::parallel build timing: Swift ${SWIFT_BUILD_SECONDS}s; sidecar ${SIDECAR_BUILD_SECONDS}s; join wait ${SIDECAR_JOIN_SECONDS}s"
+}
+
+if [[ "$PARALLEL_SIDECAR_BUILD" == "1" \
+    && "$SKIP_SIDECAR" != "1" \
+    && "${CODESIGN_IDENTITY:--}" != "-" ]]; then
+    if [[ ! -f "$SIDECAR_SCRIPT" ]]; then
+        echo "ERR: scripts/build-sidecar.sh missing: $SIDECAR_SCRIPT" >&2
+        exit 1
+    fi
+    if [[ ! -d "$ENGINE_ROOT" || ! -f "$ENGINE_ROOT/pyproject.toml" ]]; then
+        echo "ERR: rapid-mlx engine source missing: $ENGINE_ROOT" >&2
+        exit 1
+    fi
+    mkdir -p "$ROOT/build" "${RUNNER_TEMP:-$ROOT/build}"
+    SIDECAR_BUILD_LOG="${RUNNER_TEMP:-$ROOT/build}/rapid-sidecar-build-$$.log"
+    SIDECAR_BUILD_READY="${RUNNER_TEMP:-$ROOT/build}/rapid-sidecar-ready-$$"
+    rm -f "$SIDECAR_BUILD_READY"
+    validate_sidecar_stage_for_rebuild "$SIDECAR_STAGE"
+    rm -rf "$SIDECAR_STAGE"
+    echo "==> starting signed sidecar build beside Swift compilation"
+    RAPID_MLX_ENGINE_ROOT="$ENGINE_ROOT" RAPID_MLX_SOURCE="$ENGINE_ROOT" python3 -c \
+        'import os, pathlib, sys; os.setsid(); pathlib.Path(sys.argv[1]).touch(); os.execvp(sys.argv[2], sys.argv[2:])' \
+        "$SIDECAR_BUILD_READY" bash "$SIDECAR_SCRIPT" \
+        --out "$SIDECAR_STAGE" \
+        --developer-id "$CODESIGN_IDENTITY" \
+        >"$SIDECAR_BUILD_LOG" 2>&1 &
+    SIDECAR_BUILD_PID=$!
+    SIDECAR_BUILD_STARTED=$SECONDS
+    for _ in {1..500}; do
+        [[ -f "$SIDECAR_BUILD_READY" ]] && break
+        if ! kill -0 "$SIDECAR_BUILD_PID" 2>/dev/null; then
+            if wait "$SIDECAR_BUILD_PID"; then
+                SIDECAR_BUILD_STATUS=0
+            else
+                SIDECAR_BUILD_STATUS=$?
+            fi
+            SIDECAR_BUILD_PID=""
+            cat "$SIDECAR_BUILD_LOG"
+            rm -f "$SIDECAR_BUILD_LOG"
+            echo "ERR: parallel sidecar launcher exited before process-group readiness ($SIDECAR_BUILD_STATUS)" >&2
+            [[ "$SIDECAR_BUILD_STATUS" -ne 0 ]] || SIDECAR_BUILD_STATUS=1
+            exit "$SIDECAR_BUILD_STATUS"
+        fi
+        sleep 0.01
+    done
+    if [[ ! -f "$SIDECAR_BUILD_READY" ]]; then
+        kill -TERM -- "-$SIDECAR_BUILD_PID" 2>/dev/null \
+            || kill "$SIDECAR_BUILD_PID" 2>/dev/null \
+            || true
+        wait "$SIDECAR_BUILD_PID" 2>/dev/null || true
+        SIDECAR_BUILD_PID=""
+        echo "ERR: parallel sidecar process group was not ready within 5 seconds" >&2
+        exit 1
+    fi
+    SIDECAR_BUILD_PGID="$SIDECAR_BUILD_PID"
+fi
+
 cd "$ROOT"
 echo "==> swift build -c $CONFIG"
+SWIFT_BUILD_STARTED=$SECONDS
 swift build -c "$CONFIG"
+SWIFT_BUILD_SECONDS=$((SECONDS - SWIFT_BUILD_STARTED))
+echo "==> Swift compilation completed in ${SWIFT_BUILD_SECONDS}s"
+join_parallel_sidecar
 
 echo "==> assembling Rapid-MLX Desktop.app"
 rm -rf "$APP"
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources" "$CONTENTS/Frameworks"
 cp "$ROOT/.build/$CONFIG/Rapid" "$CONTENTS/MacOS/Rapid"
 cp "$ROOT/Resources/Info.plist" "$CONTENTS/Info.plist"
+
+# Browser domain enforcement reads only the selected browser's trusted active
+# tab API. Without the privacy purpose string macOS refuses the Apple Event
+# before it can present the target-specific Automation consent prompt.
+apple_events_usage=$(plutil -extract NSAppleEventsUsageDescription raw -o - \
+    "$CONTENTS/Info.plist" 2>/dev/null || true)
+if [[ -z "$apple_events_usage" ]]; then
+    echo "ERR: Info.plist lacks NSAppleEventsUsageDescription; browser domain guards would be unusable" >&2
+    exit 1
+fi
 cp "$ROOT/Resources/AppIcon.icns" "$CONTENTS/Resources/AppIcon.icns"
+
+# Only the canonical public-release lane may enable the anonymous first-run
+# funnel. This exact packaged Info.plist bit survives app launch; build-process
+# environment variables do not. The helper also removes the bit for the normal
+# local/ad-hoc path so copying a previously stamped plist can never authorize it.
+bash "$ROOT/scripts/configure-desktop-funnel-build.sh" \
+    "$CONTENTS/Info.plist" "${RAPID_MLX_OFFICIAL_RELEASE:-0}" \
+    "${CODESIGN_IDENTITY:--}" "${APPLE_TEAM_ID:-}"
 
 # Candidate builds keep the release/Sparkle version fields byte-for-byte
 # identical to source. A separate, validated identity lets About and tester
@@ -138,6 +332,35 @@ for asset in cheetah.png cheetah-sm.png; do
     fi
 done
 
+# Community Benchmark identity artwork (same Bundle.main story as the PNGs
+# above). These are NOT decorative: the contributor portrait is the shared
+# identity between this app and rapidmlx.com, so a missing plate would show a
+# different face for the same installation depending on where you looked.
+#
+# The plate list mirrors `CommunityContributorAvatar.assetPlates`, which
+# mirrors `AVATAR_ASSETS` on the website. A missing file is a hard error, not a
+# warning: shipping a build whose avatars silently all collapse to the fallback
+# would break the identity contract quietly.
+COMMUNITY_AVATAR_PLATES=(01 02 05 09 10 11 12 13 14 15 16 17 18 19 20 21 22 24)
+for plate in "${COMMUNITY_AVATAR_PLATES[@]}"; do
+    asset="cheetah-avatar-${plate}.webp"
+    if [[ -f "$ROOT/Sources/Rapid/Resources/$asset" ]]; then
+        cp "$ROOT/Sources/Rapid/Resources/$asset" "$CONTENTS/Resources/$asset"
+    else
+        echo "ERR: Sources/Rapid/Resources/$asset missing — contributor avatars would not match rapidmlx.com" >&2
+        exit 1
+    fi
+done
+
+for asset in cheetah-invite-wave.png cheetah-run.png; do
+    if [[ -f "$ROOT/Sources/Rapid/Resources/$asset" ]]; then
+        cp "$ROOT/Sources/Rapid/Resources/$asset" "$CONTENTS/Resources/$asset"
+    else
+        echo "ERR: Sources/Rapid/Resources/$asset missing — Community Benchmark mascot art is required" >&2
+        exit 1
+    fi
+done
+
 # Localizable.xcstrings: same Bundle.main vs Bundle.module story as the PNGs
 # above. A String Catalog is build input, not a runtime localization resource:
 # copying only the JSON file leaves Bundle.main with no .lproj strings to
@@ -175,8 +398,22 @@ fi
 
 # The recommendation catalog is owned by the Python package so the CLI and
 # desktop app consume one physical source file. Copy that SSOT into the shipped
-# app; SwiftPM source-checkout tests load it directly from ../../vllm_mlx.
-RECOMMENDATIONS_SRC="$ROOT/../../vllm_mlx/model_recommendations.json"
+# app; SwiftPM source-checkout tests load it directly from ../../rapid_mlx.
+# The telemetry v2 event registry is owned by the Python package for the same
+# reason as the recommendation catalog above: engine and app validate against
+# ONE physical file, so their enums cannot drift. SwiftPM source-checkout tests
+# read ../../rapid_mlx/telemetry/events.json directly; the shipped .app uses
+# this flat copy. tests/test_telemetry_registry_drift.py asserts no second copy
+# exists anywhere under apps/rapid-mac.
+TELEMETRY_EVENTS_SRC="$ROOT/../../rapid_mlx/telemetry/events.json"
+if [[ -f "$TELEMETRY_EVENTS_SRC" ]]; then
+    cp "$TELEMETRY_EVENTS_SRC" "$CONTENTS/Resources/events.json"
+else
+    echo "ERR: rapid_mlx/telemetry/events.json missing — refusing to ship a telemetry validator with no registry" >&2
+    exit 1
+fi
+
+RECOMMENDATIONS_SRC="$ROOT/../../rapid_mlx/model_recommendations.json"
 if [[ -f "$RECOMMENDATIONS_SRC" ]]; then
     cp "$RECOMMENDATIONS_SRC" "$CONTENTS/Resources/model_recommendations.json"
 else
@@ -294,9 +531,6 @@ fi
 # the same location; we compute it here too so the preflight check and
 # the cache-key/version derivation below agree with what the sidecar
 # build will actually pip-install.
-ENGINE_ROOT="${RAPID_MLX_ENGINE_ROOT:-$(cd "$ROOT/../.." && pwd)}"
-SKIP_SIDECAR="${SKIP_SIDECAR:-0}"
-SIDECAR_SCRIPT="$ROOT/scripts/build-sidecar.sh"
 if [[ "$SKIP_SIDECAR" == "1" ]]; then
     echo "==> SKIPPING sidecar bundling (SKIP_SIDECAR=1)"
 elif [[ ! -f "$SIDECAR_SCRIPT" ]]; then
@@ -313,15 +547,15 @@ elif [[ ! -d "$ENGINE_ROOT" || ! -f "$ENGINE_ROOT/pyproject.toml" ]]; then
     echo "     or set SKIP_SIDECAR=1 for a dev build without a bundled engine." >&2
     exit 1
 else
-    SIDECAR_STAGE="$ROOT/build/sidecar-stage"
-    SIDECAR_CACHE_STAMP="$SIDECAR_STAGE/.rapid-sidecar-cache-key"
     FORCE_SIDECAR_REBUILD="${FORCE_SIDECAR_REBUILD:-0}"
+    SIDECAR_OFFICIAL_RELEASE="${RAPID_MLX_OFFICIAL_RELEASE:-0}"
     SIDECAR_CACHE_KEY=""
     SIDECAR_CACHE_HIT=0
 
-    # Cache only clean, default-source local builds. A release identity must
-    # sign and verify every Mach-O afresh; a dirty source tree has no stable
-    # commit identity and must not be hidden behind an old bundle.
+    # Cache only clean, default-source local builds. Official and source builds
+    # use distinct keys because the staged package's telemetry stamp differs.
+    # A release identity must sign and verify every Mach-O afresh; a dirty source
+    # tree has no stable commit identity and must not be hidden behind an old bundle.
     if [[ "${CODESIGN_IDENTITY:--}" == "-" && -z "${RAPID_MLX_SOURCE:-}" ]]; then
         SIDECAR_SOURCE_SHA="$(git -C "$ENGINE_ROOT" rev-parse HEAD 2>/dev/null || true)"
         SIDECAR_SOURCE_STATUS="$(git -C "$ENGINE_ROOT" status --porcelain --untracked-files=normal 2>/dev/null || echo unavailable)"
@@ -334,15 +568,29 @@ else
                 | shasum -a 256 \
                 | awk '{print $1}'
             )"
-            SIDECAR_CACHE_KEY="v1:${SIDECAR_SOURCE_SHA}:${SIDECAR_RECIPE_HASH}"
+            SIDECAR_CACHE_KEY="v2:${SIDECAR_SOURCE_SHA}:${SIDECAR_RECIPE_HASH}:${SIDECAR_OFFICIAL_RELEASE}"
             if [[ "$FORCE_SIDECAR_REBUILD" != "1" \
                 && -f "$SIDECAR_CACHE_STAMP" \
                 && "$(cat "$SIDECAR_CACHE_STAMP")" == "$SIDECAR_CACHE_KEY" \
                 && -x "$SIDECAR_STAGE/rapid-mlx/python/bin/python3.12" \
                 && -x "$SIDECAR_STAGE/rapid-mlx/bin/rapid-mlx" \
-                && -d "$SIDECAR_STAGE/rapid-mlx/site-packages/vllm_mlx" ]]; then
+                && -d "$SIDECAR_STAGE/rapid-mlx/site-packages/rapid_mlx" ]]; then
                 SIDECAR_CACHE_HIT=1
             fi
+        fi
+    fi
+
+    # Pre-fix local caches contain a linker-signed Python with no Automation
+    # entitlement. Never stage one into a new app: the outer --deep signature
+    # does not add entitlements to that nested sender, and macOS then denies
+    # browser Apple Events without presenting consent UI.
+    if [[ "$SIDECAR_CACHE_HIT" == "1" ]]; then
+        cached_automation=$(codesign -d --entitlements :- \
+            "$SIDECAR_STAGE/rapid-mlx/python/bin/python3.12" 2>/dev/null \
+            | plutil -extract 'com\.apple\.security\.automation\.apple-events' raw -o - - 2>/dev/null || true)
+        if [[ "$cached_automation" != "true" ]]; then
+            echo "==> cached sidecar lacks browser Automation entitlement; rebuilding"
+            SIDECAR_CACHE_HIT=0
         fi
     fi
 
@@ -354,12 +602,14 @@ else
         # resource envelope without re-signing (no --deep).
         SIDECAR_ARGS+=(--developer-id "$CODESIGN_IDENTITY")
     else
-        # Local dev — adhoc codesign + skip smoke (smoke needs a
-        # Python that can ``import mlx``, which a dev-machine global
-        # Python can't reliably do).
-        SIDECAR_ARGS+=(--skip-codesign --skip-verify)
+        # Local dogfood uses the same per-Mach-O entitlements with an ad-hoc
+        # identity. Skip only the expensive smoke; skipping the signing sweep
+        # leaves nested Python unable to request browser Automation consent.
+        SIDECAR_ARGS+=(--skip-verify)
     fi
-    if [[ "$SIDECAR_CACHE_HIT" == "1" ]]; then
+    if [[ "$PARALLEL_SIDECAR_COMPLETE" == "1" ]]; then
+        echo "==> parallel rapid-mlx sidecar is ready"
+    elif [[ "$SIDECAR_CACHE_HIT" == "1" ]]; then
         echo "==> reusing cached rapid-mlx sidecar (${SIDECAR_SOURCE_SHA:0:12})"
         echo "    set FORCE_SIDECAR_REBUILD=1 to rebuild Python dependencies"
     else
@@ -375,6 +625,29 @@ else
     # case expects (Sources/Rapid/Server/ServerLocator.swift:211-215).
     rm -rf "$CONTENTS/Resources/rapid-mlx"
     cp -R "$SIDECAR_STAGE/rapid-mlx" "$CONTENTS/Resources/rapid-mlx"
+
+    # Computer Use must make Accessibility and Screen Capture calls from a
+    # stable, user-visible code identity. Copy the statically linked embedded
+    # interpreter into a helper app as its MAIN executable. It runs rapid_mlx
+    # directly and must never exec the raw interpreter, or the TCC authority
+    # split returns.
+    mkdir -p "$CUA_HELPER/Contents/MacOS" "$CUA_HELPER/Contents/Resources"
+    cp "$ROOT/Resources/RapidComputerUseHelper-Info.plist" \
+        "$CUA_HELPER/Contents/Info.plist"
+    HELPER_VERSION="$(plutil -extract CFBundleShortVersionString raw -o - "$CONTENTS/Info.plist")"
+    HELPER_BUILD="$(plutil -extract CFBundleVersion raw -o - "$CONTENTS/Info.plist")"
+    plutil -replace CFBundleShortVersionString -string "$HELPER_VERSION" \
+        "$CUA_HELPER/Contents/Info.plist"
+    plutil -replace CFBundleVersion -string "$HELPER_BUILD" \
+        "$CUA_HELPER/Contents/Info.plist"
+    cp "$CONTENTS/Resources/rapid-mlx/python/bin/python3.12" \
+        "$CUA_HELPER_EXECUTABLE"
+    cp "$CONTENTS/Resources/AppIcon.icns" "$CUA_HELPER/Contents/Resources/AppIcon.icns"
+    test -x "$CUA_HELPER_EXECUTABLE"
+    if otool -L "$CUA_HELPER_EXECUTABLE" | grep -q 'libpython3\.12\.dylib'; then
+        echo "ERROR: Computer Use helper unexpectedly needs an external libpython" >&2
+        exit 1
+    fi
 
     # Stamp VERSION from the engine's own version. MONOREPO: the sidecar
     # IS the engine, so its VERSION is the engine version. Downstream
@@ -530,7 +803,15 @@ fi
 SIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
 if [[ "$SIGN_IDENTITY" == "-" ]]; then
     echo "==> ad-hoc codesign"
-    codesign --force --deep --sign - "$APP"
+    if [[ -d "$CUA_HELPER" ]]; then
+        codesign --force --options runtime \
+            --entitlements "$ROOT/Resources/RapidComputerUseHelper.entitlements" \
+            --identifier com.rapidmlx.rapid.computer-use \
+            --sign - "$CUA_HELPER"
+    fi
+    codesign --force --deep \
+        --entitlements "$ROOT/Resources/Rapid.entitlements" \
+        --sign - "$APP"
     codesign --verify --deep --strict "$APP"
 else
     echo "==> Developer ID codesign ($SIGN_IDENTITY)"
@@ -551,6 +832,13 @@ else
         --preserve-metadata=identifier,entitlements,flags \
         --sign "$SIGN_IDENTITY" "$SPARKLE_FRAMEWORK_DST"
     codesign --verify --deep --strict "$SPARKLE_FRAMEWORK_DST"
+    if [[ -d "$CUA_HELPER" ]]; then
+        codesign --force --options runtime --timestamp \
+            --entitlements "$ROOT/Resources/RapidComputerUseHelper.entitlements" \
+            --identifier com.rapidmlx.rapid.computer-use \
+            --sign "$SIGN_IDENTITY" "$CUA_HELPER"
+        codesign --verify --strict "$CUA_HELPER"
+    fi
     # No --deep: the sidecar's Mach-Os under Contents/Resources/rapid-mlx/
     # are already individually signed by build-sidecar.sh; this outer
     # (non-deep) codesign hashes their bytes into the .app's resource
@@ -582,6 +870,46 @@ else
         exit 1
     fi
     codesign -dv --verbose=4 "$APP" 2>&1 | grep -E 'Authority|TeamIdentifier|flags=' || true
+fi
+
+# TCC belongs to the process that calls AX/CG. Assert the packaged executable
+# is the stable helper identity and still carries the runtime entitlements
+# after the outer application has been sealed.
+if [[ -d "$CUA_HELPER" ]]; then
+    helper_identifier=$(codesign -dvv "$CUA_HELPER" 2>&1 \
+        | sed -n 's/^Identifier=//p' | head -1)
+    if [[ "$helper_identifier" != "com.rapidmlx.rapid.computer-use" ]]; then
+        echo "ERROR: packaged Computer Use helper has unstable identity '$helper_identifier'" >&2
+        exit 1
+    fi
+    helper_jit=$(codesign -d --entitlements :- "$CUA_HELPER" 2>/dev/null \
+        | plutil -extract 'com\.apple\.security\.cs\.allow-jit' raw -o - - 2>/dev/null || true)
+    if [[ "$helper_jit" != "true" ]]; then
+        echo "ERROR: packaged Computer Use helper lost its runtime entitlements" >&2
+        exit 1
+    fi
+    codesign --verify --strict "$CUA_HELPER"
+elif [[ "$SKIP_SIDECAR" != "1" ]]; then
+    echo "ERROR: packaged sidecar is missing the Computer Use helper" >&2
+    exit 1
+fi
+
+# Check both ad-hoc dogfood and Developer ID artifacts. Source entitlements do
+# not prove that the sealed application carries the permission.
+automation_events=$(codesign -d --entitlements :- "$APP" 2>/dev/null \
+    | plutil -extract 'com\.apple\.security\.automation\.apple-events' raw -o - - 2>/dev/null || true)
+if [[ "$automation_events" != "true" ]]; then
+    echo "ERROR: sealed entitlements lack com.apple.security.automation.apple-events=true (got: '${automation_events:-absent}') — browser domain guards could not request Automation access" >&2
+    exit 1
+fi
+if [[ "$SKIP_SIDECAR" != "1" ]]; then
+    nested_automation=$(codesign -d --entitlements :- \
+        "$APP/Contents/Resources/rapid-mlx/python/bin/python3.12" 2>/dev/null \
+        | plutil -extract 'com\.apple\.security\.automation\.apple-events' raw -o - - 2>/dev/null || true)
+    if [[ "$nested_automation" != "true" ]]; then
+        echo "ERROR: packaged sidecar Python lacks com.apple.security.automation.apple-events=true (got: '${nested_automation:-absent}') — macOS would deny browser URL access without a consent prompt" >&2
+        exit 1
+    fi
 fi
 
 echo

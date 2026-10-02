@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Hermetic tests for ``vllm_mlx.audio.music.MusicEngine`` (PR #1307).
+"""Hermetic tests for ``rapid_mlx.audio.music.MusicEngine`` (PR #1307).
 
 No mlx, no weights, no network: the two external boundaries — the
 ``sa3_mlx.py`` subprocess and ``huggingface_hub.hf_hub_download`` — are
@@ -16,11 +16,11 @@ from pathlib import Path
 
 import pytest
 
-# Load music.py directly, bypassing ``vllm_mlx.audio.__init__`` (which pulls in
+# Load music.py directly, bypassing ``rapid_mlx.audio.__init__`` (which pulls in
 # numpy/mlx via the STT/TTS lanes). music.py itself is stdlib-only, so this keeps
 # the suite runnable on the mlx-free Linux CI runner.
-_MUSIC_PY = Path(__file__).resolve().parents[1] / "vllm_mlx" / "audio" / "music.py"
-_spec = importlib.util.spec_from_file_location("_vllm_mlx_music_under_test", _MUSIC_PY)
+_MUSIC_PY = Path(__file__).resolve().parents[1] / "rapid_mlx" / "audio" / "music.py"
+_spec = importlib.util.spec_from_file_location("_rapid_mlx_music_under_test", _MUSIC_PY)
 music = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(music)
 MusicEngine = music.MusicEngine
@@ -228,7 +228,10 @@ def test_ensure_weights_fetches_missing_and_returns_cache_paths(tmp_path, monkey
 
     requested = []
 
-    def _dl(repo_id, filename):
+    def _dl(repo_id, filename, *, revision=None):
+        # The pin must reach the real hf_hub_download call — an unpinned
+        # download would let a future upstream rewrite swap weights silently.
+        assert revision == music._SA3_REVISION
         requested.append((repo_id, filename))
         src = tmp_path / "hf" / filename  # stand-in for the HF cache
         src.parent.mkdir(parents=True, exist_ok=True)
@@ -274,7 +277,8 @@ def test_ensure_weights_does_not_write_into_readonly_package_dir(tmp_path, monke
     mlx_dir.mkdir()
     monkeypatch.setattr(music, "_SA3_MLX_DIR", mlx_dir)
 
-    def _dl(repo_id, filename):
+    def _dl(repo_id, filename, *, revision=None):
+        assert revision == music._SA3_REVISION
         src = tmp_path / "hf" / filename
         src.parent.mkdir(parents=True, exist_ok=True)
         src.write_bytes(b"real")
@@ -385,7 +389,7 @@ def test_no_weights_tracked_by_git():
         pytest.skip("not a git checkout")
 
     proc = subprocess.run(
-        ["git", "ls-files", "--", "vllm_mlx/audio/sa3/models/mlx"],
+        ["git", "ls-files", "--", "rapid_mlx/audio/sa3/models/mlx"],
         cwd=repo_root,
         capture_output=True,
         text=True,

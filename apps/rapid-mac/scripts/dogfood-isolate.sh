@@ -68,6 +68,11 @@ ENVIRONMENT:
                    Estimated model working set for host admission. Defaults
                    conservatively to 21 GiB, which serializes real Desktop
                    dogfood on the shared large-model lock.
+    RAPID_TEST_APP_VERSION=<X.Y.Z>
+                   Test-only override for CFBundleShortVersionString in the
+                   throwaway copy. The GUI golden harness uses this to pin
+                   version-gated first-launch behavior without changing the
+                   source app or production version lookup.
 
 OUTPUT:
     Progress and diagnostics are written to STDERR.
@@ -279,6 +284,24 @@ fi
 log "rewriting CFBundleIdentifier -> $NEW_ID"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $NEW_ID" "$PLIST"
 
+# GUI regression tests occasionally need to exercise behavior gated on the
+# running bundle version before the release bump lands. Mutate only this
+# throwaway copy, before its ad-hoc signature is created; production code keeps
+# reading CFBundleShortVersionString from Bundle.main with no environment seam.
+if [[ -n "${RAPID_TEST_APP_VERSION:-}" ]]; then
+    if [[ ! "$RAPID_TEST_APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+        die "RAPID_TEST_APP_VERSION must be SemVer-shaped (got '$RAPID_TEST_APP_VERSION')"
+    fi
+    log "rewriting CFBundleShortVersionString -> $RAPID_TEST_APP_VERSION (test copy only)"
+    /usr/libexec/PlistBuddy \
+        -c "Set :CFBundleShortVersionString $RAPID_TEST_APP_VERSION" "$PLIST"
+    ACTUAL_VERSION=$(/usr/libexec/PlistBuddy \
+        -c "Print :CFBundleShortVersionString" "$PLIST")
+    if [[ "$ACTUAL_VERSION" != "$RAPID_TEST_APP_VERSION" ]]; then
+        die "CFBundleShortVersionString rewrite verification failed: expected '$RAPID_TEST_APP_VERSION', got '$ACTUAL_VERSION'"
+    fi
+fi
+
 # Sanity-check the rewrite stuck.
 ACTUAL_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$PLIST")
 if [[ "$ACTUAL_ID" != "$NEW_ID" ]]; then
@@ -352,8 +375,8 @@ SAFETY_DIR="$TARGET_ABS/.rapid-host-safety"
 mkdir -p "$SAFETY_DIR"
 cp "$SCRIPT_DIR/dogfood-host-precheck.sh" "$SAFETY_DIR/"
 cp "$REPO_ROOT/scripts/large-model-run.py" "$SAFETY_DIR/"
-cp "$REPO_ROOT/vllm_mlx/aliases.json" "$SAFETY_DIR/"
-cp "$REPO_ROOT/vllm_mlx/model_sizes.json" "$SAFETY_DIR/"
+cp "$REPO_ROOT/rapid_mlx/aliases.json" "$SAFETY_DIR/"
+cp "$REPO_ROOT/rapid_mlx/model_sizes.json" "$SAFETY_DIR/"
 chmod +x "$SAFETY_DIR/dogfood-host-precheck.sh" "$SAFETY_DIR/large-model-run.py"
 
 # The model cache is the one thing worth SHARING by default: it is tens of
@@ -398,6 +421,11 @@ cat > "$LAUNCHER" <<LAUNCHEOF
 # which drops the environment and re-shares the user's app state.
 set -euo pipefail
 export HOME="$HOME_DIR"
+# Foundation's FileManager.homeDirectoryForCurrentUser follows
+# CFFIXED_USER_HOME on current macOS even when it ignores an overridden HOME.
+# Set both so isolated launches cannot resolve connector/session paths back to
+# the operator's real account (confirmed on macOS 26.5.2, M2 Pro).
+export CFFIXED_USER_HOME="$HOME_DIR"
 export HF_HOME="$HF_HOME_FOR_RUN"
 export RAPID_DESKTOP_PORT="$ISOLATED_PORT"
 export RAPID_DESKTOP_NO_PORT_SWEEP=1

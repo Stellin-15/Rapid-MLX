@@ -5,7 +5,7 @@
 it is talking to instead of making the operator retype it into a config
 file. Two consumers depend on that today:
 
-* **In-tree** — ``vllm_mlx.agents.adapter.fetch_reasoning_support`` reads
+* **In-tree** — ``rapid_mlx.agents.adapter.fetch_reasoning_support`` reads
   ``reasoning_parser`` to decide whether ``agents dsh --setup`` should
   advertise graded reasoning to DeepSeek Harness (#1984).
 * **Out-of-tree** — the native Rapid-MLX provider for DSH
@@ -35,7 +35,7 @@ import json
 
 import pytest
 
-from vllm_mlx.api.models import ModelInfo
+from rapid_mlx.api.models import ModelInfo
 
 #: Field -> why an external client needs it. Deleting a row here is a
 #: deliberate act that should be visible in review, which is the point.
@@ -47,6 +47,8 @@ CLIENT_FIELDS: dict[str, str] = {
     "tool_call_parser": "whether it can emit OpenAI-shape tool_calls",
     "capabilities": "text / tools / vision, for request shaping",
     "recommended_sampling": "per-model sampling a client should adopt",
+    "personal_intelligence_profile": "qualified model-specific Rapid harness",
+    "personal_intelligence_qualification": "exact admitted artifact/parser/harness record",
 }
 
 #: Fields whose ``None`` must reach the wire as an explicit ``null``.
@@ -56,6 +58,8 @@ TRISTATE_FIELDS = (
     "tool_call_parser",
     "context_window",
     "max_model_len",
+    "personal_intelligence_profile",
+    "personal_intelligence_qualification",
 )
 
 

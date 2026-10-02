@@ -16,12 +16,35 @@ struct ServerSpeculativeDecoding: Codable, Sendable, Equatable {
     let method: String?
     let runtimeState: RuntimeState
     let requestFallbackFeatures: [String]
+    /// Exact implementation selected by the engine, when it exposes one.
+    let backend: String?
+    /// Features this accelerated runtime rejects instead of safely falling
+    /// back to ordinary decoding. Missing means an older server made no claim.
+    let unsupportedFeatures: [String]?
+
+    init(
+        configured: Bool,
+        method: String?,
+        runtimeState: RuntimeState,
+        requestFallbackFeatures: [String],
+        backend: String? = nil,
+        unsupportedFeatures: [String]? = nil
+    ) {
+        self.configured = configured
+        self.method = method
+        self.runtimeState = runtimeState
+        self.requestFallbackFeatures = requestFallbackFeatures
+        self.backend = backend
+        self.unsupportedFeatures = unsupportedFeatures
+    }
 
     enum CodingKeys: String, CodingKey {
         case configured
         case method
         case runtimeState = "runtime_state"
         case requestFallbackFeatures = "request_fallback_features"
+        case backend
+        case unsupportedFeatures = "unsupported_features"
     }
 }
 
@@ -31,6 +54,7 @@ struct SpeculativeDecodingAvailability: Equatable, Sendable {
     enum State: Equatable, Sendable {
         case ready
         case pausedByTools
+        case unsupportedTools
         case pending
         case unavailable
     }
@@ -51,7 +75,9 @@ struct SpeculativeDecodingAvailability: Equatable, Sendable {
         else { return nil }
 
         let state: State
-        if speculative.runtimeState == .unavailable {
+        if sendsTools && speculative.unsupportedFeatures?.contains("tools") == true {
+            state = .unsupportedTools
+        } else if speculative.runtimeState == .unavailable {
             state = .unavailable
         } else if sendsTools
             && speculative.requestFallbackFeatures.contains("tools")
@@ -81,6 +107,9 @@ struct SpeculativeDecodingAvailability: Equatable, Sendable {
         case .pausedByTools:
             key = "speculative_status.paused_tools"
             fallback = "%@ paused"
+        case .unsupportedTools:
+            key = "speculative_status.unsupported_tools"
+            fallback = "%@ limits tools"
         case .pending:
             key = "speculative_status.pending"
             fallback = "%@ starting"
@@ -104,6 +133,9 @@ struct SpeculativeDecodingAvailability: Equatable, Sendable {
         case .pausedByTools:
             key = "speculative_status.paused_tools.help"
             fallback = "%@ is configured, but tools require ordinary decoding. Turn off tools in Settings → Tools to use it."
+        case .unsupportedTools:
+            key = "speculative_status.unsupported_tools.help"
+            fallback = "%@ cannot serve tool requests in this mode. Turn off acceleration in Settings → Performance and restart the model to use tools."
         case .pending:
             key = "speculative_status.pending.help"
             fallback = "%@ is configured. Rapid-MLX will confirm the runtime when generation starts."
@@ -120,7 +152,7 @@ struct SpeculativeDecodingAvailability: Equatable, Sendable {
 
 /// Per-alias profile data returned by Rapid-MLX `/v1/models/{id}` as
 /// vendor-extension fields on top of the OpenAI-canonical shape.
-/// Mirrors the server's ``vllm_mlx.api.models.ModelInfo`` extension
+/// Mirrors the server's ``rapid_mlx.api.models.ModelInfo`` extension
 /// surface so a curated sampling profile (``recommended_sampling``)
 /// flows straight from ``aliases.json`` to the user's first chat —
 /// no hand-tuning sliders, no per-model docs to read.
@@ -172,6 +204,12 @@ struct ServerModelProfile: Codable, Sendable, Equatable {
     /// the alias without grepping server logs.
     let toolCallParser: String?
     let reasoningParser: String?
+    /// Server-qualified model-specific harness for Personal Intelligence.
+    /// Missing or nil means ordinary Chat, even when tool calls are supported.
+    let personalIntelligenceProfile: String?
+    /// Versioned exact-build admission record. Together with `id`, parser,
+    /// and profile this is the live Personal Intelligence binding identity.
+    let personalIntelligenceQualification: String?
     /// Live request capabilities for this exact served id. `nil` means an
     /// older sidecar omitted the field; an empty array is authoritative.
     let capabilities: [String]?
@@ -215,6 +253,11 @@ struct ServerModelProfile: Codable, Sendable, Equatable {
     /// Live speculative-decoding configuration and the request features that
     /// retain ordinary decoding. Nil on older sidecars and unloaded aliases.
     let speculativeDecoding: ServerSpeculativeDecoding?
+    /// Catalog-owned ordinary mode offered when a specialized runtime cannot
+    /// serve the request's features. Nil for ordinary and older profiles.
+    let fallbackModel: String?
+    /// Qualified physical-memory floor reported by the live runtime.
+    let minMemoryGB: Double?
 
     /// A lazy speculative runtime may not know whether its generator hook can
     /// install until generation begins. Keep polling only that non-terminal
@@ -230,6 +273,8 @@ struct ServerModelProfile: Codable, Sendable, Equatable {
         case isMoe = "is_moe"
         case toolCallParser = "tool_call_parser"
         case reasoningParser = "reasoning_parser"
+        case personalIntelligenceProfile = "personal_intelligence_profile"
+        case personalIntelligenceQualification = "personal_intelligence_qualification"
         case capabilities
         case servingLane = "serving_lane"
         case servingLaneReason = "serving_lane_reason"
@@ -242,6 +287,8 @@ struct ServerModelProfile: Codable, Sendable, Equatable {
         // ``ModelInfo.context_window`` wire shape.
         case contextWindow = "context_window"
         case speculativeDecoding = "speculative_decoding"
+        case fallbackModel = "fallback_model"
+        case minMemoryGB = "min_memory_gb"
     }
 
     /// Explicit memberwise init with defaults for the FU-3 floor
@@ -257,6 +304,8 @@ struct ServerModelProfile: Codable, Sendable, Equatable {
         isMoe: Bool? = nil,
         toolCallParser: String? = nil,
         reasoningParser: String? = nil,
+        personalIntelligenceProfile: String? = nil,
+        personalIntelligenceQualification: String? = nil,
         capabilities: [String]? = nil,
         servingLane: String? = nil,
         servingLaneReason: String? = nil,
@@ -264,7 +313,9 @@ struct ServerModelProfile: Codable, Sendable, Equatable {
         reasoningChatFloor: Int? = nil,
         reasoningToolsFloor: Int? = nil,
         contextWindow: Int? = nil,
-        speculativeDecoding: ServerSpeculativeDecoding? = nil
+        speculativeDecoding: ServerSpeculativeDecoding? = nil,
+        fallbackModel: String? = nil,
+        minMemoryGB: Double? = nil
     ) {
         self.id = id
         self.recommendedSampling = recommendedSampling
@@ -272,6 +323,8 @@ struct ServerModelProfile: Codable, Sendable, Equatable {
         self.isMoe = isMoe
         self.toolCallParser = toolCallParser
         self.reasoningParser = reasoningParser
+        self.personalIntelligenceProfile = personalIntelligenceProfile
+        self.personalIntelligenceQualification = personalIntelligenceQualification
         self.capabilities = capabilities
         self.servingLane = servingLane
         self.servingLaneReason = servingLaneReason
@@ -280,6 +333,8 @@ struct ServerModelProfile: Codable, Sendable, Equatable {
         self.reasoningToolsFloor = reasoningToolsFloor
         self.contextWindow = contextWindow
         self.speculativeDecoding = speculativeDecoding
+        self.fallbackModel = fallbackModel
+        self.minMemoryGB = minMemoryGB
     }
 }
 
@@ -395,7 +450,7 @@ struct ImageInputAvailability: Equatable, Sendable {
             // carries the same floor. Only a different vision-capable model
             // is a remedy the user can actually apply.
             return .visionMemoryInsufficient
-        case "vision_hybrid_runtime_unsupported":
+        case "vision_hybrid_runtime_unsupported", "vision_runtime_absent":
             return .visionRuntimeUnsupported
         case "vision_architecture_unavailable", "vision_hybrid_cache_unsupported",
              "vision_weights_unavailable":
@@ -449,6 +504,7 @@ enum ServerProfileFetcher {
         req.httpMethod = "GET"
         req.timeoutInterval = requestTimeout
         req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.applyRapidClientHeader()
         if let bearer, !bearer.isEmpty {
             req.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
         }

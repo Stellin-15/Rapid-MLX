@@ -6,6 +6,18 @@ summary statistics, and limitations.
 
 ## Reports
 
+- [Row-invariant lane matmul for multi-row decode (opt-in)](2026-09-30-lane-matmul.md)
+- [Semantic action protocol browser CUA POC](2026-09-25-cua-semantic-action-protocol.md)
+- [Qwen3.5-9B + vision-verifier browser POC](2026-09-25-vision-verifier-cua-poc.md)
+- [System One CLM-8B server dogfood](2026-09-24-system-one-clm-dogfood.md)
+- [System One Laya server dogfood](2026-09-24-system-one-laya-dogfood.md)
+- [Gemma 4 26B-A4B assistant-sidecar MTP qualification](2026-09-20-gemma4-assistant-mtp.md)
+- [Qwen3.6-35B-A3B compiled decode replay qualification](2026-09-13-qwen36-compiled-decode.md)
+- [Qwen3.6-35B-A3B native text-cache qualification](2026-09-13-qwen36-mllm-native-text-cache.md)
+- [Qwen3.6-35B-A3B fused GDN decode qualification](2026-09-12-qwen36-35b-fused-gdn-decode.md)
+- [Qwen3.6-35B-A3B fused MoE router qualification](2026-09-12-qwen36-35b-fused-router.md)
+- [GLM-5.3 real-task MTP qualification](2026-09-12-glm53-real-task-mtp.md)
+- [DeepSeek V4.1 Flash Engram SSD offload qualification](2026-09-11-deepseek-v41-engram-offload.md)
 - [Qwen3.8 27B MTP FP16 checkpoint qualification](2026-09-07-qwen38-mtp-fp16.md)
 - [Qwen4 fp32-input fast RMSNorm qualification](2026-09-06-qwen4-fast-rmsnorm.md)
 - [FLUX.2 Klein q4/BF16 image precision qualification](2026-09-04-image-weight-precision.md)

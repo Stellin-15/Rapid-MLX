@@ -58,8 +58,8 @@ def test_pixel_assertion_uses_element_screenshots_and_crops_chrome():
     assert "older.screenshot()" in source
     assert 'element("Images.ModelPicker", in: app)' in source
     assert 'picker.label.contains("fake-image-alias")' in source
-    assert 'events.contains(#""event": "server_started""#)' in source
-    assert 'events.contains(#""alias": "fake-image-alias""#)' in source
+    assert "harness.startModel()" in source
+    assert 'sidecarAlias: "fake-image-alias"' in source
     assert "imageResponseCount(in: eventLog) == 1" in source
     assert "imageResponseCount(in: eventLog) == 2" in source
     assert "waitForNonExistence" not in source
@@ -81,6 +81,7 @@ def test_xcui_runner_launches_production_bundle_with_fake_sidecar():
         MAC / "Tests/RapidUITests/Tests/ChatAttachmentJourneyTests.swift"
     ).read_text()
     chat_view = (MAC / "Sources/Rapid/UI/ChatView.swift").read_text()
+    drag_host = (MAC / "Tests/RapidUITests/Host/main.swift").read_text()
 
     assert "build/Rapid-MLX Desktop.app" in runner
     assert "lsregister" in runner
@@ -95,13 +96,15 @@ def test_xcui_runner_launches_production_bundle_with_fake_sidecar():
     assert "CODE_SIGN_IDENTITY=-" in runner
     assert "CODE_SIGNING_ALLOWED=NO" not in runner
     assert '${test_selection[@]+"${test_selection[@]}"}' in runner
-    assert "XCUIApplication(url: appURL)" in source
-    assert 'appendingPathComponent("build/Rapid-MLX Desktop.app")' in source
-    assert source.count('"CFFIXED_USER_HOME": testHome.path') == 1
-    assert '"RAPID_BIN"' in source
-    assert "fake-rapid-mlx.sh" in source
-    assert 'appendingPathComponent(".rapid-golden-fake.json")' in source
-    assert '"FAKE_EVENT_LOG": eventLog.path' in source
+    assert "XCUIApplication(url: appURL)" in harness
+    assert 'appendingPathComponent("build/Rapid-MLX Desktop.app")' in harness
+    assert harness.count('"CFFIXED_USER_HOME": testHome.path') == 1
+    assert '"RAPID_BIN"' in harness
+    assert "fake-rapid-mlx.sh" in harness
+    assert 'appendingPathComponent(".rapid-golden-fake.json")' in harness
+    assert 'config["FAKE_EVENT_LOG"] = eventLog.path' in harness
+    assert 'sidecarAlias: "fake-image-alias"' in source
+    assert "explicitSidecarAlias ?? (" in harness
     assert 'config["FAKE_PID_FILE"] = sidecarPIDFile.path' in harness
     assert "String(contentsOf: sidecarPIDFile" in harness
     assert 'element("MemoryWarning.Confirm")' in harness
@@ -121,10 +124,10 @@ def test_xcui_runner_launches_production_bundle_with_fake_sidecar():
     assert 'matching(identifier: "RapidUITests.FileDragSource")' in harness
     assert "let maximumAttempts = 2" in harness
     assert "FileDropRetryPolicy.observationTimeout(" in harness
-    assert "- retryGestureBudget" in harness
-    assert "- minimumRetryBudget" in harness
-    assert "- observationSchedulingSlack" in harness
+    assert "completionObservationTimeout" in harness
     assert "FileDropRetryPolicy.shouldRetry(" in harness
+    assert "transportFailed:" in harness
+    assert "DragTransportFile.result(" in harness
     assert "simulateCompletionVisibilityDelay: TimeInterval = 0" in harness
     assert "completionIsVisible()" in harness
     assert "func testFileDropRetryPolicyIsBoundedAndCompletionAware()" in chat_source
@@ -138,11 +141,52 @@ def test_xcui_runner_launches_production_bundle_with_fake_sidecar():
     assert 'recordUITestFileDrop("performed")' in chat_view
     assert "try? phase.write" not in chat_view
     assert 'fatalError("could not record completed UI-test file drop' in chat_view
-    assert (
-        '"RAPID_XCUI_DROP_FIRST_GESTURE": simulateMissedFirstGesture ? "1" : "0"'
-        in harness
-    )
+    assert '"RAPID_XCUI_DROP_FIRST_GESTURE": dropFirstGesture ? "1" : "0"' in harness
     assert "XCTAssertEqual(recoveredAttempts, 2)" in chat_source
+    assert "launchFileDragSource(" in harness
+    assert "terminateFileDragSource(dragSource)" in harness
+    assert "simulateMissedFirstGesture && attempt == 1" in harness
+    retry_loop = harness.split("for attempt in 1...maximumAttempts", 1)[1].split(
+        "private func launchFileDragSource", 1
+    )[0]
+    launch_index = retry_loop.index("launchFileDragSource(")
+    gesture_index = retry_loop.index(
+        "source.click(forDuration: 1, thenDragTo: dropTarget)"
+    )
+    result_index = retry_loop.index("DragTransportFile.result(at: transportResultFile)")
+    termination_index = retry_loop.index(
+        "guard terminateFileDragSource(dragSource)", result_index
+    )
+    retry_decision_index = retry_loop.index("FileDropRetryPolicy.shouldRetry(")
+    final_marker_read_index = retry_loop.index(
+        "observedPhase = try DropEventFile.completedPhase(at: dropEventFile)",
+        termination_index,
+    )
+    assert (
+        launch_index
+        < gesture_index
+        < result_index
+        < termination_index
+        < final_marker_read_index
+        < retry_decision_index
+    )
+    assert (
+        '"RAPID_XCUI_DRAG_RESULT_FILE": resultFile.path' in harness
+        and 'environment["RAPID_XCUI_DRAG_RESULT_FILE"]' in drag_host
+    )
+    assert "endedAt screenPoint: NSPoint" in drag_host
+    assert 'recordResult("copy")' in drag_host
+    assert 'recordResult("none")' in drag_host
+    assert 'recordResult("not-started")' in drag_host
+    assert (
+        "let acceptedDrop = observedPhase != nil || transportResult == .copy" in harness
+    )
+    assert "chipIsSettled() || completionIsVisible()" in harness
+    assert "try DropEventFile.clear(at: dropEventFile)" in harness
+    assert harness.index("try DropEventFile.clear(at: dropEventFile)") < harness.index(
+        "for attempt in 1...maximumAttempts"
+    )
+    assert "retry suppressed" in harness
     assert "XCTAssertEqual(delayedChipAttempts, 1)" in chat_source
     assert "simulateCompletionVisibilityDelay: 3" in chat_source
     assert 'let dropTarget = element("rapid.chat.compose")' in harness
@@ -176,13 +220,16 @@ def test_xcui_runner_launches_production_bundle_with_fake_sidecar():
     assert 'element("ChatView.Attachment.Remove.Pasted image.png")' in chat_source
     assert "port: 65_001" not in chat_source
     assert "port: 65_002" not in chat_source
-    assert '"RAPID_DESKTOP_PORT": "65000"' in source
-    assert '"RAPID_DESKTOP_NO_PORT_SWEEP": "1"' in source
-    assert (
-        'terminateFakeSidecars(recordedIn: eventLog, alias: "fake-image-alias")'
-        in source
-    )
-    assert "isExecutableFile" in source
+    assert '"RAPID_DESKTOP_PORT": String(reservedPort.port)' in harness
+    assert '"RAPID_DESKTOP_NO_PORT_SWEEP": "1"' in harness
+    assert "override func tearDown()" in source
+    assert "activeHarness?.shutDown()" in source
+    assert "activeHarness = harness" in source
+    assert "app.wait(for: .notRunning, timeout: 5)" in harness
+    assert "private var activeFileDragSource: XCUIApplication?" in harness
+    assert "activeFileDragSource = dragSource" in harness
+    assert "terminateFakeSidecars()" in harness
+    assert "isExecutableFile" in harness
     assert "RapidUITests-$(date +%s)-$$.xcresult" in runner
 
 
@@ -208,10 +255,10 @@ def test_xcui_runner_can_reserve_its_loopback_listener():
 
 
 def test_swift_source_parent_traversal_resolves_rapid_mac_fixture():
-    source = MAC / "Tests/RapidUITests/Tests/ImageGenerationPixelTests.swift"
+    source = MAC / "Tests/RapidUITests/Tests/RapidUITestHarness.swift"
     source_text = source.read_text()
     traversal_expression = source_text.split(
-        "let rapidMacRoot = URL(fileURLWithPath: #filePath)", 1
+        "rapidMacRoot = URL(fileURLWithPath: #filePath)", 1
     )[1].split("let fakeSidecar", 1)[0]
     traversal_count = traversal_expression.count(".deletingLastPathComponent()")
 

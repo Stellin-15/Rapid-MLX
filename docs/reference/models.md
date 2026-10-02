@@ -21,10 +21,44 @@ Families with registered aliases (run `rapid-mlx models` for the full, current l
 | LFM 2 / 2.5 | 1B, 2.6B, 8B-A1B, 24B-A2B | 4-bit |
 | MiniCPM 5 | 1B, 2B | 4-bit, OptiQ 4-bit |
 | GPT-OSS | 20B, 120B | 4/8-bit, mxfp4 |
-| Ternary Bonsai | 1.7B, 27B | 2-bit (ternary) |
+| Ternary Bonsai | 1.7B, 27B, Bonsai 2 27B (vision) | 2-bit (ternary) |
 | Hunyuan 3 (Hy3) | 295B MoE (21B active) — **Ultra-only** | 4-bit |
 | NeoHorse 1 | 9B (experimental Chat candidate) | 4-bit |
 | G9v3 (AI9Stars) | 39B MoE (5B active) | 4-bit |
+| K2 Horizon | 7B (experimental, text-only) | 4-bit |
+
+### Experimental 256 GB lane: DeepSeek V4.1 Flash
+
+`deepseek-v41-flash-reap-2bit` serves the pinned Rapid-MLX REAP 2-bit
+checkpoint with its pinned DSpark K4 sidecar. The target contains about 199 GiB
+of tensors; the sidecar download is narrowed to the three required MTP shards
+plus its manifest, data index, and config (4.62 GB). It is published separately
+at [DeepSeek V4.1 Flash DSpark 4d2e MLX](https://huggingface.co/rapid-mlx/DeepSeek-V4.1-Flash-DSpark-4d2e-MLX),
+so users who do not enable this path do not download it.
+
+```bash
+rapid-mlx pull deepseek-v41-flash-reap-2bit
+rapid-mlx serve deepseek-v41-flash-reap-2bit
+```
+
+This is a deliberately narrow product lane:
+
+- 256 GB Apple Silicon is the supported hardware; startup fails closed below
+  the measured 224 GiB unified-memory floor.
+- Requests serialize behind one model worker. Continuous batching and prefix
+  caching are not claimed for this architecture-specific cache.
+- Greedy generation is supported, with at most 8,192 input tokens and 4,096
+  output tokens. Sampling, images, tools, MCP, and structured output are not
+  yet qualified.
+- The four-workload 128-token suite was deterministic across two repeats. It
+  measured 19.39 tok/s overall at K4 versus 9.58 tok/s autoregressive (2.02x).
+  This is approximately 20 tok/s for the measured configuration, not a
+  per-prompt guarantee. Peak MLX memory was 218.23 GB on the qualification
+  Studio.
+
+The runtime verifies immutable revisions, expected file sizes, SHA-256 values
+for every sidecar data file, and the complete tensor/config contract before it
+reports healthy.
 
 ### MiniCPM5 2B
 
@@ -47,7 +81,7 @@ until its separately published draft architecture is supported and qualified.
 
 ### Recommended Models
 
-Recommendations live in one catalog (`vllm_mlx/model_recommendations.json`) shared by the installer, the desktop app, and `rapid-mlx recipe` — run `rapid-mlx recipe` to see the Smart and Fast picks for *this* Mac. The RAM-tier smart picks:
+Recommendations live in one catalog (`rapid_mlx/model_recommendations.json`) shared by the installer, the desktop app, and `rapid-mlx recipe` — run `rapid-mlx recipe` to see the Smart and Fast picks for *this* Mac. The RAM-tier smart picks:
 
 | RAM | Alias | ~8K-prompt peak |
 |-----|-------|-----------------|
@@ -56,6 +90,39 @@ Recommendations live in one catalog (`vllm_mlx/model_recommendations.json`) shar
 | 18–23 GB | `qwen3.5-9b-4bit` | 8.7 GB |
 | 24–31 GB | `bonsai-27b-2bit` | 13.0 GB |
 | 32 GB+ | `qwen3.8-27b-4bit` | 20.0 GB |
+
+The experimental `qwen3.8-27b-tensorfold` profile requires a separately
+installed source runtime. Install the exact qualified revision before selecting
+the profile:
+
+```bash
+python -m pip install "tensorfold @ git+https://github.com/ashhart/TensorFold.git@9cd52ab4daba68ddd09be89be8f23ad43175e821"
+```
+
+This dependency remains an explicit opt-in because it is not available as an
+indexed wheel. The normal `rapid-mlx` package and its extras do not install it.
+
+### Experimental GLM-5.3 accelerated profile
+
+`glm5.3-flash-tensorfold` is an experimental, text-only profile for Apple Silicon
+Macs with 256 GB of unified memory. It uses the checkpoint's embedded MTP head;
+there is no separate draft-model download. The ordinary
+`glm5.3-flash-4bit` alias and its defaults are unchanged.
+
+Install the exact qualified runtime, then select the dedicated alias:
+
+```bash
+python -m pip install "tensorfold @ git+https://github.com/ashhart/TensorFold.git@c4646171139ee8a3c38103eaa1699dad226ec12b"
+rapid-mlx serve glm5.3-flash-tensorfold
+```
+
+This experimental lane supports streaming and non-streaming text chat. Tools,
+images, grammar constraints, and general batching fail explicitly; restart with
+`glm5.3-flash-4bit` for the ordinary feature-complete mode. The profile pins
+the target and runtime revisions and refuses incompatible artifacts at startup.
+The dedicated alias enables its accelerated backend by default on compatible
+systems. Pass `--no-spec-decode` to opt out; Rapid then uses the normal GLM
+serving path and reports that mode rather than advertising TensorFold as active.
 
 ### Experimental Chat candidate: NeoHorse 1 9B
 
@@ -74,6 +141,33 @@ cache optimizations until that exact checkpoint has separate compatibility
 evidence. See the
 [reproducible qualification note](../engineering/performance/2026-09-08-neohorse-9b-chat-qualification.md)
 for the current evidence and limitations.
+
+### Experimental Chat candidate: K2 Horizon 7B
+
+`k2-horizon-7b-4bit` is an opt-in, text-only model for Macs with at least
+16 GB of unified memory. Rapid-MLX implements the dense K2 architecture and
+its graded reasoning/tool protocol directly on the text runtime; loading this
+alias does not execute Python shipped by the checkpoint repository and does
+not use the optional vision runtime.
+
+```bash
+rapid-mlx pull k2-horizon-7b-4bit
+rapid-mlx serve k2-horizon-7b-4bit
+```
+
+The model has native high/medium/low reasoning effort rather than a true
+no-reasoning mode. Requests that disable thinking use its lowest native effort,
+and Rapid-MLX still keeps that trace out of visible answer content. A pinned
+4-bit checkpoint was qualified through the real OpenAI-compatible server on a
+48 GB M4 Pro Mac. The standardized five-prompt speed tier generated 640 tokens
+at 49.1 tokens/second. A separate fixed-length decode probe measured 51.1
+tokens/second with 5.52 GB peak MLX memory, essentially matching Qwen3.5 9B on
+the same machine. Native structured tool calls worked in both streaming and
+non-streaming responses. See the
+[reproducible qualification note](../engineering/performance/2026-09-14-k2-horizon-7b-qualification.md)
+for the exact method and why a short-response measurement previously
+understated throughput. The alias is not a Smart/Fast default, and speculative
+decoding remains disabled pending separate evidence.
 
 ### Experimental research model: Qwen3.8 27B Abliterated
 
@@ -185,7 +279,7 @@ uses the reasoning-token budget; to send the template's own
 parameters active per token (32 of 320 routed experts plus one shared
 expert), gated GQA attention and a 128K context. The architecture ships
 only as `trust_remote_code` transformers code, so rapid-mlx vendors the MLX
-backbone (`vllm_mlx/models/g9v3.py`) and publishes its own conversion.
+backbone (`rapid_mlx/models/g9v3.py`) and publishes its own conversion.
 The 4-bit export keeps the routed experts at 4-bit and everything else
 (attention, dense/shared MLP, embeddings) at 8-bit: uniform 4-bit was
 measured to hurt this architecture's attention projections badly.

@@ -48,6 +48,27 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 
+def _start_parent_watchdog():
+    """Mirror the production sidecar's orphan-reaping contract in GUI tests."""
+    raw_parent = os.environ.get("RAPID_MLX_WATCHDOG_PPID", "")
+    try:
+        expected_parent = int(raw_parent)
+    except ValueError:
+        return
+    if expected_parent <= 1:
+        return
+
+    def watch():
+        while os.getppid() == expected_parent:
+            time.sleep(0.1)
+        # The Desktop supervisor is gone.  Avoid Python shutdown machinery:
+        # another request thread may be blocked inside a deliberately held
+        # test response, and the production contract is immediate retirement.
+        os._exit(0)
+
+    threading.Thread(target=watch, name="parent-watchdog", daemon=True).start()
+
+
 if sys.argv[1:] == ["launch", "list", "--json"]:
     print(json.dumps([
         {"id": "cline", "name": "Cline", "kind": "config_writer", "config_path": "~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"},
@@ -125,6 +146,36 @@ def _parse_args(argv):
     parser.add_argument("--port", type=int, default=8000)
     args, _unknown = parser.parse_known_args(argv[1:])
     return args
+
+
+# The QuickSilver pool catalog, as ``ShareComputeModel.supported`` spells it.
+# Gated behind FAKE_SHARE_COMPUTE_POOL so only the Share Compute journeys see
+# these rows: every other flow's baseline would otherwise gain models it has no
+# opinion about. Sizes mirror the real checkpoints closely enough for a layout
+# review and are never asserted on.
+#
+# glm-5.3-flash is deliberately NOT cached: its real checkpoint is ~180 GB, so
+# a review Mac would not have it, and the pool surfaces need a live example of
+# the download-required state with a long model name.
+SHARE_COMPUTE_POOL_ALIASES = [
+    "qwen3.8-27b-4bit",
+    "qwen3.6-35b",
+    "nemotron-3.5-lightning-30b-4bit",
+    "glm5.3-flash-4bit",
+]
+SHARE_COMPUTE_POOL_SIZES = {
+    "qwen3.8-27b-4bit": "16.8 GB",
+    "qwen3.6-35b": "20.4 GB",
+    "nemotron-3.5-lightning-30b-4bit": "18.9 GB",
+}
+# Aliases listed in the catalog but reported as NOT downloaded, so the pool
+# surfaces always have a real Download Required row with a storage check and
+# Share always has a model it must refuse to list. Nemotron and GLM together
+# also give the model list its two longest names to lay out.
+SHARE_COMPUTE_POOL_UNCACHED = {
+    "nemotron-3.5-lightning-30b-4bit",
+    "glm5.3-flash-4bit",
+}
 
 
 CONTENT_CHUNKS = [
@@ -1174,6 +1225,8 @@ def _emit_catalog(subcommand, alias):
                 aliases.append("qwen3.5-4b-4bit")
             if _setting("FAKE_CACHED_VARIANTS") == "1":
                 aliases.extend(["qwen3-0.6b-8bit", "qwen3-0.6b-4bit", "qwen3-4b-4bit"])
+            if _setting("FAKE_SHARE_COMPUTE_POOL") == "1":
+                aliases.extend(SHARE_COMPUTE_POOL_ALIASES)
             aliases.append(FAKE_VISION_ALIAS if _setting("FAKE_VISION_CHAT") == "1" else "fake-alias")
             aliases.append("fake-external-alias")
             if _setting("FAKE_SETTINGS_MTP") == "1":
@@ -1224,6 +1277,9 @@ def _emit_catalog(subcommand, alias):
             print("qwen3-0.6b-8bit       hermes           qwen3")
             print("qwen3-0.6b-4bit       hermes           qwen3")
             print("qwen3-4b-4bit         hermes           qwen3")
+        if _setting("FAKE_SHARE_COMPUTE_POOL") == "1":
+            for pool_alias in SHARE_COMPUTE_POOL_ALIASES:
+                print(f"{pool_alias:<22} hermes           qwen3")
         if _setting("FAKE_VISION_CHAT") == "1":
             print("qwen3-vl-2b-4bit      hermes           qwen3")
         else:
@@ -1266,6 +1322,16 @@ def _emit_catalog(subcommand, alias):
         print("Alias                  Repo                   Size")
         print("---------------------  ---------------------  ------")
         pulled_models = _pulled_model_aliases()
+        if _setting("FAKE_SHARE_COMPUTE_POOL") == "1":
+            # Membership in SHARE_COMPUTE_POOL_UNCACHED decides this, not a
+            # slice index — a slice silently changed meaning every time the
+            # catalog grew, which is how adding a fourth pool model turned two
+            # ready rows into two different ones.
+            for pool_alias in SHARE_COMPUTE_POOL_ALIASES:
+                if pool_alias in SHARE_COMPUTE_POOL_UNCACHED:
+                    continue
+                size = SHARE_COMPUTE_POOL_SIZES[pool_alias]
+                print(f"{pool_alias:<22} rapid-mlx/{pool_alias:<12} {size}")
         if "lfm2.5-2.6b-4bit" in pulled_models:
             print("lfm2.5-2.6b-4bit      fake-org/fake-repo        1.6 GB")
         if "lfm2.5-1b-4bit" in pulled_models:
@@ -1392,6 +1458,11 @@ def main():
                     stream.write(f"{args.alias}\n")
         _emit_catalog(args.subcommand, args.alias)
         sys.exit(0)
+
+    # The production sidecar retires itself when its Desktop supervisor dies.
+    # Keep the fixture faithful so a failed/crashed XCUITest cannot poison the
+    # next job with an orphan listener.
+    _start_parent_watchdog()
 
     # XCUITest cleanup must not depend on reaching the later readiness event:
     # record ownership as soon as this process commits to the long-lived serve

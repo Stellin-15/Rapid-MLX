@@ -1,0 +1,5324 @@
+# SPDX-License-Identifier: Apache-2.0
+"""OpenAI Responses API endpoint — /v1/responses.
+
+Stateless shim that lets Codex CLI (and any other Responses-API client)
+talk to rapid-mlx as if it were OpenAI. Translates Responses → Chat,
+runs inference through the existing engine, translates back into the
+seven SSE events Codex CLI parses (``response.created``,
+``response.output_item.added``, ``response.output_text.delta``,
+``response.function_call_arguments.delta``, ``response.output_item.done``,
+``response.completed``, ``response.failed``).
+
+Statelessness: ``previous_response_id`` returns 400. Codex CLI doesn't
+use that field (openai/codex#3841) — it re-sends the full conversation
+history every turn in ``input``.
+"""
+
+import asyncio
+import inspect
+import json
+import logging
+import re
+import shlex
+import time
+import uuid
+from collections.abc import AsyncIterator, Mapping
+from typing import cast
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import Response, StreamingResponse
+
+from ..api.errors import RESPONSES_TEXT_FORMAT_PARAM, GuidedGenerationCancelledError
+from ..api.models import (
+    AssistantMessage,
+    ChatCompletionChoice,
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+)
+from ..api.protocol_mapping import cancellation_error, is_cancellation_finish_reason
+from ..api.response_format_metrics import (
+    incr_strict_repair_attempt,
+    incr_strict_repair_skipped_context_overflow,
+    incr_strict_repair_success,
+    incr_strict_request,
+    incr_strict_violation,
+)
+from ..api.responses_adapter import (
+    normalize_responses_tool_types,
+    openai_to_responses,
+    request_uses_computer_use,
+    responses_to_openai,
+    validate_responses_tool_choice,
+    validate_responses_tool_types,
+)
+from ..api.responses_models import ResponsesRequest, ResponsesResponse, ResponsesUsage
+from ..api.strict_json_schema import (
+    build_repair_messages,
+    build_violation_envelope,
+    repair_retry_enabled,
+    strict_enforcement_enabled,
+    validate_and_envelope,
+)
+from ..api.tool_calling import (
+    check_schema_validity,
+    convert_tools_for_template,
+    extract_json_schema_for_guided,
+    is_strict_json_schema,
+    nonstrict_json_schema_boundary_error,
+    validate_output_against_schema,
+)
+from ..api.utils import (
+    StreamingReasoningSanitizer,
+    StreamingThinkRouter,
+    StreamingToolCallFilter,
+    UnsupportedContentBlockError,
+    clean_output_text,
+    decode_inline_tool_call_arguments,
+    extract_json_from_response,
+    extract_multimodal_content,
+    sanitize_output,
+    strip_special_tokens,
+    strip_thinking_tags,
+    validate_content_blocks_for_capabilities,
+)
+from ..config import get_config
+from ..engine import BaseEngine, GenerationOutput
+from ..middleware.auth import check_rate_limit, verify_api_key
+from ..reasoning import finalize_streaming_compat
+from ..service.helpers import (
+    SSE_RESPONSE_HEADERS,
+    _aggregate_generation_attempts,
+    _apply_reasoning_cutoff_notice,
+    _build_response_metrics,
+    _build_usage,
+    _check_admission_or_503,
+    _client_signalled_reasoning_intent,
+    _consume_guided_lifecycle_cancel,
+    _disconnect_guard,
+    _effective_enable_thinking,
+    _extract_thinking_from_request,
+    _finalize_content_and_reasoning,
+    _is_structured_output_requested,
+    _parse_tool_calls_with_parser,
+    _raise_lifecycle_cancel_or_reraise,
+    _release_admission_unless_committed,
+    _release_route_ownership,
+    _resolve_enable_thinking,
+    _resolve_max_tokens,
+    _resolve_temperature,
+    _resolve_top_p,
+    _uses_deepseek_v4_reasoning,
+    _validate_model_name,
+    _validate_tool_call_params,
+    _wait_with_disconnect,
+    build_extended_sampling_kwargs,
+    enforce_context_length,
+    enforce_context_length_for_messages,
+    ensure_engine_ready,
+    get_engine,
+    get_model_max_context,
+    maybe_apply_default_reasoning_effort,
+    maybe_apply_reasoning_effort,
+    maybe_auto_disable_thinking_for_casual_chat,
+    maybe_auto_disable_thinking_for_tools,
+    repair_messages_fit_context,
+    served_chat_template,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+_NONPROGRESS_RETRY_BUFFER_LIMIT = 4 * 1024 * 1024
+
+
+def _should_prime_deepseek_codex_exec(
+    responses_request: ResponsesRequest, tool_parser: str | None
+) -> bool:
+    """Return whether DeepSeek Codex's first turn should pin exec_command.
+
+    DeepSeek V4 reliably emits a valid DSML invocation when the tool name is
+    primed, but stochastic ``auto`` selection can stop in hidden output before
+    the first repository inspection. Pin exactly the initial locating action;
+    after any completed call, release ``auto`` so a small grounded task can
+    edit immediately and larger tasks can gather evidence proportional to
+    their scope.
+    """
+    if tool_parser != "deepseek_v4_0731":
+        return False
+    if responses_request.tool_choice not in (None, "auto"):
+        return False
+
+    tool_names: set[str] = set()
+    for tool in responses_request.tools or []:
+        data = tool.model_dump() if hasattr(tool, "model_dump") else tool
+        if not isinstance(data, dict):
+            continue
+        function = data.get("function")
+        name = data.get("name") or (
+            function.get("name") if isinstance(function, dict) else None
+        )
+        if isinstance(name, str):
+            tool_names.add(name)
+    # Codex exposes ``apply_patch`` as a custom tool whose wire shape can vary
+    # by client version, while its PTY pair is stable. Requiring both PTY tools
+    # keeps this scoped to a coding-agent surface rather than arbitrary apps
+    # that happen to expose one shell function.
+    if not {"exec_command", "write_stdin"}.issubset(tool_names):
+        return False
+
+    items = responses_request.input
+    if not isinstance(items, list):
+        return True
+    completed_calls = 0
+    for item in items:
+        data = item.model_dump() if hasattr(item, "model_dump") else item
+        if isinstance(data, dict) and data.get("type") == "function_call_output":
+            completed_calls += 1
+    return completed_calls == 0
+
+
+def _is_deepseek_codex_surface(
+    responses_request: ResponsesRequest, tool_parser: str | None
+) -> bool:
+    """Identify the DeepSeek DSML + Codex PTY tool combination."""
+    if tool_parser is None:
+        cfg = get_config()
+        configured = " ".join(
+            str(value or "")
+            for value in (
+                responses_request.model,
+                cfg.model_name,
+                cfg.model_alias,
+                cfg.model_path,
+            )
+        ).lower()
+        if "deepseek-v4-flash-0731" in configured:
+            tool_parser = "deepseek_v4_0731"
+    if tool_parser != "deepseek_v4_0731":
+        return False
+    names: set[str] = set()
+    for tool in responses_request.tools or []:
+        data = tool.model_dump() if hasattr(tool, "model_dump") else tool
+        if not isinstance(data, dict):
+            continue
+        function = data.get("function")
+        name = data.get("name") or (
+            function.get("name") if isinstance(function, dict) else None
+        )
+        if isinstance(name, str):
+            names.add(name)
+    return {"exec_command", "write_stdin"}.issubset(names)
+
+
+def _inject_codex_progress_reminder(
+    messages: list[dict], responses_request: ResponsesRequest
+) -> list[dict]:
+    """Nudge completed work or a proven command loop without guessing task scope."""
+    items = responses_request.input
+    if not isinstance(items, list):
+        return messages
+    has_edited = False
+    has_test_passed = False
+    has_test_failed = False
+    actions: list[tuple[str, str]] = []
+    calls: dict[str, str] = {}
+    call_names: dict[str, str] = {}
+    for item in items:
+        data = item.model_dump() if hasattr(item, "model_dump") else item
+        if not isinstance(data, dict):
+            continue
+        if data.get("type") == "function_call_output":
+            output = str(data.get("output") or "")
+            call_id = str(data.get("call_id") or "")
+            command = calls.get(call_id, "")
+            actions.append((call_names.get(call_id, ""), command))
+            is_test = any(
+                marker in command
+                for marker in ("pytest", "unittest", "tox", "nox", "ruff", "mypy")
+            )
+            if is_test and re.search(r"(?m)^\s*\d+\s+passed(?:\s|,|$)", output):
+                # Pytest summaries have shapes such as ``21 passed in 1.0s``.
+                has_test_passed = True
+            if is_test and any(
+                marker in output for marker in ("FAILED ", " FAILURES ", " ERROR ")
+            ):
+                has_test_failed = True
+        if data.get("type") == "function_call":
+            arguments = str(data.get("arguments") or "")
+            call_id = str(data.get("call_id") or "")
+            calls[call_id] = arguments
+            call_names[call_id] = str(data.get("name") or "")
+            if _codex_call_performs_edit(call_names[call_id], arguments):
+                has_edited = True
+                has_test_passed = False
+                has_test_failed = False
+                actions = []
+
+    if has_edited and has_test_passed and not has_test_failed:
+        reminder = (
+            "Engineering completion checkpoint: focused tests have passed. Do not "
+            "rerun the same tests unchanged. Compare the diff against the original "
+            "acceptance constraints, run any still-required broader validation, then "
+            "provide the final answer with an accurate validation summary."
+        )
+    elif _has_unchanged_exec_loop(actions):
+        reminder = (
+            "Engineering loop checkpoint: the last command was repeated unchanged "
+            "three times. Use its existing result. Re-check the requested constraints "
+            "and choose a materially different evidence-gathering, editing, or testing "
+            "action. Preserve any user-specified interpreter and toolchain."
+        )
+    elif not has_edited and len(actions) >= 8:
+        reminder = (
+            "Engineering exploration checkpoint: at least eight read-only tool "
+            "results are already available and no edit has been made. Before another "
+            "broad read, identify the one concrete unresolved question that blocks a "
+            "safe change and inspect only the evidence needed to answer it. If no "
+            "such question remains, move to the smallest grounded failing test or "
+            "implementation change. Do not edit while a material ambiguity remains."
+        )
+    else:
+        return messages
+    return [
+        *messages,
+        {
+            "role": "developer",
+            "content": reminder,
+            # Server-only guidance is not returned in Responses output and the
+            # client therefore cannot replay it next turn. The batched engine
+            # removes this metadata before templating and snapshots only the
+            # stable message prefix preceding it.
+            "_rapid_mlx_transient_priming": True,
+        },
+    ]
+
+
+def _codex_call_performs_edit(name: str, arguments: str) -> bool:
+    """Recognize common coding-agent writes without matching search literals."""
+    if name == "apply_patch":
+        return True
+    command = arguments
+    argument_field = "chars" if name == "write_stdin" else "cmd"
+    try:
+        decoded = json.loads(arguments)
+        if isinstance(decoded, dict) and isinstance(decoded.get(argument_field), str):
+            command = decoded[argument_field]
+    except (TypeError, ValueError):
+        # Some model-emitted argument objects escape apostrophes as ``\'``,
+        # which is harmless to the shell command but invalid JSON.
+        match = re.search(rf'"{argument_field}"\s*:\s*"((?:\\.|[^"\\])*)"', arguments)
+        if match:
+            command = match.group(1).replace(r"\'", "'").replace(r"\"", '"')
+
+    # Output sinks do not modify the project and should not suppress the
+    # exploration checkpoint.
+    command = re.sub(r"(?:>>|>)\s*/dev/null\b", "", command)
+    command = re.sub(r"\btee(?:\s+-\S+)*\s+/dev/null\b", "", command)
+
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;<>")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        tokens = []
+    for index, token in enumerate(tokens):
+        if token in {">", ">>"}:
+            target = tokens[index + 1] if index + 1 < len(tokens) else ""
+            if target and target != "/dev/null":
+                return True
+    mutating_commands = {
+        "apply_patch",
+        "cp",
+        "install",
+        "ln",
+        "mkdir",
+        "mv",
+        "rm",
+        "rmdir",
+        "touch",
+        "truncate",
+    }
+    command_words = [
+        token
+        for index, token in enumerate(tokens)
+        if index == 0 or tokens[index - 1] in {";", "&&", "||", "|"}
+    ]
+    if any(word.rsplit("/", 1)[-1] in mutating_commands for word in command_words):
+        return True
+    for index, token in enumerate(tokens):
+        if token.rsplit("/", 1)[-1] != "tee":
+            continue
+        destinations = [
+            value
+            for value in tokens[index + 1 :]
+            if value not in {";", "&&", "||", "|"} and not value.startswith("-")
+        ]
+        if any(value != "/dev/null" for value in destinations):
+            return True
+    if re.search(
+        r"(?:^|[\n;&|])\s*sed\s+(?:-[A-Za-z]*i[A-Za-z]*|--in-place)\b", command
+    ):
+        return True
+    if name != "write_stdin" and not re.search(
+        r"(?:^|[\s/])python(?:\d+(?:\.\d+)?)?\b", command
+    ):
+        return False
+    return bool(
+        re.search(r"\.(?:write_text|write_bytes)\s*\(", command)
+        or re.search(
+            r"\bopen\s*\([^,\n]+,\s*(['\"])[^'\"]*[wax+][^'\"]*\1",
+            command,
+        )
+    )
+
+
+def _codex_action_command_prefix(responses_request: ResponsesRequest) -> str | None:
+    """Return a DSML command-value prefix after Codex has explored enough."""
+    items = responses_request.input
+    if not isinstance(items, list):
+        return None
+    has_edited = False
+    has_unresolved_failure = False
+    has_successful_test = False
+    actions_after_edit: list[tuple[str, str]] = []
+    calls: dict[str, str] = {}
+    call_names: dict[str, str] = {}
+    for item in items:
+        data = item.model_dump() if hasattr(item, "model_dump") else item
+        if not isinstance(data, dict):
+            continue
+        if data.get("type") == "function_call_output":
+            if has_edited:
+                output = str(data.get("output") or "")
+                call_id = str(data.get("call_id") or "")
+                command = calls.get(call_id, "")
+                actions_after_edit.append((call_names.get(call_id, ""), command))
+                is_test = any(
+                    marker in command
+                    for marker in (
+                        "pytest",
+                        "unittest",
+                        "tox",
+                        "nox",
+                        "ruff",
+                        "mypy",
+                    )
+                )
+                if is_test:
+                    failed = any(
+                        marker in output
+                        for marker in (
+                            "FAILED ",
+                            " FAILURES ",
+                            "Traceback (most recent call last)",
+                            " ERROR ",
+                            "command not found",
+                            "No such file or directory",
+                        )
+                    )
+                    passed = bool(re.search(r"(?m)^\s*\d+\s+passed(?:\s|,|$)", output))
+                    if failed:
+                        has_unresolved_failure = True
+                        has_successful_test = False
+                    elif passed:
+                        has_unresolved_failure = False
+                        has_successful_test = True
+        if data.get("type") == "function_call":
+            arguments = str(data.get("arguments") or "")
+            call_id = str(data.get("call_id") or "")
+            calls[call_id] = arguments
+            call_names[call_id] = str(data.get("name") or "")
+            if "apply_patch" in arguments:
+                has_edited = True
+                has_unresolved_failure = False
+                has_successful_test = False
+                actions_after_edit = []
+    if has_successful_test or has_unresolved_failure:
+        return None
+    if has_edited:
+        # Let the model diagnose a grounded tool failure. Prefixing another
+        # command here can force the exact unavailable interpreter forever
+        # (for example ``python`` on a macOS host exposing only ``python3``).
+        if has_unresolved_failure:
+            return None
+        # Only force a return to editing when the transcript proves an exact
+        # unchanged loop. Distinct searches/reads are legitimate evidence in
+        # large cross-file tasks, and choosing an interpreter here can override
+        # an explicit venv supplied by the user.
+        if not _has_unchanged_exec_loop(actions_after_edit):
+            return None
+        command = "apply_patch"
+    else:
+        return None
+    return (
+        "<｜DSML｜tool_calls>\n"
+        '<｜DSML｜invoke name="exec_command">\n'
+        '<｜DSML｜parameter name="cmd" string="true">'
+        f"{command}"
+    )
+
+
+def _has_unchanged_exec_loop(actions: list[tuple[str, str]]) -> bool:
+    """Return whether the last three completed actions repeat one shell command."""
+    if len(actions) < 3:
+        return False
+    tail = actions[-3:]
+    name, arguments = tail[0]
+    return (
+        name == "exec_command"
+        and "apply_patch" not in arguments
+        and len(set(tail)) == 1
+    )
+
+
+def _resolve_context_safe_implicit_responses_max_tokens(
+    engine: BaseEngine,
+    prompt_tokens: int | None,
+    resolved_max_tokens: int,
+) -> int:
+    """Resolve an omitted Responses completion budget against context room.
+
+    ``/v1/responses`` clients such as Codex often omit
+    ``max_output_tokens``. Rapid-MLX then supplies the operator/model
+    default (commonly 32768). For long but still valid prompts this can
+    make the *default* budget push ``prompt + completion`` past the
+    model window and raise ``context_length_exceeded`` even though a
+    shorter completion would fit. Explicit client caps remain strict;
+    this helper is used only for the omitted/implicit default case.
+    """
+    if prompt_tokens is None:
+        return resolved_max_tokens
+
+    remaining_tokens = get_model_max_context(engine) - int(prompt_tokens)
+    if remaining_tokens < 1:
+        # Keep the caller's normal OpenAI-shaped context rejection path:
+        # returning the positive resolved budget makes
+        # ``prompt + completion`` exceed the window below.
+        return resolved_max_tokens
+
+    return min(resolved_max_tokens, remaining_tokens)
+
+
+def _resolved_sampling_kwargs(
+    openai_request: ChatCompletionRequest,
+) -> dict:
+    """Resolve sampling params through the 4-layer cascade.
+
+    Mirrors the helper in routes/anthropic.py so ``/v1/responses`` users
+    get the same alias / generation_config defaults as ``/v1/messages``
+    and ``/v1/chat/completions``.
+    """
+    out = {
+        "temperature": _resolve_temperature(openai_request.temperature),
+        "top_p": _resolve_top_p(openai_request.top_p),
+        "stop": getattr(openai_request, "stop", None),
+    }
+    out.update(build_extended_sampling_kwargs(openai_request))
+    return out
+
+
+def _resolved_responses_sampling_kwargs(
+    openai_request: ChatCompletionRequest,
+    responses_request: ResponsesRequest,
+    tool_parser: str | None,
+) -> dict:
+    """Apply Responses/Codex defaults without changing the base helper contract."""
+    out = _resolved_sampling_kwargs(openai_request)
+    if responses_request.temperature is None and _is_deepseek_codex_surface(
+        responses_request, tool_parser
+    ):
+        # The 0731 checkpoint ships temperature=1 in generation_config.
+        # That is useful for chat, but in long Codex tool loops it causes
+        # repeated/degenerate DSML and also opts out of the correctness-gated
+        # greedy DSpark path. Coding-agent requests that did not explicitly
+        # choose a temperature therefore use a low-entropy coding default.
+        # A literal greedy 0.0 currently exposes a reproducible DSpark failure
+        # where the second forced exec call has no ``cmd``; 0.2 stays on the
+        # correctness-gated plain sampler while sharply reducing temperature-1
+        # tool degeneration. Explicit client sampling always wins.
+        out["temperature"] = 0.2
+    return out
+
+
+def _attach_deepseek_no_think_suppression(
+    engine: BaseEngine,
+    cfg,
+    model_name: str | None,
+    explicit_no_thinking: bool,
+    chat_kwargs: dict,
+) -> None:
+    """Keep an explicitly non-thinking DeepSeek request out of ``<think>``."""
+    if not explicit_no_thinking:
+        return
+
+    model_cfg = cfg
+    registry = getattr(cfg, "model_registry", None)
+    if registry is not None:
+        try:
+            entry = registry.get_entry(model_name)
+        except KeyError:
+            return
+        if getattr(entry, "engine", None) is not engine:
+            return
+        from types import SimpleNamespace
+
+        model_cfg = SimpleNamespace(
+            reasoning_parser_name=getattr(entry, "reasoning_parser", None),
+            reasoning_parser=None,
+            model_path=getattr(entry, "model_path", None),
+            model_name=getattr(entry, "model_name", None),
+        )
+    if not _uses_deepseek_v4_reasoning(model_cfg):
+        return
+
+    from ..api.reasoning_budget import (
+        SuppressTokensLogitsProcessor,
+        resolve_think_token_ids,
+    )
+    from .chat import _engine_output_vocab_size
+
+    start_id, _end_id = resolve_think_token_ids(
+        getattr(engine, "tokenizer", None),
+        getattr(model_cfg, "reasoning_parser_name", None),
+    )
+    vocab_size = _engine_output_vocab_size(engine)
+    if start_id is None or vocab_size is None or not 0 <= start_id < vocab_size:
+        return
+    chat_kwargs["suppressed_tokens_logits_processor"] = SuppressTokensLogitsProcessor(
+        [start_id]
+    )
+
+
+def _attach_deepseek_codex_reasoning_budget(
+    engine: BaseEngine,
+    cfg,
+    openai_request: ChatCompletionRequest,
+    resolved_thinking: bool | None,
+    codex_surface: bool,
+    chat_kwargs: dict,
+) -> None:
+    """Enforce the Codex reasoning tier while generation is still in ``think``.
+
+    The generic chat builder conservatively skips requests with tools because an
+    ungated grammar may already be inside a tool envelope when a budget fires.
+    DeepSeek V4's Codex/DSML path has a token-delimited ``</think>`` boundary and
+    parses tools only after that boundary, so forcing the boundary is safe here.
+    Without this coupling, Responses only trims hidden reasoning after decode;
+    long agent turns can therefore spend thousands of invisible tokens without
+    ever reaching the next action even though ``reasoning_max_tokens`` is set.
+
+    Once a request qualifies, missing boundary metadata is a server invariant
+    violation rather than an opt-out: silently retaining the post-hoc trim would
+    re-open the unbounded-decode failure this path exists to prevent. Streaming
+    converts this error into ``response.failed``; non-streaming returns the
+    route's normal server-error envelope.
+    """
+    if (
+        not codex_surface
+        or not openai_request.tools
+        or not _uses_deepseek_v4_reasoning(cfg)
+    ):
+        return
+
+    if (
+        _effective_enable_thinking(resolved_thinking, cfg.model_path or cfg.model_name)
+        is not True
+        or getattr(openai_request, "reasoning_max_tokens", None) is None
+    ):
+        return
+
+    from ..api.reasoning_budget import ReasoningBudgetLogitsProcessor
+    from .chat import _engine_output_vocab_size
+
+    # This checkpoint's assistant turn is structurally in the reasoning lane:
+    # depending on the vendored tokenizer/template, the opening marker is either
+    # prefilled or is the first generated token. Treating it as seeded also avoids
+    # losing that first marker when mlx-lm establishes the processor's cumulative
+    # token baseline on its first callback.
+    cache_attr = "_rapid_mlx_deepseek_codex_reasoning_boundary_v2"
+    boundary = getattr(engine, cache_attr, None)
+    if not (
+        isinstance(boundary, tuple)
+        and len(boundary) == 3
+        and all(isinstance(value, int) for value in boundary)
+    ):
+        tokenizer = getattr(engine, "tokenizer", None)
+        try:
+            vocab = tokenizer.get_vocab()
+            start_id = vocab.get("<think>")
+            end_id = vocab.get("</think>")
+        except Exception as exc:
+            raise RuntimeError(
+                "DeepSeek Codex reasoning budget unavailable: tokenizer cannot "
+                "resolve the <think>/</think> boundaries"
+            ) from exc
+        vocab_size = _engine_output_vocab_size(engine)
+        if (
+            not isinstance(start_id, int)
+            or not isinstance(end_id, int)
+            or vocab_size is None
+            or not 0 <= start_id < vocab_size
+            or not 0 <= end_id < vocab_size
+        ):
+            raise RuntimeError(
+                "DeepSeek Codex reasoning budget unavailable: <think> or "
+                "</think> is missing or outside the model output vocabulary"
+            )
+        boundary = (start_id, end_id, vocab_size)
+        try:
+            setattr(engine, cache_attr, boundary)
+        except (AttributeError, TypeError):
+            # Slot-only engine facades still get the enforced processor; they
+            # merely pay the one-token lookup again on their next request.
+            pass
+    start_id, end_id, _vocab_size = boundary
+    chat_kwargs["reasoning_budget_logits_processor"] = ReasoningBudgetLogitsProcessor(
+        end_id,
+        getattr(openai_request, "reasoning_max_tokens", None),
+        think_start_id=start_id,
+        seeded_thinking=True,
+    )
+
+
+def _should_start_in_thinking(
+    chat_template: str,
+    enable_thinking: bool | None,
+    *,
+    unconditional: bool = False,
+    tools_requested: bool = False,
+) -> bool:
+    """Thin wrapper over the shared
+    ``service.helpers._should_start_in_thinking`` predicate.
+
+    Codex round-9 BLOCKING (PR #799): the same heuristic used to live
+    here AND in ``routes/anthropic.py`` AND was reimplemented inline
+    in ``routes/chat.py``. Single source of truth now lives in
+    ``service/helpers.py``; this thin wrapper is retained so in-module
+    callers stay unchanged.
+    """
+    from ..service.helpers import _should_start_in_thinking as _shared
+
+    return _shared(
+        chat_template,
+        enable_thinking,
+        unconditional=unconditional,
+        tools_requested=tools_requested,
+    )
+
+
+def _enforce_responses_tool_choice(
+    tool_calls: list | None,
+    responses_request: ResponsesRequest,
+    openai_request: ChatCompletionRequest,
+) -> list | None:
+    """Mirror of the chat-route post-parse forced-choice synthesis.
+
+    The chat route synthesises a stub tool_call when the model produces
+    text under ``tool_choice="required"`` (single-tool case) or under
+    the named-function form (target unambiguous). The /v1/responses
+    lane skipped this step, so Yuki F6 saw zero ``function_call`` items
+    even though the contract guarantees one.
+
+    Synthesis rules (parity with chat.py ~L1880):
+      * ``"required"`` + exactly one tool → synthesise a call to it
+      * ``"required"`` + multiple tools + no model call → 422 with the
+        same diagnostic chat.py uses (codex r1 BLOCKING #1 on PR #817).
+        Silently degrading to ``auto`` would let a multi-tool ``required``
+        request return zero tool_calls and break the contract this PR
+        claims to restore.
+      * ``{"type":"function","name":X}`` + X in submitted tools →
+        synthesise a call to X
+      * ``auto`` / ``none`` / unrecognised shapes → pass through.
+    """
+    from ..routes.chat import (
+        _forced_synth_schema_error,
+        _synthesize_forced_tool_call,
+    )
+
+    tc = responses_request.tool_choice
+    if tc is None or not openai_request.tools:
+        return tool_calls
+    # Codex r3 BLOCKING #1 (PR #817): for the named-function form,
+    # validate that EVERY model-produced tool_call targets the pinned
+    # name. A model that called a different tool (``ping`` when
+    # ``pong`` was pinned) violates the contract just as much as a
+    # text-only response — raise 422 with the same diagnostic
+    # chat.py uses (~L1969-L1978).
+    if tool_calls and isinstance(tc, dict) and tc.get("type") == "function":
+        _named_target = tc.get("name") or (tc.get("function") or {}).get("name")
+        if _named_target:
+            mismatched = [
+                tc_obj
+                for tc_obj in tool_calls
+                if (tc_obj.function.name or "") != _named_target
+            ]
+            if mismatched:
+                _names = [m.function.name for m in mismatched]
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": {
+                            "message": (
+                                f"tool_choice pinned function "
+                                f"{_named_target!r} but the model emitted "
+                                f"calls to {_names}. Local inference "
+                                "cannot decoder-enforce a specific "
+                                "function; retry with a more direct "
+                                "user message."
+                            ),
+                            "type": "invalid_request_error",
+                            "code": "tool_choice_named_mismatch",
+                            "param": "tool_choice.name",
+                        }
+                    },
+                )
+    # Only coerce when the model surfaced NO calls — a real model
+    # response that called the right tool already satisfies the
+    # contract.
+    if tool_calls:
+        return tool_calls
+    if tc == "required":
+        if len(openai_request.tools) == 1:
+            name = openai_request.tools[0].function.get("name")
+            if name:
+                logger.info(
+                    "tool_choice='required' on /v1/responses produced no "
+                    "tool_calls; synthesising a call to the sole "
+                    "available tool %r to honour the OpenAI tool_call-"
+                    "guaranteed contract (Yuki F6).",
+                    name,
+                )
+                _synth = _synthesize_forced_tool_call(name)
+                # #1256: fail explicitly rather than return a schema-invalid
+                # synthesised call. On the streaming surface this 422 is caught
+                # and re-emitted as a ``response.failed`` event (see caller).
+                _synth_err = _forced_synth_schema_error(
+                    name, _synth.function.arguments, openai_request.tools
+                )
+                if _synth_err:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "error": {
+                                "message": _synth_err,
+                                "type": "invalid_request_error",
+                                "code": "tool_choice_required_unsynthesizable",
+                                "param": "tool_choice",
+                            }
+                        },
+                    )
+                return [_synth]
+        # Multi-tool ``required`` with no model call — local inference
+        # cannot guess which of N tools the user intended. Chat.py
+        # raises 422 in the same situation (~L1891-1902); mirror that
+        # so the Responses surface does not silently violate the
+        # tool_call-guaranteed contract.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": {
+                    "message": (
+                        'tool_choice="required" but the model returned a '
+                        "text response with no tool_calls. Local "
+                        "inference has no decoder-level constraint; the "
+                        "system-prompt enforcement was insufficient for "
+                        "this prompt. Retry with a more concrete user "
+                        "message or use tool_choice="
+                        '{"type":"function","name":...} to pin a '
+                        "specific tool."
+                    ),
+                    "type": "invalid_request_error",
+                    "code": "tool_choice_required_unfulfilled",
+                    "param": "tool_choice",
+                }
+            },
+        )
+    if isinstance(tc, dict) and tc.get("type") == "function":
+        target = tc.get("name") or (tc.get("function") or {}).get("name")
+        if not target:
+            return tool_calls
+        submitted = {
+            t.function.get("name") for t in openai_request.tools if t.type == "function"
+        }
+        if target in submitted:
+            logger.info(
+                "tool_choice pinned function %r on /v1/responses produced "
+                "no tool_calls; synthesising a call with empty arguments "
+                "to honour the OpenAI tool_call-guaranteed contract "
+                "(Yuki F6).",
+                target,
+            )
+            _synth = _synthesize_forced_tool_call(target)
+            # #1256: a pinned tool whose schema requires fields can't be
+            # satisfied by an empty synthesised call — fail explicitly.
+            _synth_err = _forced_synth_schema_error(
+                target, _synth.function.arguments, openai_request.tools
+            )
+            if _synth_err:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": {
+                            "message": _synth_err,
+                            "type": "invalid_request_error",
+                            "code": "tool_choice_named_unsynthesizable",
+                            "param": "tool_choice",
+                        }
+                    },
+                )
+            return [_synth]
+    return tool_calls
+
+
+@router.post(
+    "/v1/responses",
+    dependencies=[
+        Depends(verify_api_key),
+        Depends(check_rate_limit),
+    ],
+)
+async def create_response(request: Request):
+    """OpenAI Responses API entry point.
+
+    Codex CLI hardcodes ``stream: true`` and sends the full
+    conversation history in ``input[]`` each turn, so the streaming
+    path is the hot path.
+    """
+    from rapid_mlx.telemetry import inference as _telemetry_inference
+
+    _caller_agent, _caller_client = _telemetry_inference.request_caller_headers(request)
+    body = await request.json()
+    # ``ResponsesRequest`` is constructed manually (not as a FastAPI body
+    # parameter). The raw :class:`pydantic.ValidationError` it can raise
+    # is now caught by the global ``_pydantic_validation_handler`` in
+    # ``middleware.exception_handlers`` (H-17), which routes it through
+    # the same sanitized 400 envelope used by ``/v1/chat/completions``.
+    # The earlier per-route ``HTTPException(detail=str(e))`` leaked the
+    # model class name (``ResponsesRequest``), the pinned pydantic
+    # version (``errors.pydantic.dev/2.13/...``), and any attacker-
+    # supplied ``input_value`` blob — see Rhea r0.8.1 audit.
+    responses_request = ResponsesRequest(**body)
+
+    # Statelessness gate — see module docstring. Codex CLI does not set
+    # this field; clients that DO use it would get silent prompt loss
+    # on retries because we have no response store, so 400 loudly.
+    if responses_request.previous_response_id:
+        from rapid_mlx.telemetry.inference import emit_capability_rejected
+
+        emit_capability_rejected(
+            "stateless_api_only",
+            caller_agent=_caller_agent,
+            caller_client=_caller_client,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "previous_response_id is not supported by this server — "
+                "rapid-mlx is a stateless Responses API shim. Re-send the "
+                "full conversation history in the `input` field each turn."
+            ),
+        )
+
+    # Yuki F13 (0.8.5 dogfood): pre-engine tool-type allowlist. Anything
+    # outside ``SUPPORTED_RESPONSES_TOOL_TYPES`` 400s with a clear
+    # envelope BEFORE we admit a scheduler slot — pre-0.8.5 the route
+    # silently accepted ``web_search`` / ``computer_20251022`` /
+    # ``file_search`` and the client thought the tool was being invoked.
+    #
+    # r7-A R7-M6: canonicalise tool-type aliases FIRST (e.g. OpenAI
+    # SDK's ``computer_use_preview`` → ``computer_20251022``) so the
+    # rest of the request pipeline only ever sees canonical names.
+    # The validator below is alias-aware (a request that survived the
+    # canonicalisation pass has its ``type`` already on the canonical
+    # name) but normalising up-front means downstream Computer-Use
+    # detectors, the adapter's input-item builder, and any future tool
+    # type-keyed dispatch can read ``tools[i].type`` directly.
+    # issue #2114: flattening a Codex ``namespace`` group erases which MCP
+    # server each function came from. Capture the ``{function_name:
+    # namespace}`` mapping here (built from the ORIGINAL tools, before the
+    # in-place flatten discards the namespace identity) and thread it to
+    # the streaming / non-streaming output builders so each emitted
+    # ``function_call`` re-attaches its originating namespace for routing.
+    namespace_by_tool = normalize_responses_tool_types(responses_request.tools)
+    cfg_for_priming = get_config()
+    priming_tool_parser = cfg_for_priming.tool_call_parser
+    if priming_tool_parser is None:
+        configured_model = " ".join(
+            str(value or "")
+            for value in (
+                cfg_for_priming.model_name,
+                cfg_for_priming.model_alias,
+                cfg_for_priming.model_path,
+            )
+        ).lower()
+        if "deepseek-v4-flash-0731" in configured_model:
+            # Auto parser selection is materialized later in the request
+            # pipeline and historically did not write the inferred name back
+            # to ServerConfig.  First-turn priming runs before that point, so
+            # recognize this checkpoint directly when the CLI did not receive
+            # an explicit --tool-call-parser value.
+            priming_tool_parser = "deepseek_v4_0731"
+    if _should_prime_deepseek_codex_exec(responses_request, priming_tool_parser):
+        responses_request.tool_choice = {
+            "type": "function",
+            "name": "exec_command",
+        }
+        logger.info(
+            "DeepSeek Codex first-action priming: pinning exec_command for "
+            "the initial repository locating turn"
+        )
+    # Keep this gate ahead of tool-choice and model validation so requests
+    # with multiple invalid fields retain their established error ordering.
+    # Before model validation, only a single configured engine is authoritative.
+    # A registry selection depends on the request's model field, so omit the
+    # identity there until the validated engine has been resolved below.
+    from rapid_mlx.telemetry.model_id import engine_telemetry_id
+
+    _preflight_engine = (
+        getattr(cfg_for_priming, "engine", None)
+        if not getattr(cfg_for_priming, "model_registry", None)
+        else None
+    )
+    _preflight_telemetry_id = (
+        engine_telemetry_id(_preflight_engine)
+        if _preflight_engine is not None
+        else None
+    )
+    validate_responses_tool_types(
+        responses_request.tools,
+        telemetry_model=_preflight_telemetry_id,
+        caller_agent=_caller_agent,
+        caller_client=_caller_client,
+    )
+    # Yuki F6 (0.8.5 dogfood): mirror the chat-completions tool_choice
+    # gate so ``required`` / named-function tool_choice REJECTS shapes
+    # that cannot be honoured (e.g. ``required`` with empty tools, named
+    # function not in tools). The post-parse synthesis path below
+    # COERCES a tool_call when the model didn't emit one — without it,
+    # the named-function form silently degraded to ``auto``.
+    validate_responses_tool_choice(
+        responses_request.tool_choice, responses_request.tools
+    )
+
+    # Reuse the Claude-Code / Codex bypass from #557: ``claude-*``,
+    # ``gpt-*`` model names pass through to the loaded engine instead of
+    # 404'ing on _validate_model_name. Codex sends ``gpt-5``,
+    # ``gpt-5-codex``, etc. — none of which match a local alias.
+    if not (responses_request.model or "").startswith(("claude-", "gpt-")):
+        _validate_model_name(responses_request.model)
+    engine = get_engine(responses_request.model)
+    _served_telemetry_id = engine_telemetry_id(engine)
+    await ensure_engine_ready(engine)
+
+    # Pre-flight admission — same C4 reservation shape the other two
+    # routes use. ``_admission_committed`` flips to True when the
+    # streaming path takes over so ``_disconnect_guard`` owns release.
+    _admission_committed = False
+    _admission_acquired = False
+    try:
+        _check_admission_or_503(engine)
+        _admission_acquired = True
+        _log_request(responses_request)
+
+        cfg_for_log = get_config()
+        if (
+            responses_request.model
+            and cfg_for_log.model_name
+            and responses_request.model != cfg_for_log.model_name
+        ):
+            logger.info(
+                "Responses /v1/responses: request model=%r served by loaded engine=%r",
+                responses_request.model,
+                cfg_for_log.model_name,
+            )
+
+        # F-034 (and any future ``ChatCompletionRequest``-layer validator):
+        # the adapter materializes a fresh ``ChatCompletionRequest`` from
+        # the Responses body, which now rejects unsatisfiable combinations
+        # (e.g. ``tool_choice="required"`` with no ``tools``). The
+        # resulting :class:`pydantic.ValidationError` bubbles to the
+        # global ``_pydantic_validation_handler`` (H-17) which routes
+        # it through the sanitized 400 envelope — no more ``str(e)``
+        # echo that leaked the model class name and pydantic version.
+        try:
+            cfg_for_adapter = get_config()
+            openai_request = responses_to_openai(
+                responses_request,
+                preserve_developer_role=(
+                    cfg_for_adapter.tool_call_parser == "deepseek_v4_0731"
+                ),
+                telemetry_model=_served_telemetry_id,
+                caller_agent=_caller_agent,
+                caller_client=_caller_client,
+            )
+            # #3714: ``serve --default-reasoning-effort`` fills the knob
+            # before anything else reads the request, so it behaves exactly
+            # like a client value on this surface too (the strict-schema and
+            # tool gates below see it as reasoning intent, as they would a
+            # client's). The Responses-native ``reasoning.effort`` counts via
+            # ``extra_signals`` — the adapter collapses it onto
+            # ``openai_request`` but the original is the authoritative shape.
+            if maybe_apply_default_reasoning_effort(
+                openai_request,
+                default_effort=cfg_for_adapter.default_reasoning_effort,
+                extra_signals=responses_request,
+            ):
+                logger.info(
+                    "#3714 reasoning_effort defaulted to %s on /v1/responses "
+                    "(serve --default-reasoning-effort; client sent no "
+                    "reasoning knob)",
+                    openai_request.reasoning_effort,
+                )
+            # Capture the client's preference before server defaults and the
+            # automatic tool/schema heuristics may mutate the adapted request.
+            _explicit_thinking = _extract_thinking_from_request(openai_request)
+            explicit_no_thinking = _explicit_thinking is False or (
+                _explicit_thinking is None
+                and getattr(openai_request, "reasoning_effort", None) == "none"
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        # H-06: ``text.format`` with strict json_schema on /v1/responses
+        # was suggestion-only — the route went straight to
+        # ``engine.chat()`` and dropped the constraint. When the engine
+        # cannot honor the contract (``[guided]`` extra missing), 400
+        # loudly instead of silently emitting unconstrained tokens.
+        # Counter tick mirrors the chat-route gate so the operator
+        # dashboards see uniform traffic shape across both surfaces.
+        _rf = getattr(openai_request, "response_format", None)
+        # ROUTE-BOUNDARY schema validation (0.10.16 dogfood P1-③), the SAME
+        # single structural-validation gate the chat route uses. /v1/responses
+        # only guides STRICT json_schema, so a NON-strict json_schema with an
+        # invalid schema would otherwise skip validation entirely and silently
+        # degrade to a 200 with unconstrained output. Strict requests are
+        # handled by the more specific ``invalid_strict_schema`` gate below.
+        _boundary_err = nonstrict_json_schema_boundary_error(
+            _rf, RESPONSES_TEXT_FORMAT_PARAM
+        )
+        if _boundary_err is not None:
+            raise HTTPException(status_code=400, detail=_boundary_err)
+        if is_strict_json_schema(_rf):
+            _schema = extract_json_schema_for_guided(_rf)
+            incr_strict_request()
+            # Codex r3 BLOCKING #3 parity: a malformed strict request
+            # without an extractable schema must fail closed (400)
+            # not fall through to unconstrained ``engine.chat`` —
+            # mirrors the chat-route gate.
+            if not _schema:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": {
+                            "message": (
+                                "text.format strict=true requires a "
+                                "non-empty schema. The request set "
+                                "strict=true but the schema field is "
+                                "missing or empty — the strict contract "
+                                "cannot be enforced without one."
+                            ),
+                            "type": "invalid_request_error",
+                            "code": "strict_schema_required",
+                            "param": "text.format.schema",
+                        }
+                    },
+                )
+            # Codex r4 NIT #5 parity: validate the user-supplied
+            # schema BEFORE generation so an invalid JSON Schema
+            # (e.g. ``"type":"objct"`` typo) surfaces as a 400
+            # ``invalid_strict_schema`` pointing at the client's
+            # malformed input — instead of falling into the
+            # post-decode validator and surfacing as a 502
+            # ``strict_schema_violation`` (server-side breach shape).
+            _schema_ok, _schema_err = check_schema_validity(_schema)
+            if not _schema_ok:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": {
+                            "message": (
+                                "text.format.schema is not a valid "
+                                f"JSON Schema document: {_schema_err}. "
+                                "Fix the schema and retry."
+                            ),
+                            "type": "invalid_request_error",
+                            "code": "invalid_strict_schema",
+                            "param": "text.format.schema",
+                        }
+                    },
+                )
+            if not engine.supports_guided_generation:
+                # R12-4: pre-R12-4 this branch raised 400
+                # ``guided_extra_required``. The new path falls
+                # through to post-generate validation + repair retry
+                # below (mirrored from chat.py). Strict streams also
+                # take this buffered path before their validated result
+                # is replayed through the normal SSE event ladder. The
+                # disable flag ``RAPID_MLX_STRICT_JSON_SCHEMA=off``
+                # restores the legacy silent-pass-through behavior.
+                if not strict_enforcement_enabled():
+                    logger.warning(
+                        "Strict json_schema on /v1/responses requested "
+                        "without [guided] AND "
+                        "RAPID_MLX_STRICT_JSON_SCHEMA=off — falling "
+                        "through to prompt-injection only."
+                    )
+                else:
+                    logger.info(
+                        "Strict json_schema on /v1/responses without "
+                        "[guided] — engaging R12-4 post-generate "
+                        "validation + repair retry."
+                    )
+
+            # R12-M2 (Mira r12 / finding R-2) — auto-disable thinking
+            # on the strict json_schema path WHEN the client did not
+            # express a preference. The chat surface lets users opt
+            # out via ``chat_template_kwargs={"enable_thinking":false}``;
+            # R12-M2 wires that knob through to /v1/responses too
+            # (finding R-1). But operator preference is "convenience
+            # for agents" — most strict-json callers care about the
+            # final JSON, not the chain-of-thought, and on thinking
+            # models (Qwen3 / DeepSeek-R1) the default-on
+            # ``<think>`` channel routinely exhausts the token budget
+            # before the schema-conformant body is emitted, turning
+            # every strict request into a 422 ``invalid_json`` on the
+            # happy path. So under strict json_schema we flip the
+            # default from "template default (= thinking on)" to
+            # "thinking off" — same shape OpenAI's structured-output
+            # mode uses (reasoning is off unless the caller asks for
+            # it).
+            #
+            # Gated on _both_ knobs being unset: when the client
+            # EXPLICITLY set ``chat_template_kwargs.enable_thinking``
+            # (either True or False) or the top-level
+            # ``enable_thinking`` field, we honor their choice and do
+            # NOT override (a strict caller who deliberately wants
+            # thinking-on can ask for it and accept the budget risk —
+            # they just have to raise ``max_output_tokens``). We
+            # express the override by injecting
+            # ``chat_template_kwargs.enable_thinking=False`` onto the
+            # materialized ``ChatCompletionRequest`` so every
+            # downstream consult (the token-budget gate immediately
+            # below, ``engine.chat`` / ``generate_with_schema``,
+            # ``_finalize_content_and_reasoning``) sees the same
+            # resolved choice.
+            # #448 codex #1009 r3 MAJOR: also step aside when the client
+            # signalled explicit reasoning intent (reasoning_effort /
+            # reasoning_max_tokens / native reasoning.effort — all collapsed
+            # onto ``openai_request`` by the adapter). Symmetric with the
+            # tool + casual gates: a client asking for reasoning has opted
+            # into the budget risk, and the ``reasoning_max_tokens`` cap
+            # keeps it bounded. Without this, a strict-json request with
+            # ``reasoning_effort="high"`` got thinking force-disabled before
+            # ``maybe_apply_reasoning_effort`` set its (now-moot) cap.
+            if _extract_thinking_from_request(
+                openai_request
+            ) is None and not _client_signalled_reasoning_intent(openai_request):
+                existing_ctk = openai_request.chat_template_kwargs or {}
+                # Merge rather than replace so any non-thinking keys
+                # the client passed survive (forward-compat).
+                merged_ctk = dict(existing_ctk)
+                merged_ctk["enable_thinking"] = False
+                openai_request.chat_template_kwargs = merged_ctk
+                # Codex r1 MEDIUM #2 (R12-T2F-276): tag the request so
+                # the L-05 ``enable_thinking_warning_header`` does NOT
+                # fire spuriously on non-qwen3 parsers — the server
+                # injected the flag, not the client. Mirrors the
+                # ``_mark_thinking_auto_disabled`` call inside the
+                # R12-T1F / R12-T2F helpers so all three auto-disable
+                # paths share one warning-suppression contract.
+                from ..service.helpers import _mark_thinking_auto_disabled
+
+                _mark_thinking_auto_disabled(openai_request)
+                logger.info(
+                    "R12-M2 auto-disable: strict json_schema on "
+                    "/v1/responses with no client-set thinking "
+                    "preference — injecting "
+                    "chat_template_kwargs.enable_thinking=False so "
+                    "thinking models do not burn the token budget "
+                    "inside <think>. Set chat_template_kwargs."
+                    "enable_thinking=true to opt back in."
+                )
+
+        # #448 — translate the OpenAI ``reasoning_effort`` knob into
+        # rapid-mlx's native controls. MUST run BEFORE the tool auto-
+        # disable below so a ``reasoning_effort="none"`` request registers
+        # its enable_thinking preference first (the tool auto-disable then
+        # no-ops on it) and a graded value lands its reasoning_max_tokens
+        # cap from one source. Explicit client knobs always win.
+        if maybe_apply_reasoning_effort(
+            openai_request, chat_template=served_chat_template(engine)
+        ):
+            logger.info(
+                "#448/#3043 reasoning_effort=%s translated on /v1/responses "
+                "(template reasoning_effort=%s, reasoning_max_tokens=%s). "
+                "Explicit client enable_thinking / chat_template_kwargs."
+                "reasoning_effort / reasoning_max_tokens always wins.",
+                openai_request.reasoning_effort,
+                (openai_request.chat_template_kwargs or {}).get("reasoning_effort"),
+                openai_request.reasoning_max_tokens,
+            )
+
+        # R12-T1F (0.8.16 operator dogfood) — auto-disable thinking
+        # when ``tools`` is non-empty and the client did NOT pin a
+        # thinking preference. Same shape as R12-M2 above but the
+        # trigger is "tools provided" instead of "strict json_schema",
+        # so this branch lives OUTSIDE the ``if is_strict_json_schema``
+        # block. On strict + tools requests the two auto-disable triggers
+        # intentionally compose through the same idempotent merge helper.
+        # Default-on thinking
+        # routinely exhausts the agent-SDK ``max_output_tokens=50..100``
+        # budget inside ``<think>...</think>`` before emitting the
+        # ``<tool_call>`` envelope, so the tool never fires
+        # (``finish_reason="length"``, ``tool_calls=None``). Explicit
+        # ``enable_thinking=true`` from the client is preserved.
+        if maybe_auto_disable_thinking_for_tools(openai_request):
+            logger.info(
+                "R12-T1F auto-disable: /v1/responses request has "
+                "tools=%d with no client-set thinking preference — "
+                "injecting chat_template_kwargs.enable_thinking=False "
+                "so thinking models do not burn the token budget "
+                "inside <think> before emitting the tool_call. Set "
+                "chat_template_kwargs.enable_thinking=true to opt "
+                "back in.",
+                len(openai_request.tools),
+            )
+
+        # R12-T2F-276 (0.8.16 brand-new-user simulation) — third
+        # member of the auto-disable family. The Responses-native
+        # ``reasoning`` dict (``{"effort": "low|medium|high", ...}``)
+        # is declared on ``ResponsesRequest`` but
+        # ``responses_to_openai`` deliberately does NOT forward it
+        # onto the materialized ``ChatCompletionRequest`` (the
+        # engine consults the already-translated ``reasoning_max_tokens``
+        # / ``reasoning_effort`` fields). Pass the original
+        # ``responses_request`` as the secondary ``extra_signals``
+        # source so the shared casual-chat helper sees the
+        # Responses-native ``reasoning`` dict the same way the chat
+        # surface sees ``reasoning_effort`` — single source of truth
+        # for "explicit reasoning intent" without forking the helper
+        # AND without mutating a Pydantic-locked schema (extra="forbid"
+        # on the ChatCompletionRequest model would reject a stray
+        # setattr).
+        if maybe_auto_disable_thinking_for_casual_chat(
+            openai_request, extra_signals=responses_request
+        ):
+            logger.info(
+                "R12-T2F auto-disable: /v1/responses casual chat "
+                "request to a thinking-capable model (parser=%s) with "
+                "no client-set thinking preference and no explicit "
+                "reasoning intent — injecting chat_template_kwargs."
+                "enable_thinking=False so thinking models do not burn "
+                "the token budget inside <think> before emitting the "
+                "answer. Set chat_template_kwargs.enable_thinking=true "
+                "(or reasoning / reasoning_max_tokens / reasoning_effort) "
+                "to opt back in.",
+                get_config().reasoning_parser_name,
+            )
+
+        try:
+            validate_content_blocks_for_capabilities(
+                openai_request.messages,
+                model_name=get_config().model_name or responses_request.model,
+                allow_image=getattr(engine, "is_mllm", False),
+                allow_video=getattr(engine, "is_mllm", False),
+                allow_audio=False,
+                telemetry_model=_served_telemetry_id,
+                caller_agent=_caller_agent,
+                caller_client=_caller_client,
+            )
+        except UnsupportedContentBlockError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=e.openai_detail(
+                    serving_lane_reason=getattr(engine, "serving_lane_reason", None),
+                    engine=engine,
+                ),
+            ) from e
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        # Context-length pre-check — same DoS gate the chat/completions/
+        # anthropic routes enforce. Runs BEFORE the stream branch so
+        # streaming clients can't bypass by setting ``stream: true``.
+        try:
+            _ctx_messages = _prepare_messages_for_context_check(engine, openai_request)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        # rapid-mlx#280 (codex MED on PR #893 review): thread the
+        # resolved ``enable_thinking`` so the prompt-token estimate
+        # matches what the engine actually generates. The R12-T1F /
+        # R12-T2F auto-disable above mutates
+        # ``openai_request.chat_template_kwargs`` BEFORE this gate
+        # runs, so the gate must consult the resolved value via
+        # ``_resolve_enable_thinking`` — otherwise it renders with
+        # the template default and over-estimates the prompt by the
+        # thinking scaffolding. Single source of truth across the two
+        # surfaces; the chat lane has the equivalent threading at
+        # routes/chat.py:2066.
+        _resp_resolved_thinking = _resolve_enable_thinking(openai_request)
+        _resp_resolved_max_tokens = _resolve_max_tokens(
+            openai_request.max_tokens,
+            _resp_resolved_thinking,
+        )
+        _resp_implicit_max_tokens = (
+            openai_request.max_tokens is None
+            and not get_config().default_max_tokens_is_explicit
+        )
+        # Count the prompt with the same template variables the engine will
+        # render with (parity with the chat route's guard; #3043 may have just
+        # merged a native ``reasoning_effort`` level into the dict).
+        _resp_ctk = getattr(openai_request, "chat_template_kwargs", None) or None
+        _resp_ctx_prompt_tokens = enforce_context_length_for_messages(
+            engine,
+            _ctx_messages,
+            tools=openai_request.tools,
+            max_tokens=None if _resp_implicit_max_tokens else _resp_resolved_max_tokens,
+            enable_thinking=_resp_resolved_thinking,
+            chat_template_kwargs=_resp_ctk,
+            telemetry_model=_served_telemetry_id,
+            caller_agent=_caller_agent,
+            caller_client=_caller_client,
+        )
+        if _resp_ctx_prompt_tokens is not None:
+            if _resp_implicit_max_tokens:
+                _resp_resolved_max_tokens = (
+                    _resolve_context_safe_implicit_responses_max_tokens(
+                        engine,
+                        _resp_ctx_prompt_tokens,
+                        _resp_resolved_max_tokens,
+                    )
+                )
+            _resp_clamped_max_tokens = enforce_context_length(
+                engine,
+                _resp_ctx_prompt_tokens,
+                max_tokens=_resp_resolved_max_tokens,
+                telemetry_model=_served_telemetry_id,
+                caller_agent=_caller_agent,
+                caller_client=_caller_client,
+            )
+            if _resp_clamped_max_tokens is not None:
+                _resp_resolved_max_tokens = _resp_clamped_max_tokens
+            openai_request.max_tokens = _resp_resolved_max_tokens
+        if _resp_implicit_max_tokens and _resp_ctx_prompt_tokens is None:
+            # If prompt accounting is unavailable, do not apply the
+            # context-room clamp: re-run the old strict admission check
+            # with the resolved default completion budget so this path
+            # cannot silently weaken the pre-existing DoS gate.
+            enforce_context_length_for_messages(
+                engine,
+                _ctx_messages,
+                tools=openai_request.tools,
+                max_tokens=_resp_resolved_max_tokens,
+                enable_thinking=_resp_resolved_thinking,
+                chat_template_kwargs=_resp_ctk,
+                telemetry_model=_served_telemetry_id,
+                caller_agent=_caller_agent,
+                caller_client=_caller_client,
+            )
+
+        _buffer_strict_stream = bool(
+            responses_request.stream
+            and is_strict_json_schema(getattr(openai_request, "response_format", None))
+        )
+        if responses_request.stream and not _buffer_strict_stream:
+            _admission_committed = True
+            # C-01 force-abort: holder list the engine populates with
+            # the admitted scheduler request id; the disconnect_guard
+            # reads it and force-calls scheduler.abort_request on
+            # client disconnect.
+            _resp_rid_holder: list[str | None] = [None]
+            _resp_heartbeat_state: dict[str, object] = {}
+            return StreamingResponse(
+                _disconnect_guard(
+                    _stream_responses_with_nonprogress_retry(
+                        engine,
+                        openai_request,
+                        responses_request,
+                        explicit_no_thinking=explicit_no_thinking,
+                        request_id_holder=_resp_rid_holder,
+                        heartbeat_state=_resp_heartbeat_state,
+                        namespace_by_tool=namespace_by_tool,
+                        caller_agent=request.headers.get("user-agent"),
+                        caller_client=request.headers.get("x-rapid-client"),
+                        served_telemetry_id=_served_telemetry_id,
+                    ),
+                    request,
+                    engine=engine,
+                    request_id_holder=_resp_rid_holder,
+                    keepalive_factory=lambda: _responses_keepalive_sse(
+                        _resp_heartbeat_state
+                    ),
+                ),
+                media_type="text/event-stream",
+                # ``SSE_RESPONSE_HEADERS`` (Cache-Control no-cache/no-transform +
+                # X-Accel-Buffering: no) wraps the legacy ``Connection: keep-alive``
+                # already on this route. F-073 anti-buffering parity with the
+                # chat / completions / anthropic streaming responses.
+                headers={**SSE_RESPONSE_HEADERS, "Connection": "keep-alive"},
+            )
+
+        _buffered_response = await _non_stream(
+            engine,
+            openai_request,
+            responses_request,
+            request,
+            explicit_no_thinking=explicit_no_thinking,
+            namespace_by_tool=namespace_by_tool,
+        )
+        if _buffer_strict_stream and _buffered_response.status_code == 200:
+            return StreamingResponse(
+                _stream_buffered_responses_response(_buffered_response.body),
+                media_type="text/event-stream",
+                headers={**SSE_RESPONSE_HEADERS, "Connection": "keep-alive"},
+            )
+        return _buffered_response
+    except asyncio.CancelledError as exc:
+        _raise_lifecycle_cancel_or_reraise(engine, exc)
+    finally:
+        _release_route_ownership(
+            engine,
+            admission_acquired=_admission_acquired,
+            committed=_admission_committed,
+            release_admission=_release_admission_unless_committed,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Non-streaming path
+# ---------------------------------------------------------------------------
+
+
+def _prepare_messages_for_engine(
+    engine: BaseEngine, openai_request: ChatCompletionRequest
+) -> list[dict]:
+    if getattr(engine, "is_mllm", False):
+        messages = []
+        for msg in openai_request.messages:
+            messages.append(_message_to_engine_dict(msg))
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("type") in {
+                        "input_text",
+                        "output_text",
+                        "input_image",
+                        "input_audio",
+                    }:
+                        raise ValueError(
+                            "Responses content blocks must be normalized before "
+                            "engine preparation"
+                        )
+        if getattr(engine, "preserve_native_tool_format", False):
+            decode_inline_tool_call_arguments(messages)
+        return messages
+
+    messages, _images, _videos = extract_multimodal_content(
+        openai_request.messages,
+        preserve_native_format=getattr(engine, "preserve_native_tool_format", False),
+    )
+    return messages
+
+
+def _prepare_messages_for_context_check(
+    engine: BaseEngine, openai_request: ChatCompletionRequest
+) -> list[dict]:
+    if getattr(engine, "is_mllm", False):
+        messages, _images, _videos = extract_multimodal_content(
+            openai_request.messages,
+            preserve_native_format=False,
+        )
+        return messages
+    return _prepare_messages_for_engine(engine, openai_request)
+
+
+def _message_to_engine_dict(msg) -> dict:
+    if hasattr(msg, "model_dump"):
+        return msg.model_dump(exclude_none=True)
+    if isinstance(msg, Mapping):
+        raw = msg
+    else:
+        raw = {
+            key: getattr(msg, key, None)
+            for key in (
+                "role",
+                "content",
+                "tool_calls",
+                "tool_call_id",
+                "name",
+            )
+            if hasattr(msg, key)
+        }
+    return {k: v for k, v in raw.items() if v is not None}
+
+
+#: Responses-input conversion failures the non-stream handler answers as 400.
+_RESPONSES_INPUT_400_MARKERS = (
+    "content block",
+    "input_text.",
+    "output_text.",
+    "input_image.",
+)
+
+
+def _record_nonstream_failure(engine, request: Request, error_class: str) -> None:
+    """Count one failed non-streaming /v1/responses request under a class."""
+    from rapid_mlx.telemetry import inference as _telemetry_inference
+    from rapid_mlx.telemetry.model_id import engine_telemetry_id
+
+    caller_agent, caller_client = _telemetry_inference.request_caller_headers(request)
+    _telemetry_inference.emit_completed_request(
+        model=engine_telemetry_id(engine),
+        endpoint="/v1/responses",
+        caller_agent=caller_agent,
+        caller_client=caller_client,
+        result="failed",
+        error_class=error_class,
+    )
+
+
+async def _non_stream(
+    engine: BaseEngine,
+    openai_request: ChatCompletionRequest,
+    responses_request: ResponsesRequest,
+    request: Request,
+    *,
+    explicit_no_thinking: bool = False,
+    namespace_by_tool: dict[str, str] | None = None,
+) -> Response:
+    cfg = get_config()
+    created_at = int(time.time())
+
+    messages = _prepare_messages_for_engine(engine, openai_request)
+    codex_surface = _is_deepseek_codex_surface(responses_request, cfg.tool_call_parser)
+    if codex_surface:
+        messages = _inject_codex_progress_reminder(messages, responses_request)
+
+    # r5-B C-10 / C-11: tool-coupled UI-TARS sysprompt injection. PR
+    # #817 wired ``computer_20251022`` → ``computer`` tool translation
+    # on the Responses surface but never injected the canonical UI-TARS
+    # action-API sysprompt — so the model had no idea it was supposed
+    # to emit ``Action: click(...)`` and just described the click in
+    # English (F-R2-D). With the shared helper threaded here, the
+    # responses lane fires the SAME tool-coupled gate as
+    # ``/v1/chat/completions`` and ``/v1/messages``: when the request
+    # declares ``tools=[{type:"computer_20251022",...}]``, the UI-TARS
+    # sysprompt is prepended, the model emits ``Action: ...`` text,
+    # the parser surfaces it as a ``computer`` tool_call, and the
+    # response adapter (already in place since #817) translates that
+    # to a ``computer_call`` output item. Cross-lane parity restored.
+    from ..tool_parsers.ui_tars_tool_parser import (
+        maybe_inject_ui_tars_system_prompt as _maybe_inject_ui_tars_sysprompt,
+    )
+
+    messages = _maybe_inject_ui_tars_sysprompt(
+        messages,
+        tool_call_parser=cfg.tool_call_parser,
+        tool_choice=openai_request.tool_choice,
+        tools=openai_request.tools,
+    )
+
+    chat_kwargs = {
+        "max_tokens": _resolve_max_tokens(
+            openai_request.max_tokens,
+            _resolve_enable_thinking(openai_request),
+        ),
+        **_resolved_responses_sampling_kwargs(
+            openai_request, responses_request, cfg.tool_call_parser
+        ),
+    }
+    if openai_request.tools:
+        chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+        from .chat import _compute_forced_tool_prefix
+
+        forced_prefix = _compute_forced_tool_prefix(cfg, openai_request)
+        if codex_surface:
+            forced_prefix = (
+                _codex_action_command_prefix(responses_request) or forced_prefix
+            )
+        if forced_prefix:
+            chat_kwargs["forced_assistant_prefix"] = forced_prefix
+
+    resolved_thinking = _resolve_enable_thinking(openai_request)
+    if resolved_thinking is not None:
+        chat_kwargs["enable_thinking"] = resolved_thinking
+    # Forward client ``chat_template_kwargs`` to the engine (#2474 wired only
+    # the chat surface; here the dict was dropped, so the native
+    # ``reasoning_effort`` level #3043 merges in never reached the template).
+    # ``enable_thinking`` is resolved above; the engine-side merge never
+    # overwrites server-resolved keys.
+    ctk = getattr(openai_request, "chat_template_kwargs", None)
+    if isinstance(ctk, dict) and ctk:
+        chat_kwargs["chat_template_kwargs"] = ctk
+    _attach_deepseek_no_think_suppression(
+        engine,
+        cfg,
+        responses_request.model,
+        explicit_no_thinking,
+        chat_kwargs,
+    )
+    _attach_deepseek_codex_reasoning_budget(
+        engine,
+        cfg,
+        openai_request,
+        resolved_thinking,
+        codex_surface,
+        chat_kwargs,
+    )
+
+    start_time = time.perf_counter()
+    timeout = cfg.default_timeout
+
+    # H-06: when the request asks for strict json_schema, route
+    # through ``engine.generate_with_schema`` for llguidance-backed
+    # constrained decoding. The route gate above already 400'd if
+    # guided was unavailable, so reaching here under strict means
+    # ``supports_guided_generation`` was True. Under strict we DO
+    # NOT fall back to unconstrained ``engine.chat`` on guided
+    # failure — that turns ``strict=true`` back into best-effort
+    # output (codex r2 BLOCKING #1). Instead we propagate the
+    # guided-coroutine failure as 502 ``strict_schema_violation``
+    # so the client sees the contract breach explicitly.
+    _rf_for_strict = getattr(openai_request, "response_format", None)
+    _strict_schema = (
+        extract_json_schema_for_guided(_rf_for_strict)
+        if is_strict_json_schema(_rf_for_strict)
+        else None
+    )
+
+    # Codex r3 BLOCKING #1: wrap ONLY the guided coroutine creation
+    # in our exception translator, not ``_wait_with_disconnect``
+    # itself. ``_wait_with_disconnect`` raises
+    # ``asyncio.TimeoutError`` / client-disconnect exceptions that
+    # the outer route relies on to return the canonical 408 / 499 /
+    # 503 envelopes — translating those to 502
+    # ``strict_schema_violation`` would mask client-disconnect /
+    # timeout as a server-side contract breach.
+    #
+    # Strategy: build the guided coroutine OUTSIDE the
+    # ``_wait_with_disconnect`` call but INSIDE a dedicated
+    # ``try`` (the one starting at ``try: _guided_coro = ...``
+    # below). Sync setup errors from
+    # ``engine.generate_with_schema(...)`` — AttributeError,
+    # NotImplementedError, llguidance-import errors, kwargs
+    # collisions if the sanitization at line ~450 ever regressed —
+    # materialize synchronously and the tight try catches them.
+    # ``_wait_with_disconnect`` then handles the actual await
+    # with its own timeout/disconnect semantics intact, in a
+    # SEPARATE outer try below.
+    #
+    # Codex r8 BLOCKING (false positive): the round-8 review
+    # claimed the call was "before the surrounding try" — see
+    # line 453 below, the call site IS inside the try. The
+    # ``test_strict_true_responses_sync_setup_failure_returns_502``
+    # test in test_response_format_json_schema_strict.py pins
+    # this behavior so any future refactor that moves the call
+    # outside the try is caught.
+    if (
+        _strict_schema
+        and engine.supports_guided_generation
+        and not openai_request.tools
+    ):
+        # Codex r5 BLOCKING: ``chat_kwargs`` is the merged
+        # ``_resolved_sampling_kwargs`` + tools/thinking flags blob.
+        # If any upstream resolver ever surfaces a ``raise_on_failure``
+        # key (e.g. a future ``extra_body`` passthrough, or an
+        # accidental sampling-param alias), the explicit
+        # ``raise_on_failure=True`` below would TypeError with
+        # "got multiple values for keyword argument" BEFORE
+        # constrained decoding ran — and the outer ``except Exception``
+        # would translate that operator-side wiring bug into a
+        # 502 ``strict_schema_violation`` (server contract-breach
+        # shape), masking the root cause from the client and from
+        # logs. Sanitize the kwargs dict here so the strict gate
+        # OWNS the value and no caller can collide with it.
+        _guided_kwargs = {
+            k: v for k, v in chat_kwargs.items() if k != "raise_on_failure"
+        }
+        try:
+            # Structural validity of the (strict) schema is already settled at
+            # the route boundary above, so constructing the guided coroutine
+            # here cannot surface a caller-schema fault; any operational failure
+            # is caught by the ``except Exception`` 502 arm below (and on the
+            # await path further down).
+            _guided_coro = engine.generate_with_schema(
+                messages=messages,
+                json_schema=_strict_schema,
+                raise_on_failure=True,
+                **_guided_kwargs,
+            )
+        except HTTPException:
+            raise
+        except Exception as guided_err:
+            logger.warning(
+                "Guided generation setup failed on /v1/responses strict path: %s",
+                guided_err,
+            )
+            incr_strict_violation()
+            _record_nonstream_failure(engine, request, "strict_schema_violation")
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": {
+                        "message": (
+                            "strict response_format requested but "
+                            "constrained decoding failed: "
+                            f"{type(guided_err).__name__}. Investigate "
+                            "the server logs and the "
+                            "rapid_mlx_response_format_strict_violations_total "
+                            "metric."
+                        ),
+                        "type": "api_error",
+                        "code": "strict_schema_violation",
+                        "param": "text.format.strict",
+                    }
+                },
+            ) from guided_err
+    else:
+        _guided_coro = None
+
+    try:
+        if _guided_coro is not None:
+            # Codex r3 BLOCKING #1: the guided await runs under the
+            # same _wait_with_disconnect contract as the
+            # unconstrained path — timeout/disconnect surface as
+            # the route's standard 408/499/503 envelopes (handled
+            # by the outer try/except). Any guided-specific
+            # runtime failure (llguidance grammar error during
+            # await, etc.) is translated to 502 below by checking
+            # the exception class explicitly so cancellation /
+            # timeout aren't misclassified.
+            try:
+                output = await _wait_with_disconnect(
+                    _guided_coro,
+                    request,
+                    timeout=timeout,
+                )
+            except HTTPException:
+                raise
+            except (TimeoutError, asyncio.TimeoutError):
+                # _wait_with_disconnect surfaces these from its
+                # own timeout machinery — they belong to the
+                # outer route's standard timeout shape, NOT to
+                # the strict_schema_violation contract.
+                raise
+            except asyncio.CancelledError:
+                # Client disconnect / cancellation — same as above,
+                # belongs to the route's standard cancellation
+                # path, not the strict contract.
+                raise
+            except GuidedGenerationCancelledError as exc:
+                # Engine-owned cancellation is lifecycle control, never a
+                # strict-schema failure and never eligible for fallback.
+                if _consume_guided_lifecycle_cancel(engine, exc):
+                    _record_nonstream_failure(engine, request, "model_replaced")
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Request cancelled by model replacement",
+                    ) from exc
+                raise asyncio.CancelledError() from exc
+            except Exception as guided_err:
+                logger.warning(
+                    "Guided generation failed mid-await on /v1/responses "
+                    "strict path: %s",
+                    guided_err,
+                )
+                incr_strict_violation()
+                _record_nonstream_failure(engine, request, "strict_schema_violation")
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "error": {
+                            "message": (
+                                "strict response_format requested but "
+                                "constrained decoding failed: "
+                                f"{type(guided_err).__name__}. Investigate "
+                                "the server logs and the "
+                                "rapid_mlx_response_format_strict_violations_total "
+                                "metric."
+                            ),
+                            "type": "api_error",
+                            "code": "strict_schema_violation",
+                            "param": "text.format.strict",
+                        }
+                    },
+                ) from guided_err
+        else:
+            output = await _wait_with_disconnect(
+                engine.chat(messages=messages, **chat_kwargs),
+                request,
+                timeout=timeout,
+            )
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001 — match other routes' error shape
+        from rapid_mlx.telemetry import inference as _telemetry_inference
+
+        from ..request import (
+            is_batch_cap_error,
+            is_chat_template_error,
+            is_media_input_error,
+        )
+
+        # Responses-input conversion failures this route answers as 400. The
+        # text is read defensively so an exception whose ``__str__`` raises is
+        # still counted before the (unchanged) ``str(e)`` below re-raises.
+        try:
+            responses_input_400 = any(
+                marker in str(e) for marker in _RESPONSES_INPUT_400_MARKERS
+            )
+        except Exception:
+            responses_input_400 = False
+        # Classify in THIS handler's order: the shared 400 predicates, then
+        # the responses-only input markers (a request-shape 400 is "other",
+        # never an engine abort), then the abort category.
+        error_class = _telemetry_inference.classify_inference_failure(
+            e, abort_first=False
+        )
+        if responses_input_400 and error_class not in (
+            "template_error",
+            "media_input_invalid",
+            "prompt_too_large",
+        ):
+            error_class = "other"
+        _record_nonstream_failure(engine, request, error_class)
+        err_msg = str(e)
+        if is_chat_template_error(e):
+            raise HTTPException(
+                status_code=400, detail=f"Chat template error: {err_msg}"
+            )
+        # Multimodal fetch failures + MLLM per-batch-cap errors → 400
+        # (parity with chat route, #457 / #682). The MLLM scheduler
+        # classifier already treats both as client-actionable; this route
+        # must map both to 400 or the /v1/responses surface returns a 500
+        # for what is really an oversized-image / oversized-prompt user
+        # error.
+        if is_media_input_error(e) or is_batch_cap_error(e) or responses_input_400:
+            raise HTTPException(status_code=400, detail=err_msg)
+        raise
+
+    if output is None:
+        return Response(status_code=499)
+
+    usage_detail_output = None
+
+    # A strict schema applies only to the assistant's final text. Tool-call
+    # turns retain the ordinary parser and wire representation unchanged.
+    _strict_tool_turn = False
+    if _strict_schema and openai_request.tools:
+        _engine_calls = getattr(output, "tool_calls", None)
+        _unused_text, _detected_calls = _parse_tool_calls_with_parser(
+            output.text,
+            openai_request,
+            structured_tool_calls=_engine_calls,
+        )
+        _strict_tool_turn = bool(_detected_calls)
+
+    # R12-4: when the strict path took the unconstrained branch
+    # (i.e. ``_strict_schema`` was set but ``supports_guided_generation``
+    # was False — the route gate now lets us through instead of
+    # raising ``guided_extra_required``), run the same post-generate
+    # validation + single repair retry the chat route runs. On
+    # validation failure we surface the structured
+    # ``json_schema_violation`` envelope so SDK consumers can read
+    # ``error.details.failing_path`` programmatically.
+    if (
+        _strict_schema
+        and (not engine.supports_guided_generation or bool(openai_request.tools))
+        and strict_enforcement_enabled()
+        and not _strict_tool_turn
+    ):
+        ok, failure_details = validate_and_envelope(output.text or "", _strict_schema)
+        attempts = 1
+        repair_attempted = False
+        if (
+            not ok
+            and repair_retry_enabled()
+            and (not openai_request.tools or engine.supports_guided_generation)
+        ):
+            repair_messages = build_repair_messages(
+                messages,
+                output.text or "",
+                _strict_schema,
+                failure_details or {},
+            )
+            repair_kwargs = dict(chat_kwargs)
+            for _k in ("tools", "tool_choice", "logprobs", "top_logprobs"):
+                repair_kwargs.pop(_k, None)
+            # H-06 #267b: re-check context-length AGAINST the post-build
+            # repair prompt. ``build_repair_messages`` builds a strictly
+            # larger prompt than the initial request (prepended
+            # instructions, repeated schema, up to 4 KiB of failed
+            # output), so a request that passed the initial gate can
+            # blow context only on the repair attempt — pre-fix that
+            # surfaced as the opaque ``502 strict_repair_engine_failure``
+            # instead of a deterministic ``422 json_schema_violation``.
+            # Centralized helper shared with chat.py keeps the gate
+            # logic from drifting between the two surfaces.
+            # rapid-mlx#280: thread the resolved ``enable_thinking`` so
+            # the repair-prompt fit check renders the way the engine
+            # will. ``repair_kwargs`` carries the same value because it
+            # is a copy of ``chat_kwargs`` (see line above); resolving
+            # from ``chat_kwargs`` keeps the single-source-of-truth
+            # invariant with the initial gate at responses.py:640. The
+            # chat lane has the equivalent threading at
+            # routes/chat.py:2895.
+            _repair_fits = repair_messages_fit_context(
+                engine,
+                repair_messages,
+                tools=None,
+                max_tokens=repair_kwargs.get("max_tokens"),
+                enable_thinking=chat_kwargs.get("enable_thinking"),
+            )
+            repair_output = None
+            if not _repair_fits:
+                incr_strict_repair_skipped_context_overflow()
+                logger.warning(
+                    "R12-4 /v1/responses strict json_schema repair retry "
+                    "SKIPPED: post-build repair prompt would exceed model "
+                    "context window. Surfacing the ORIGINAL 422 "
+                    "json_schema_violation envelope instead of attempting "
+                    "a retry that would either 502 or truncate."
+                )
+                # Fall through to the existing ``if not ok:`` below with
+                # ``attempts == 1`` so the envelope reflects the single
+                # generation attempt the client actually saw.
+            else:
+                incr_strict_repair_attempt()
+                attempts = 2
+                repair_attempted = True
+                logger.info(
+                    "R12-4 strict json_schema first attempt failed on "
+                    "/v1/responses (%s); attempting repair retry.",
+                    (failure_details or {}).get("reason", "?"),
+                )
+                try:
+                    if openai_request.tools:
+                        repair_coro = engine.generate_with_schema(
+                            messages=repair_messages,
+                            json_schema=_strict_schema,
+                            raise_on_failure=True,
+                            **repair_kwargs,
+                        )
+                    else:
+                        repair_coro = engine.chat(
+                            messages=repair_messages, **repair_kwargs
+                        )
+                    repair_output = await _wait_with_disconnect(
+                        repair_coro,
+                        request,
+                        timeout=timeout,
+                    )
+                except HTTPException:
+                    raise
+                except (TimeoutError, asyncio.TimeoutError, asyncio.CancelledError):
+                    raise
+                except Exception as repair_err:
+                    # Codex r1 #4 parity with chat.py: a non-timeout,
+                    # non-disconnect engine exception during the repair
+                    # turn is a SERVER failure, not a client schema-
+                    # validation failure. Surface as 502 instead of
+                    # swallowing into a 422 ``json_schema_violation``
+                    # that would mislead the client into thinking their
+                    # schema was the problem.
+                    logger.warning(
+                        "R12-4 /v1/responses strict repair retry raised %s: %s; "
+                        "surfacing as 502 (server-side generation failure, "
+                        "NOT a schema-validation contract breach).",
+                        type(repair_err).__name__,
+                        repair_err,
+                    )
+                    from rapid_mlx.telemetry import inference as _telemetry_inference
+
+                    _record_nonstream_failure(
+                        engine,
+                        request,
+                        _telemetry_inference.classify_inference_failure(repair_err),
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "error": {
+                                "message": (
+                                    "Strict json_schema repair retry failed on "
+                                    "/v1/responses: the engine raised "
+                                    f"{type(repair_err).__name__} during the "
+                                    "second generation attempt. The initial "
+                                    "output had also failed schema validation; "
+                                    "investigate server logs."
+                                ),
+                                "type": "api_error",
+                                "code": "strict_repair_engine_failure",
+                                "param": "text.format",
+                                "details": {
+                                    "initial_failure": failure_details,
+                                    "repair_exception": type(repair_err).__name__,
+                                },
+                            }
+                        },
+                    ) from repair_err
+            if repair_output is not None:
+                ok2, failure2 = validate_and_envelope(
+                    repair_output.text or "", _strict_schema
+                )
+                if ok2:
+                    incr_strict_repair_success()
+                    logger.info("R12-4 /v1/responses strict repair retry succeeded.")
+                    # Codex r2 #3 parity with chat.py: aggregate
+                    # token usage across BOTH attempts before
+                    # swapping ``output`` so the client-facing
+                    # response reports the full prompt + completion
+                    # cost the server billed.
+                    usage_detail_output = repair_output
+                    output = _aggregate_generation_attempts(output, repair_output)
+                    ok = True
+                    failure_details = None
+                else:
+                    failure_details = failure2
+        if not ok:
+            incr_strict_violation()
+            envelope = build_violation_envelope(
+                failure_details or {"reason": "schema_violation"},
+                param="text.format",
+                attempts=attempts,
+            )
+            if openai_request.tools and repair_attempted:
+                envelope["error"]["code"] = "strict_schema_violation"
+            logger.warning(
+                "R12-4 /v1/responses strict json_schema validation "
+                "failed after %d attempt(s): %s",
+                attempts,
+                (failure_details or {}).get("message"),
+            )
+            _record_nonstream_failure(engine, request, "strict_schema_violation")
+            raise HTTPException(
+                status_code=(502 if openai_request.tools and repair_attempted else 422),
+                detail=envelope,
+            )
+
+    # r6-A R6-C2: detect a degenerate engine output — no text, no
+    # reasoning, no tool_calls, zero output_tokens, AND
+    # ``finish_reason="length"`` — and surface it as a Responses
+    # ``status="failed"`` envelope with a populated ``error`` block
+    # instead of the silent ``200 + status="incomplete" + usage=0/0/0``
+    # shape pre-fix.
+    #
+    # Why this is needed: the engine reports ``finish_reason="length"``
+    # when the runtime aborts a request before it produced its first
+    # token (the scheduler's prefill-side ``max_tokens`` check fires the
+    # length stop). On a healthy "small budget" turn that's the right
+    # signal — the client did ask for a tiny budget. But when the
+    # underlying root cause is an engine wedge (e.g. ``metal::malloc``
+    # Resource-limit (499000) on the hybrid path for dense Qwen3.5, the
+    # R6-C1 sibling) the same wire shape is emitted, so SDK consumers
+    # cannot tell "you asked for 1 token" from "the GPU OOM'd before
+    # generating anything." Mapping the empty-and-zero-budget case to
+    # ``status="failed"`` + a structured ``error`` block keeps the OpenAI
+    # Responses spec contract (``error`` is the documented field for the
+    # failed state) and gives clients a clear distinction.
+    #
+    # Heuristic gate (codex r1 IMPORTANT — narrowed): the guard now
+    # ALSO requires ``finish_reason="length"``. The original predicate
+    # ("zero completion + no user-visible output channels") would have
+    # mis-classified legitimate immediate-stop / zero-budget /
+    # stop-sequence turns where the scheduler reports
+    # ``finish_reason="stop"`` (e.g. the very first sampled token was
+    # an EOS or matched a stop_sequence and was suppressed from
+    # ``output.text``). Restricting the gate to ``length`` keeps it
+    # focused on the runtime-abort signature the R6-C1 wedge produces:
+    #   - ``finish_reason="length"`` AND
+    #   - no assistant text (``output.text`` empty after strip)
+    #   - no reasoning text on the engine output
+    #   - no structured tool_calls surfaced by the engine
+    #   - ``completion_tokens == 0``
+    # Returning ``status="failed"`` here is the analogue of the
+    # streaming path's ``response.failed`` event (line ~1865) for
+    # non-streaming clients.
+    _has_text = bool((output.text or "").strip())
+    _has_reasoning = bool((getattr(output, "reasoning_text", "") or "").strip())
+    _has_tool_calls = bool(getattr(output, "tool_calls", None))
+    _zero_completion = (output.completion_tokens or 0) == 0
+    _engine_aborted_signature = getattr(output, "finish_reason", None) == "length"
+    if (
+        _engine_aborted_signature
+        and _zero_completion
+        and not (_has_text or _has_reasoning or _has_tool_calls)
+    ):
+        logger.warning(
+            "Responses: engine produced no output (no text/reasoning/tool_calls "
+            "and completion_tokens=0); surfacing as status=failed envelope "
+            "(finish_reason=%s)",
+            getattr(output, "finish_reason", None),
+        )
+        failed_payload = ResponsesResponse(
+            id=f"resp_{uuid.uuid4().hex[:24]}",
+            created_at=created_at,
+            model=cfg.model_name or responses_request.model,
+            status="failed",
+            output=[],
+            usage=ResponsesUsage(
+                input_tokens=output.prompt_tokens or 0,
+                output_tokens=0,
+                total_tokens=output.prompt_tokens or 0,
+            ),
+        )
+        # Spec field naming: ``error`` is OpenAI Responses' canonical
+        # failure block (``{code, message}`` — the same shape the
+        # streaming ``response.failed`` event emits). Build via
+        # ``model_dump`` + dict merge so the strict ResponsesResponse
+        # schema doesn't need a separate ``error`` field today (the
+        # streaming surface uses the same pattern).
+        payload = failed_payload.model_dump(exclude_none=True)
+        payload["error"] = {
+            "code": "engine_no_output",
+            "message": (
+                "The engine returned no usable output (no text, reasoning, "
+                "or tool_calls and zero completion tokens). This usually "
+                "indicates a runtime abort before generation produced its "
+                "first token (e.g. a Metal allocation failure). Inspect "
+                "the server logs for the underlying engine error."
+            ),
+        }
+        _record_nonstream_failure(engine, request, "output_contract_unmet")
+        return Response(
+            content=json.dumps(payload),
+            media_type="application/json",
+        )
+
+    elapsed = time.perf_counter() - start_time
+    tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
+    logger.info(
+        f"Responses: {output.completion_tokens} tokens in {elapsed:.2f}s "
+        f"({tokens_per_sec:.1f} tok/s)"
+    )
+
+    # H-06 (codex r2): post-decode validation under strict mode is a
+    # HARD contract — a knowingly schema-invalid 200 violates
+    # OpenAI's ``strict=true`` semantics. Counter ticks for ops
+    # visibility, then 502 so the client sees the contract breach
+    # instead of silently consuming garbage.
+    #
+    # R12-T1F-267-a (PR #878 codex follow-up): this gate must mirror
+    # chat.py's ``if strict_mode and use_guided and json_schema and
+    # output is not None:`` — i.e. it ONLY fires on the
+    # CONSTRAINED-DECODING (guided) path. When the engine does NOT
+    # support guided generation, the unconstrained path has its own
+    # post-decode validator + repair retry block ABOVE (gated by
+    # ``strict_enforcement_enabled()`` at line ~937), and the
+    # ``RAPID_MLX_STRICT_JSON_SCHEMA=off`` escape hatch correctly
+    # short-circuits that block. Without the ``supports_guided_generation``
+    # gate here, the disable flag was effectively ignored — the
+    # non-guided branch logged "falling through to prompt-injection
+    # only" and then the unconditional 502 at this site fired
+    # regardless, breaking parity with /v1/chat/completions. Match
+    # chat's gate exactly: only the guided path runs this validator.
+    if (
+        _strict_schema
+        and engine.supports_guided_generation
+        and not openai_request.tools
+        and output is not None
+    ):
+        ok, err = validate_output_against_schema(output.text or "", _strict_schema)
+        if not ok:
+            incr_strict_violation()
+            logger.warning(
+                "Strict json_schema response failed post-decode validation "
+                "on /v1/responses: %s",
+                err,
+            )
+            _record_nonstream_failure(engine, request, "strict_schema_violation")
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": {
+                        "message": (
+                            "strict response_format violated: model output "
+                            f"did not validate against the supplied schema ({err}). "
+                            "This indicates the constrained-decoding path silently "
+                            "degraded; investigate the server logs and the "
+                            "rapid_mlx_response_format_strict_violations_total metric."
+                        ),
+                        "type": "api_error",
+                        "code": "strict_schema_violation",
+                        "param": "text.format",
+                    }
+                },
+            )
+
+    engine_tool_calls = getattr(output, "tool_calls", None)
+    cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+        output.text, openai_request, structured_tool_calls=engine_tool_calls
+    )
+
+    # Yuki F6 (0.8.5 dogfood): mirror the chat-route ``tool_choice``
+    # coercion. The local engine has no decoder-level FSM constraint, so
+    # ``required`` / named-function ``tool_choice`` rely on post-parse
+    # synthesis to honour the OpenAI ``tool_call guaranteed`` contract.
+    # Without this, both shapes silently degraded to ``auto`` and Yuki
+    # F6 saw zero tool_calls on the wire.
+    try:
+        tool_calls = _enforce_responses_tool_choice(
+            tool_calls, responses_request, openai_request
+        )
+        if tool_calls and openai_request.tools:
+            _validate_tool_call_params(
+                tool_calls, openai_request.tools, enforce_required=True
+            )
+    except HTTPException as tool_error:
+        # Every rejection out of the tool_choice / tool-argument contract
+        # check is an unmet output contract, whether it is answered as the
+        # failed envelope below or re-raised as the route's 4xx.
+        _record_nonstream_failure(engine, request, "output_contract_unmet")
+        detail = tool_error.detail
+        classified_code = getattr(tool_error, "rapid_mlx_error_code", None)
+        if classified_code is None:
+            raise
+        if isinstance(detail, dict):
+            envelope = detail.get("error", {})
+            code = envelope.get("code", "tool_choice_unfulfilled")
+            message = envelope.get("message", "tool choice could not be fulfilled")
+        else:
+            code = classified_code
+            message = str(detail)
+        failed_payload = ResponsesResponse(
+            id=f"resp_{uuid.uuid4().hex[:24]}",
+            created_at=created_at,
+            model=cfg.model_name or responses_request.model,
+            status="failed",
+            output=[],
+            usage=ResponsesUsage(
+                input_tokens=output.prompt_tokens or 0,
+                output_tokens=output.completion_tokens or 0,
+                total_tokens=(output.prompt_tokens or 0)
+                + (output.completion_tokens or 0),
+            ),
+        )
+        payload = failed_payload.model_dump(exclude_none=True)
+        payload["error"] = {"code": code, "message": message}
+        return Response(content=json.dumps(payload), media_type="application/json")
+
+    cleaned_text, reasoning_text = _finalize_content_and_reasoning(
+        raw_text=output.raw_text or output.text,
+        cleaned_text=cleaned_text,
+        tool_calls=tool_calls,
+        reasoning_parser=cfg.reasoning_parser,
+        engine_reasoning_text=getattr(output, "reasoning_text", "") or "",
+        enable_thinking=_effective_enable_thinking(
+            resolved_thinking, cfg.model_path or cfg.model_name
+        ),
+        prompt_thinking_active=_should_start_in_thinking(
+            getattr(getattr(engine, "tokenizer", None), "chat_template", "") or "",
+            resolved_thinking,
+            unconditional=bool(
+                getattr(cfg.reasoning_parser, "implicit_reasoning_until_close", False)
+            ),
+            tools_requested=bool(openai_request.tools),
+        ),
+        # Per-request reasoning cap (upstream vLLM PR #20859 backport).
+        # Forwarded from ``ResponsesRequest.reasoning_max_tokens`` via
+        # the Responses → OpenAI adapter. None → no cap (back-compat).
+        reasoning_max_tokens=getattr(openai_request, "reasoning_max_tokens", None),
+        # r5-D shared finalize-on-truncation plug — see chat.py for
+        # the rationale. Forwarded so the /v1/responses path picks up
+        # the same gemma4 / glm4 / minimax fixes.
+        finish_reason=getattr(output, "finish_reason", None),
+        json_mode=_is_structured_output_requested(
+            getattr(openai_request, "response_format", None)
+        ),
+    )
+
+    final_content = None
+    if cleaned_text:
+        final_content = strip_thinking_tags(clean_output_text(cleaned_text))
+        final_content = sanitize_output(final_content)
+        # R7-M4 (Vlad r7 — 0.8.8 sweep): mirror the chat-route fence-strip
+        # so a model that wraps a ``json_object`` / ``json_schema`` body
+        # in a ```json ... ``` markdown fence has the fence peeled off
+        # BEFORE the body is handed to the Responses adapter. Pre-R7
+        # the chat surface ran ``extract_json_from_response`` after
+        # ``response_format`` was set (chat.py L2076) but the Responses
+        # surface called ``engine.chat()`` directly and skipped the
+        # post-processor entirely, so the same model + prompt produced
+        # a clean JSON body on /v1/chat/completions but a fenced body
+        # on /v1/responses — a cross-route inconsistency the r7 sweep
+        # surfaced as M-02 fence-strip not covering this route.
+        # Defensive: only strips when a JSON-structure response_format
+        # was requested (parity with chat.py); plain text responses are
+        # untouched.
+        rf = getattr(openai_request, "response_format", None)
+        if rf is not None and final_content:
+            final_content = extract_json_from_response(final_content)
+
+    finish_reason = "tool_calls" if tool_calls else output.finish_reason
+    if is_cancellation_finish_reason(finish_reason):
+        return Response(status_code=499)
+
+    # Issue #858: /v1/responses mirror of the cutoff sentinel.
+    # Default-on (PR #802 / H-01 semantics restored) — clients that only
+    # render ``output_text`` blocks (rather than walking ``status`` +
+    # ``usage.output_tokens_details.reasoning_tokens``) get the literal
+    # cue in-band. Opt out via
+    # ``RAPID_MLX_REASONING_CUTOFF_NOTICE=disabled``. The Responses
+    # surface intentionally does NOT run
+    # ``_rescue_silent_drop_from_reasoning`` (this endpoint never
+    # carried the issue#569 silent-drop pre-history), so the helper sees
+    # a broader predicate set here than on chat/anthropic — that scope
+    # is fine because the helper itself owns all the gates.
+    final_content = _apply_reasoning_cutoff_notice(
+        final_content,
+        reasoning_text,
+        tool_calls,
+        finish_reason,
+        include_reasoning_tail=not _uses_deepseek_v4_reasoning(cfg),
+    )
+
+    if (
+        output.finish_reason == "stop"
+        and responses_request.tools
+        and not tool_calls
+        and not (final_content or "").strip()
+    ):
+        failed_payload = ResponsesResponse(
+            id=f"resp_{uuid.uuid4().hex[:24]}",
+            created_at=created_at,
+            model=cfg.model_name or responses_request.model,
+            status="failed",
+            output=[],
+            usage=ResponsesUsage(
+                input_tokens=output.prompt_tokens or 0,
+                output_tokens=output.completion_tokens or 0,
+                total_tokens=(output.prompt_tokens or 0)
+                + (output.completion_tokens or 0),
+            ),
+        )
+        payload = failed_payload.model_dump(exclude_none=True)
+        payload["error"] = {
+            "code": "model_no_final_answer",
+            "message": (
+                "The model stopped without producing a final answer or tool "
+                "call. Retry the request."
+            ),
+        }
+        _record_nonstream_failure(engine, request, "output_contract_unmet")
+        return Response(content=json.dumps(payload), media_type="application/json")
+
+    openai_response = ChatCompletionResponse(
+        model=cfg.model_name or openai_request.model,
+        choices=[
+            ChatCompletionChoice(
+                message=AssistantMessage(
+                    content=final_content,
+                    reasoning_content=reasoning_text,
+                    tool_calls=tool_calls,
+                ),
+                finish_reason=finish_reason,
+            )
+        ],
+        usage=_build_usage(
+            output,
+            reasoning_text,
+            detail_output=usage_detail_output,
+        ),
+        metrics=_build_response_metrics(output),
+    )
+
+    responses_response = openai_to_responses(
+        openai_response,
+        model=cfg.model_name or responses_request.model,
+        request=responses_request,
+        created_at=created_at,
+        namespace_by_tool=namespace_by_tool,
+    )
+    response = Response(
+        content=responses_response.model_dump_json(exclude_none=True),
+        media_type="application/json",
+    )
+    from rapid_mlx.telemetry import inference as _telemetry_inference
+    from rapid_mlx.telemetry.model_id import engine_telemetry_id
+
+    _telemetry_inference.emit_completed_request(
+        model=engine_telemetry_id(engine),
+        endpoint="/v1/responses",
+        caller_agent=request.headers.get("user-agent"),
+        caller_client=request.headers.get("x-rapid-client"),
+        result="ok",
+    )
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Streaming path — emits the 7 SSE events Codex CLI parses
+# ---------------------------------------------------------------------------
+
+
+def _sse(event: str, data: dict) -> str:
+    """Format one Server-Sent Event in Responses-API shape.
+
+    Codex parses ``event: <name>\\ndata: <json>\\n\\n`` framing — same as
+    chat-completions and Anthropic streams. No ``data: [DONE]`` here;
+    that sentinel is chat-completions-only.
+    """
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+async def _stream_buffered_responses_response(
+    body: bytes | memoryview,
+) -> AsyncIterator[str]:
+    """Replay a validated result through the ordinary Responses state machine."""
+    response = json.loads(bytes(body))
+    response_output = response.get("output", [])
+    item_ids: dict[str, list[str]] = {}
+    outputs: list[GenerationOutput] = []
+
+    for item in response_output:
+        item_type = item.get("type")
+        item_id = item.get("id")
+        if isinstance(item_id, str):
+            item_ids.setdefault(item_type, []).append(item_id)
+        if item_type == "reasoning":
+            reasoning = "".join(
+                str(part.get("text") or "")
+                for part in item.get("summary", [])
+                if isinstance(part, dict) and part.get("type") == "summary_text"
+            )
+            if reasoning:
+                outputs.append(
+                    GenerationOutput(
+                        text=reasoning,
+                        new_text=reasoning,
+                        channel="reasoning",
+                        finished=False,
+                        finish_reason=None,
+                    )
+                )
+        elif item_type == "message":
+            text = "".join(
+                str(part.get("text") or "")
+                for part in item.get("content", [])
+                if isinstance(part, dict) and part.get("type") == "output_text"
+            )
+            if text:
+                outputs.append(
+                    GenerationOutput(
+                        text=text,
+                        new_text=text,
+                        channel="content",
+                        finished=False,
+                        finish_reason=None,
+                    )
+                )
+        elif item_type == "function_call":
+            outputs.append(
+                GenerationOutput(
+                    text=" ",
+                    new_text=" ",
+                    channel="tool_call",
+                    tool_calls=[
+                        {
+                            "id": item.get("call_id"),
+                            "name": item.get("name"),
+                            "arguments": item.get("arguments", ""),
+                        }
+                    ],
+                    finished=False,
+                    finish_reason=None,
+                )
+            )
+        elif item_type == "computer_call":
+            outputs.append(
+                GenerationOutput(
+                    text=" ",
+                    new_text=" ",
+                    channel="tool_call",
+                    tool_calls=[
+                        {
+                            "id": item.get("call_id"),
+                            "name": "computer",
+                            "arguments": json.dumps(
+                                item.get("action") or {}, separators=(",", ":")
+                            ),
+                        }
+                    ],
+                    finished=False,
+                    finish_reason=None,
+                )
+            )
+
+    if not outputs:
+        outputs.append(GenerationOutput(text="", new_text="", finished=False))
+    terminal = outputs[-1]
+    terminal.finished = True
+    terminal.finish_reason = (
+        "length" if response.get("status") == "incomplete" else "stop"
+    )
+    usage = response.get("usage") or {}
+    terminal.prompt_tokens = int(usage.get("input_tokens") or 0)
+    terminal.completion_tokens = int(usage.get("output_tokens") or 0)
+    input_details = usage.get("input_tokens_details") or {}
+    terminal.cached_tokens = int(input_details.get("cached_tokens") or 0)
+    metrics = (response.get("metrics") or {}).get("speculative_decoding")
+    if isinstance(metrics, dict):
+        terminal.spec_decode_metrics = metrics
+
+    class _ReplayEngine:
+        tokenizer = None
+
+        async def stream_chat(self, **_kwargs):
+            for replay_output in outputs:
+                yield replay_output
+
+    responses_request = ResponsesRequest.model_validate(
+        {
+            "model": response.get("model") or "model",
+            "input": "buffered replay",
+            "stream": True,
+            "parallel_tool_calls": response.get("parallel_tool_calls", True),
+            "tool_choice": response.get("tool_choice", "auto"),
+            "tools": response.get("tools", []),
+        }
+    )
+    openai_request = responses_to_openai(responses_request)
+    async for event in _stream_responses(
+        cast(BaseEngine, _ReplayEngine()),
+        openai_request,
+        responses_request,
+        response_id_override=response.get("id"),
+        created_at_override=response.get("created_at"),
+        replay_item_ids=item_ids,
+        emit_telemetry=False,
+    ):
+        yield event
+
+
+def _responses_keepalive_sse(state: dict[str, object]) -> str:
+    """Emit a parsed Responses SSE heartbeat for clients that ignore comments.
+
+    Codex's idle watchdog observes parsed SSE events, so ``: keepalive`` comment
+    frames can keep proxies alive while Codex still considers the stream idle.
+    Reusing ``response.in_progress`` keeps the frame in the Responses event
+    vocabulary and lets SDK consumers treat it as a harmless lifecycle refresh.
+    """
+    data: dict[str, object] = {"type": "response.in_progress"}
+    response = state.get("response")
+    if isinstance(response, dict):
+        data["response"] = response
+    seq = state.get("sequence_number")
+    if isinstance(seq, list) and seq:
+        data["sequence_number"] = seq[0]
+        seq[0] += 1
+    return _sse("response.in_progress", data)
+
+
+async def _emit_function_call_item(tc, output_index: int) -> AsyncIterator[str]:
+    """Stream the SSE event triplet for a single ``function_call`` item.
+
+    Sequence: ``response.output_item.added`` →
+    ``response.function_call_arguments.delta`` →
+    ``response.output_item.done``. Args are sent in a single delta
+    because the underlying engine doesn't surface per-token tool-call
+    streaming yet (Codex CLI concatenates either way).
+    """
+    fc_id = f"fc_{uuid.uuid4().hex[:24]}"
+    yield _sse(
+        "response.output_item.added",
+        {
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": {
+                "type": "function_call",
+                "id": fc_id,
+                "call_id": tc.id,
+                "name": tc.function.name,
+                "arguments": "",
+                "status": "in_progress",
+            },
+        },
+    )
+    yield _sse(
+        "response.function_call_arguments.delta",
+        {
+            "type": "response.function_call_arguments.delta",
+            "item_id": fc_id,
+            "output_index": output_index,
+            "delta": tc.function.arguments or "",
+        },
+    )
+    yield _sse(
+        "response.output_item.done",
+        {
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": {
+                "type": "function_call",
+                "id": fc_id,
+                "call_id": tc.id,
+                "name": tc.function.name,
+                "arguments": tc.function.arguments or "",
+                "status": "completed",
+            },
+        },
+    )
+
+
+async def _emit_computer_call_item(tc, output_index: int) -> AsyncIterator[str]:
+    """Stream the SSE event pair for one Computer-Use ``computer_call``
+    item (Ana C-06, 0.8.5 dogfood).
+
+    Sequence: ``response.output_item.added`` →
+    ``response.output_item.done``. There is no per-token args delta
+    event for ``computer_call`` in the OpenAI spec — the entire
+    ``action`` envelope ships in the ``done`` payload.
+    """
+    # Lazy import to avoid the route module circular-importing the
+    # adapter at module load time (the adapter imports types from
+    # ``responses_models`` which the route also imports).
+    from ..api.responses_adapter import _parse_computer_action
+
+    cu_id = f"cu_{uuid.uuid4().hex[:24]}"
+    action = _parse_computer_action(tc.function.arguments or "")
+    yield _sse(
+        "response.output_item.added",
+        {
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": {
+                "type": "computer_call",
+                "id": cu_id,
+                "call_id": tc.id,
+                "status": "in_progress",
+                "action": action,
+                "pending_safety_checks": [],
+            },
+        },
+    )
+    yield _sse(
+        "response.output_item.done",
+        {
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": {
+                "type": "computer_call",
+                "id": cu_id,
+                "call_id": tc.id,
+                "status": "completed",
+                "action": action,
+                "pending_safety_checks": [],
+            },
+        },
+    )
+
+
+async def _stream_responses_with_nonprogress_retry(
+    engine: BaseEngine,
+    openai_request: ChatCompletionRequest,
+    responses_request: ResponsesRequest,
+    *,
+    explicit_no_thinking: bool = False,
+    request_id_holder: list | None = None,
+    heartbeat_state: dict[str, object] | None = None,
+    namespace_by_tool: dict[str, str] | None = None,
+    caller_agent: str | None = None,
+    caller_client: str | None = None,
+    served_telemetry_id: str | None = None,
+) -> AsyncIterator[str]:
+    """Hide one DeepSeek reasoning-only stop behind a bounded retry.
+
+    Codex otherwise reconnects the whole Responses turn when the model ends
+    after hidden reasoning.  Buffer only this model/surface combination so a
+    failed attempt has not committed an SSE lifecycle, then retry once with a
+    transient completion reminder.  Successful turns and every other surface
+    retain their existing streaming behaviour.
+    """
+    cfg = get_config()
+    retryable_surface = _is_deepseek_codex_surface(
+        responses_request, cfg.tool_call_parser
+    )
+    if not retryable_surface:
+        async for event in _stream_responses(
+            engine,
+            openai_request,
+            responses_request,
+            explicit_no_thinking=explicit_no_thinking,
+            request_id_holder=request_id_holder,
+            heartbeat_state=heartbeat_state,
+            namespace_by_tool=namespace_by_tool,
+            caller_agent=caller_agent,
+            caller_client=caller_client,
+            served_telemetry_id=served_telemetry_id,
+        ):
+            yield event
+        return
+
+    # Transport liveness and cancellation remain owned by the outer
+    # ``_disconnect_guard`` in ``create_response``. While lifecycle events are
+    # held here, that guard keeps polling disconnects and emits parsed
+    # Responses heartbeats at the configured interval. Keep the attempt's
+    # lifecycle private until it commits so a heartbeat cannot expose an ID
+    # that will be discarded by the transparent retry.
+    # The transparent retry owns one public Responses lifecycle. Expose its
+    # created/in-progress pair immediately and let both engine attempts share
+    # the same id. Public events and keepalives use their own counter so buffered
+    # or discarded attempt events cannot leave gaps in the visible sequence.
+    public_response_id = f"resp_{uuid.uuid4().hex[:24]}"
+    public_created_at = int(time.time())
+    public_sequence = [0]
+    attempt_sequence = [0]
+    public_response = _responses_initial_payload(
+        response_id=public_response_id,
+        created_at=public_created_at,
+        served_model=cfg.model_name or responses_request.model,
+        responses_request=responses_request,
+    )
+    if heartbeat_state is not None:
+        heartbeat_state["response"] = public_response
+        heartbeat_state["sequence_number"] = public_sequence
+    yield _responses_resequence_event(
+        _sse(
+            "response.created",
+            {"type": "response.created", "response": public_response},
+        ),
+        public_sequence,
+    )
+    yield _responses_resequence_event(
+        _sse(
+            "response.in_progress",
+            {"type": "response.in_progress", "response": public_response},
+        ),
+        public_sequence,
+    )
+    attempt_heartbeat_state: dict[str, object] = {}
+    # The first attempt's route-level failure is only counted if we do NOT
+    # retry it (see _stream_responses ``deferred_failure``).
+    first_attempt_failure: list[str | None] = [None]
+    buffered: list[str] = []
+    buffered_bytes = 0
+    committed = False
+    retry_nonprogress = False
+    async for event in _stream_responses(
+        engine,
+        openai_request,
+        responses_request,
+        explicit_no_thinking=explicit_no_thinking,
+        request_id_holder=request_id_holder,
+        heartbeat_state=attempt_heartbeat_state,
+        response_id_override=public_response_id,
+        created_at_override=public_created_at,
+        sequence_counter=attempt_sequence,
+        emit_initial_lifecycle=False,
+        namespace_by_tool=namespace_by_tool,
+        caller_agent=caller_agent,
+        caller_client=caller_client,
+        served_telemetry_id=served_telemetry_id,
+        deferred_failure=first_attempt_failure,
+    ):
+        if committed:
+            if heartbeat_state is not None:
+                heartbeat_state.clear()
+                heartbeat_state.update(attempt_heartbeat_state)
+                heartbeat_state["sequence_number"] = public_sequence
+            yield _responses_resequence_event(event, public_sequence)
+            continue
+        event_bytes = len(event.encode("utf-8"))
+        event_buffered = False
+        if buffered_bytes + event_bytes >= _NONPROGRESS_RETRY_BUFFER_LIMIT:
+            committed = True
+        else:
+            buffered.append(event)
+            buffered_bytes += event_bytes
+            event_buffered = True
+        if _responses_event_commits_progress(event):
+            committed = True
+        elif committed:
+            logger.warning(
+                "DeepSeek Codex retry buffer reached %d bytes; preserving streaming "
+                "and disabling the transparent retry for this turn",
+                buffered_bytes + event_bytes,
+            )
+        if committed:
+            if heartbeat_state is not None:
+                heartbeat_state.clear()
+                heartbeat_state.update(attempt_heartbeat_state)
+                heartbeat_state["sequence_number"] = public_sequence
+            for pending in buffered:
+                yield _responses_resequence_event(pending, public_sequence)
+            buffered.clear()
+            if not event_buffered:
+                yield _responses_resequence_event(event, public_sequence)
+        elif _responses_event_is_nonprogress_failure(event):
+            retry_nonprogress = True
+
+    if (committed or not retry_nonprogress) and first_attempt_failure[0] is not None:
+        from rapid_mlx.telemetry import inference as _telemetry_inference
+
+        _telemetry_inference.emit_completed_request(
+            model=served_telemetry_id or "<custom>",
+            endpoint="/v1/responses",
+            caller_agent=caller_agent,
+            caller_client=caller_client,
+            result="failed",
+            error_class=first_attempt_failure[0],
+        )
+    if committed:
+        return
+    if not retry_nonprogress:
+        for event in buffered:
+            yield _responses_resequence_event(event, public_sequence)
+        return
+
+    logger.warning(
+        "DeepSeek Codex reasoning-only stop: retrying once inside the server"
+    )
+    if request_id_holder is not None:
+        request_id_holder[0] = None
+    async for event in _stream_responses(
+        engine,
+        openai_request,
+        responses_request,
+        explicit_no_thinking=explicit_no_thinking,
+        request_id_holder=request_id_holder,
+        heartbeat_state=heartbeat_state,
+        nonprogress_retry=True,
+        response_id_override=public_response_id,
+        created_at_override=public_created_at,
+        sequence_counter=public_sequence,
+        emit_initial_lifecycle=False,
+        namespace_by_tool=namespace_by_tool,
+        caller_agent=caller_agent,
+        caller_client=caller_client,
+        served_telemetry_id=served_telemetry_id,
+    ):
+        yield event
+
+
+def _responses_event_commits_progress(event: str) -> bool:
+    """Return whether an SSE event proves this attempt has public progress."""
+    for line in event.splitlines():
+        if not line.startswith("data: "):
+            continue
+        try:
+            data = json.loads(line[6:])
+        except (TypeError, ValueError):
+            continue
+        event_type = data.get("type")
+        if event_type == "response.output_text.delta":
+            return bool(str(data.get("delta") or "").strip())
+        if event_type == "response.output_item.added":
+            item_type = data.get("item", {}).get("type")
+            if item_type in {"function_call", "computer_call"}:
+                return True
+    return False
+
+
+def _responses_resequence_event(event: str, sequence: list[int]) -> str:
+    """Assign the next public sequence number to one buffered SSE event."""
+    for line in event.splitlines():
+        if not line.startswith("data: "):
+            continue
+        try:
+            data = json.loads(line[6:])
+        except (TypeError, ValueError):
+            return event
+        event_type = data.get("type")
+        if not isinstance(event_type, str):
+            return event
+        data["sequence_number"] = sequence[0]
+        sequence[0] += 1
+        return _sse(event_type, data)
+    return event
+
+
+def _responses_initial_payload(
+    *,
+    response_id: str,
+    created_at: int,
+    served_model: str,
+    responses_request: ResponsesRequest,
+) -> dict:
+    """Build the shared response object used by initial lifecycle events."""
+    return {
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "status": "in_progress",
+        "model": served_model,
+        "output": [],
+        "parallel_tool_calls": bool(responses_request.parallel_tool_calls),
+        "tool_choice": responses_request.tool_choice or "auto",
+        "tools": responses_request.tools or [],
+    }
+
+
+def _responses_event_is_nonprogress_failure(event: str) -> bool:
+    """Match only the terminal failure envelope, never model-authored text."""
+    for line in event.splitlines():
+        if not line.startswith("data: "):
+            continue
+        try:
+            data = json.loads(line[6:])
+        except (TypeError, ValueError):
+            continue
+        return bool(
+            data.get("type") == "response.failed"
+            and data.get("response", {}).get("error", {}).get("code")
+            == "model_no_final_answer"
+        )
+    return False
+
+
+async def _stream_responses(
+    engine: BaseEngine,
+    openai_request: ChatCompletionRequest,
+    responses_request: ResponsesRequest,
+    *,
+    explicit_no_thinking: bool = False,
+    request_id_holder: list | None = None,
+    heartbeat_state: dict[str, object] | None = None,
+    nonprogress_retry: bool = False,
+    response_id_override: str | None = None,
+    created_at_override: int | None = None,
+    sequence_counter: list[int] | None = None,
+    emit_initial_lifecycle: bool = True,
+    namespace_by_tool: dict[str, str] | None = None,
+    caller_agent: str | None = None,
+    caller_client: str | None = None,
+    served_telemetry_id: str | None = None,
+    deferred_failure: list[str | None] | None = None,
+    replay_item_ids: dict[str, list[str]] | None = None,
+    emit_telemetry: bool = True,
+) -> AsyncIterator[str]:
+    """Stream a Responses-API SSE event sequence Codex CLI can parse.
+
+    Event order Codex expects:
+      1. ``response.created`` — once, before any deltas
+      2. ``response.in_progress`` — lifecycle transition (R10-C3 / R6-H7)
+      3. ``response.output_item.added`` (reasoning item, leading — R12-M3) —
+         flushed immediately before the message item. Carries an empty
+         ``summary`` at open; the matching ``response.output_item.done``
+         (with the accumulated chain-of-thought) ships after the message
+         item closes. The reasoning item ALWAYS leads the message on the
+         wire — matching the OpenAI Responses reference even when the
+         reasoning text is empty.
+      4. ``response.output_item.added`` (message item) — when first text
+         delta arrives
+      5. ``response.output_text.delta`` — each chunk of assistant text
+      6. ``response.output_item.done`` (message item) — when text ends,
+         before the leading reasoning item's ``done`` event
+      7. ``response.output_item.done`` (reasoning item) — closes the
+         leading item with the accumulated summary
+      8. For each tool call:
+         ``response.output_item.added`` (function_call item) +
+         ``response.function_call_arguments.delta`` (full JSON args) +
+         ``response.output_item.done`` (function_call item)
+      9. ``response.completed`` — terminal event, carries final usage
+
+    Errors emit ``response.failed`` then close. Codex treats
+    stream-close-without-``response.completed`` as a hard failure, so
+    we always finalize.
+    """
+    cfg = get_config()
+    response_id = response_id_override or f"resp_{uuid.uuid4().hex[:24]}"
+    created_at = created_at_override or int(time.time())
+    start_time = time.perf_counter()
+    served_model = cfg.model_name or responses_request.model
+    telemetry_failure_emitted = [False]
+
+    # R10-C3: openai-python event models mark ``sequence_number`` as
+    # required on every Responses-API event. Monotonic counter starting
+    # at 0, incremented per yielded event. Wrap ``_sse`` via a helper so
+    # the bookkeeping stays in one place.
+    _seq = sequence_counter if sequence_counter is not None else [0]
+    if heartbeat_state is not None:
+        heartbeat_state["sequence_number"] = _seq
+
+    def _emit(event: str, data: dict) -> str:
+        data["sequence_number"] = _seq[0]
+        _seq[0] += 1
+        return _sse(event, data)
+
+    def _record_failed(error_class: str) -> None:
+        if telemetry_failure_emitted[0]:
+            return
+        telemetry_failure_emitted[0] = True
+        if deferred_failure is not None:
+            # A buffered attempt the caller may still retry transparently:
+            # hand the class back instead of counting a failure the client
+            # may never see.
+            deferred_failure[:] = [error_class]
+            return
+        if not emit_telemetry:
+            return
+        from rapid_mlx.telemetry import inference as _telemetry_inference
+
+        _telemetry_inference.emit_completed_request(
+            model=served_telemetry_id or "<custom>",
+            endpoint="/v1/responses",
+            caller_agent=caller_agent,
+            caller_client=caller_client,
+            result="failed",
+            error_class=error_class,
+        )
+
+    def _item_id(item_type: str, prefix: str) -> str:
+        ids = (replay_item_ids or {}).get(item_type)
+        if ids:
+            return ids.pop(0)
+        return f"{prefix}_{uuid.uuid4().hex[:24]}"
+
+    # response.created — Codex needs this before any deltas.
+    # R10-C3: include the same top-level fields the non-streaming response
+    # object carries (``parallel_tool_calls`` / ``tool_choice`` / ``tools``)
+    # so consumers like openai-python ``Response.model_validate`` accept
+    # the streaming payload too. ``output`` starts empty and is rebuilt
+    # below before ``response.completed`` is emitted.
+    _initial_response_payload = _responses_initial_payload(
+        response_id=response_id,
+        created_at=created_at,
+        served_model=served_model,
+        responses_request=responses_request,
+    )
+    if heartbeat_state is not None:
+        heartbeat_state["response"] = _initial_response_payload
+    if emit_initial_lifecycle:
+        yield _emit(
+            "response.created",
+            {
+                "type": "response.created",
+                "response": _initial_response_payload,
+            },
+        )
+    # R10-C3: the OpenAI Responses SSE spec mandates ``response.in_progress``
+    # between ``response.created`` and the first ``response.output_item.added``.
+    # The ``openai-python`` SDK transitions internal state on it (sets
+    # ``Response.status="in_progress"`` separately from the initial
+    # ``created`` event), so skipping the event leaves the SDK's parser in
+    # a half-initialized state until the message item lands — which causes
+    # ``AsyncResponseStreamManager`` to crash when ``response.completed``
+    # arrives without the intermediate transition. Sven r10-R1 captured
+    # exactly this on 0.8.11. Payload mirrors ``created`` because no
+    # generation state has changed yet, just the lifecycle marker.
+    if emit_initial_lifecycle:
+        yield _emit(
+            "response.in_progress",
+            {
+                "type": "response.in_progress",
+                "response": _initial_response_payload,
+            },
+        )
+    try:
+        messages = _prepare_messages_for_engine(engine, openai_request)
+        codex_surface = _is_deepseek_codex_surface(
+            responses_request, cfg.tool_call_parser
+        )
+        if codex_surface:
+            messages = _inject_codex_progress_reminder(messages, responses_request)
+            if nonprogress_retry:
+                messages = [
+                    *messages,
+                    {
+                        "role": "developer",
+                        "content": (
+                            "The previous generation stopped inside private reasoning. "
+                            "Complete this turn now with exactly one public answer or "
+                            "one valid tool call; do not end in reasoning alone."
+                        ),
+                        "_rapid_mlx_transient_priming": True,
+                    },
+                ]
+
+        # r5-B C-10 / C-11: tool-coupled UI-TARS sysprompt injection on
+        # the streaming responses lane. Same gate as the non-stream
+        # path above and the chat / messages lanes — see ``_non_stream``
+        # for the full rationale. The streaming response builder
+        # surfaces ``computer_call`` output items via the parser path
+        # downstream once the model is primed to emit ``Action: ...``.
+        from ..tool_parsers.ui_tars_tool_parser import (
+            maybe_inject_ui_tars_system_prompt as _maybe_inject_ui_tars_sysprompt,
+        )
+
+        messages = _maybe_inject_ui_tars_sysprompt(
+            messages,
+            tool_call_parser=cfg.tool_call_parser,
+            tool_choice=openai_request.tool_choice,
+            tools=openai_request.tools,
+        )
+
+        chat_kwargs = {
+            "max_tokens": _resolve_max_tokens(
+                openai_request.max_tokens,
+                _resolve_enable_thinking(openai_request),
+            ),
+            **_resolved_responses_sampling_kwargs(
+                openai_request, responses_request, cfg.tool_call_parser
+            ),
+        }
+        forced_prefix = None
+        if openai_request.tools:
+            chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+            from .chat import _compute_forced_tool_prefix
+
+            forced_prefix = _compute_forced_tool_prefix(cfg, openai_request)
+            if codex_surface:
+                forced_prefix = (
+                    _codex_action_command_prefix(responses_request) or forced_prefix
+                )
+            if forced_prefix:
+                chat_kwargs["forced_assistant_prefix"] = forced_prefix
+        resolved_thinking = _resolve_enable_thinking(openai_request)
+        if resolved_thinking is not None:
+            chat_kwargs["enable_thinking"] = resolved_thinking
+        # Forward client ``chat_template_kwargs`` to the engine (#2474 wired only
+        # the chat surface; here the dict was dropped, so the native
+        # ``reasoning_effort`` level #3043 merges in never reached the template).
+        # ``enable_thinking`` is resolved above; the engine-side merge never
+        # overwrites server-resolved keys.
+        ctk = getattr(openai_request, "chat_template_kwargs", None)
+        if isinstance(ctk, dict) and ctk:
+            chat_kwargs["chat_template_kwargs"] = ctk
+        _attach_deepseek_no_think_suppression(
+            engine,
+            cfg,
+            responses_request.model,
+            explicit_no_thinking,
+            chat_kwargs,
+        )
+        _attach_deepseek_codex_reasoning_budget(
+            engine,
+            cfg,
+            openai_request,
+            resolved_thinking,
+            codex_surface,
+            chat_kwargs,
+        )
+        # C-01: thread the request_id holder so disconnect_guard can
+        # force-call scheduler.abort_request on client RST.
+        if request_id_holder is not None:
+            chat_kwargs["request_id_holder"] = request_id_holder
+
+        accumulated_text = ""
+        accumulated_raw = ""
+        accumulated_raw_parts: list[str] = []
+        # D-STOP-THINK (PR #799): track the most-recently-surfaced
+        # ``matched_stop`` so the post-loop finalize_streaming call
+        # can distinguish a casual non-thinking answer (None — natural
+        # EOS) from a prompt-injected mid-think truncation (set — a
+        # user-supplied stop string trimmed the output). Mirrors the
+        # ``stream_matched_stop`` accumulator in routes/anthropic.py.
+        stream_matched_stop: str | None = None
+        # D-STOP-THINK codex round-6 BLOCKING (PR #799): track the most
+        # recently observed ``finish_reason`` so the post-loop
+        # ``finalize_streaming`` can pass it to parsers. Parsers gate
+        # on ``finish_reason="length" AND prompt_thinking_active`` to
+        # route prompt-injected ``max_tokens`` truncations to reasoning
+        # (instead of leaking them into content).
+        stream_finish_reason: str | None = None
+        accumulated_structured_tool_calls: list[dict] = []
+        # r6-A R6-C2 codex r1 IMPORTANT: track the last engine-reported
+        # ``finish_reason`` so the post-loop degenerate-output guard can
+        # narrow itself to the ``"length"`` abort signature instead of
+        # firing on every empty / zero-token stream (which would also
+        # cover legitimate immediate-stop / zero-budget /
+        # stop-sequence turns whose ``finish_reason`` is ``"stop"``).
+        last_finish_reason: str | None = None
+        last_response_metrics = None
+        tool_filter = StreamingToolCallFilter()
+
+        # Yuki F6 codex r1 BLOCKING #2 (PR #817): when the request
+        # forces a tool_choice (``required`` or named-function), the
+        # message item MUST NOT be emitted if synthesis fires after
+        # generation — otherwise the client sees both an
+        # ``output_text`` message AND a synthesised tool_call, which
+        # violates the OpenAI Responses ``tool_call-guaranteed``
+        # contract. Solution: buffer text deltas in ``deferred_text``
+        # under forced-choice mode; at end-of-stream, decide to either
+        # flush them (model produced a real tool_call so synthesis won't
+        # fire) or drop them (synthesis will fire — message item is
+        # suppressed entirely). For non-forced choice, the legacy
+        # streaming path is preserved (lazy message-item open on first
+        # delta).
+        _forced_tc = responses_request.tool_choice
+        _forced_choice_active = (
+            openai_request.tools is not None
+            and openai_request.tools
+            and (
+                _forced_tc == "required"
+                or (
+                    isinstance(_forced_tc, dict)
+                    and _forced_tc.get("type") == "function"
+                )
+            )
+        )
+        # DeepSeek-V4 can briefly leave reasoning to announce an action, then
+        # re-enter reasoning before emitting the actual DSML tool call. Once a
+        # Responses message item is opened, that channel transition is
+        # irreversible and Codex rejects the later reasoning item. Buffer
+        # public text for DeepSeek Codex tool turns until generation finishes,
+        # when the complete reasoning/message/tool ordering is known. Ordinary
+        # chat streams and other models retain token-by-token text delivery.
+        _deepseek_defer_public_text = bool(
+            codex_surface
+            and openai_request.tools
+            and openai_request.tool_choice != "none"
+            and cfg.tool_call_parser == "deepseek_v4_0731"
+        )
+        _defer_public_text = _forced_choice_active or _deepseek_defer_public_text
+        # This buffer is bounded by the request's already-resolved scheduler
+        # ``max_tokens`` budget (32K by default for Codex), not by wall time or
+        # context length. Keeping it in memory avoids blocking file I/O and
+        # cancellation-time descriptor cleanup on the async request path.
+        deferred_text: list[str] = []
+
+        def _clear_deferred_text() -> None:
+            deferred_text.clear()
+
+        def _take_deferred_text() -> str:
+            value = "".join(deferred_text)
+            deferred_text.clear()
+            return value
+
+        _tokenizer = engine.tokenizer
+        _chat_template = ""
+        if _tokenizer and hasattr(_tokenizer, "chat_template"):
+            _chat_template = _tokenizer.chat_template or ""
+        _starts_thinking = _should_start_in_thinking(
+            _chat_template,
+            chat_kwargs.get("enable_thinking"),
+            unconditional=cfg.reasoning_parser_name == "deepseek_r1_distill",
+            tools_requested=bool(chat_kwargs.get("tools")),
+        )
+        think_router = StreamingThinkRouter(start_in_thinking=_starts_thinking)
+
+        prompt_tokens = 0
+        completion_tokens = 0
+        cached_tokens = 0
+
+        # R11-B (R11-M-F1): accumulate reasoning text in-stream so we can
+        # emit a ``reasoning`` output item when the engine cuts off
+        # mid-think on ``max_output_tokens``. Pre-fix the streaming path
+        # dropped every reasoning delta on the floor (the v1 Responses
+        # contract used to omit ``response.reasoning_text.delta``) — so
+        # if ``</think>`` never closed within budget the message ladder
+        # never opened and ``response.completed`` shipped with
+        # ``output:[]`` + ``status:"completed"``. The non-streaming path
+        # always surfaced this exact case as a ``reasoning`` item +
+        # ``status:"incomplete"`` via ``openai_to_responses``; this
+        # accumulator + the post-loop emitter below close the cross-path
+        # parity gap.
+        accumulated_reasoning_text = ""
+        reasoning_sanitizer = StreamingReasoningSanitizer()
+        reasoning_stream_seen = False
+
+        def _route_sanitized_reasoning(
+            parts: list[tuple[str, str]],
+        ) -> str:
+            nonlocal accumulated_reasoning_text
+            content_parts: list[str] = []
+            for destination, text in parts:
+                if destination == "reasoning":
+                    accumulated_reasoning_text += text
+                else:
+                    content_parts.append(text)
+            return "".join(content_parts)
+
+        def _append_reasoning(text: str | None) -> str:
+            nonlocal reasoning_stream_seen
+            if text:
+                reasoning_stream_seen = True
+            return _route_sanitized_reasoning(
+                reasoning_sanitizer.process(text, "reasoning")
+            )
+
+        def _sanitize_reasoning_overflow(text: str | None) -> str:
+            return _route_sanitized_reasoning(
+                reasoning_sanitizer.process(text, "reasoning_overflow")
+            )
+
+        def _transition_reasoning_to_content(text: str | None) -> str:
+            return _route_sanitized_reasoning(
+                reasoning_sanitizer.transition_to_content(text)
+            )
+
+        def _flush_reasoning_sanitizer() -> str:
+            return _route_sanitized_reasoning(reasoning_sanitizer.flush())
+
+        terminal_reasoning_sidecar_seen = False
+
+        # R11-B codex r7 BLOCKING: track an explicit "reasoning closed"
+        # signal — set only when the parser/router emits a TRUE content
+        # channel chunk (NOT reasoning-cap overflow reclassified into
+        # content via ``_account_for_reasoning``). Pre-fix the mid-think
+        # gate derived this from ``accumulated_text``, but overflow
+        # bytes ALSO land in ``accumulated_text``, so a mid-think
+        # length cutoff after a reasoning-cap overflow could be
+        # misclassified as a downstream-output completion. This flag
+        # plus ``tool_calls`` is the precise signal.
+        reasoning_block_closed = False
+
+        # Lazy message-item state. We do NOT emit the message
+        # output_item.added until we have actual user-facing text to stream
+        # — a turn that is pure tool_calls should not emit a phantom empty
+        # message item.
+        message_item_id: str | None = None
+        message_output_index: int | None = None
+        message_open = False
+        # R10-C3: track whether the ``output_text`` content_part has been
+        # opened so the streaming sequence emits ``response.content_part.added``
+        # exactly once per message item — required by the OpenAI Responses
+        # SSE spec between ``output_item.added`` and the first
+        # ``output_text.delta``. Without it, the openai-python SDK's
+        # ``AsyncResponseStream`` fails to materialize the output_text
+        # part and the final ``response.completed`` consumer raises.
+        content_part_open = False
+
+        # R12-M3 (Mira r12 dogfood, R-4): the OpenAI Responses SSE spec
+        # requires "leading" items (``reasoning``, and any pre-message
+        # tool-call/function-call items) to land on the wire BEFORE the
+        # ``message`` item — even when the leading item is empty. Pre-fix
+        # the streaming surface emitted the ``reasoning`` item AFTER the
+        # message item in the post-loop block, so SDK clients that index
+        # the stream by item order saw ``message`` first and either
+        # discarded the late ``reasoning`` event or rejected the stream as
+        # malformed. The OpenAI reference implementation always emits a
+        # ``reasoning`` item (possibly with empty ``summary``) before the
+        # first ``message`` item, so we match that contract here.
+        #
+        # Mechanism: pre-allocate the reasoning item id + index, then have
+        # ``_open_message_item`` flush the leading reasoning ``added`` event
+        # FIRST so the message ``added`` event always lands at a strictly
+        # later index. The post-loop reasoning emitter then ships only the
+        # ``done`` event (with the accumulated chain-of-thought) instead of
+        # the full added → done pair. When the turn has neither a message
+        # item nor any reasoning text (pure-tool-call shape), the leading
+        # reasoning item is suppressed to keep the non-stream parity:
+        # the non-stream ``openai_to_responses`` shim only emits a
+        # ``reasoning`` item when reasoning text exists.
+        reasoning_item_id: str | None = None
+        reasoning_output_index: int | None = None
+        # Whether the leading reasoning ``added`` event has been emitted.
+        # Set by ``_emit_pending_leading_items`` (called from
+        # ``_open_message_item``) so the post-loop reasoning emitter
+        # knows whether it still needs to ship ``added`` or only ``done``.
+        reasoning_item_added = False
+        reasoning_item_finalized = False
+        reasoning_item_payload_done: dict | None = None
+
+        # Per-request reasoning parser instance (matches anthropic.py).
+        reasoning_parser = None
+        if cfg.reasoning_parser_name:
+            try:
+                from ..reasoning import get_parser
+
+                reasoning_parser = get_parser(cfg.reasoning_parser_name)()
+            except Exception:
+                pass
+        if (
+            chat_kwargs.get("enable_thinking") is False
+            and getattr(reasoning_parser, "sanitize_when_thinking_disabled", False)
+            is not True
+        ):
+            reasoning_parser = None
+        if reasoning_parser:
+            configure_request = getattr(reasoning_parser, "configure_request", None)
+            if callable(configure_request):
+                configure_kwargs = {
+                    "enable_thinking": chat_kwargs.get("enable_thinking")
+                }
+                if getattr(reasoning_parser, "implicit_reasoning_until_close", False):
+                    configure_kwargs["prompt_thinking_active"] = (
+                        _should_start_in_thinking(
+                            getattr(
+                                getattr(engine, "tokenizer", None), "chat_template", ""
+                            )
+                            or "",
+                            chat_kwargs.get("enable_thinking"),
+                            unconditional=True,
+                            tools_requested=bool(chat_kwargs.get("tools")),
+                        )
+                    )
+                configure_parameters: Mapping[str, inspect.Parameter] = (
+                    inspect.signature(configure_request).parameters
+                )
+                if "json_mode" in configure_parameters:
+                    configure_kwargs["json_mode"] = _is_structured_output_requested(
+                        getattr(openai_request, "response_format", None)
+                    )
+                configure_request(**configure_kwargs)
+            else:
+                reasoning_parser.reset_state()
+
+        reasoning_close_marker = "</think>"
+        if reasoning_parser is not None:
+            configured_marker = getattr(
+                reasoning_parser, "reasoning_end_str", None
+            ) or getattr(reasoning_parser, "end_token", None)
+            if isinstance(configured_marker, str) and configured_marker:
+                reasoning_close_marker = configured_marker
+
+        def _prepare_forced_reasoning_end() -> None:
+            prepare = getattr(reasoning_parser, "prepare_forced_reasoning_end", None)
+            if callable(prepare):
+                prepare()
+
+        # Per-request reasoning cap (upstream vLLM PR #20859 backport).
+        # Responses SSE drops reasoning to the floor (Codex doesn't read
+        # ``response.reasoning_text.delta`` in v1) so the cap's primary
+        # job here is to RECLASSIFY: once the budget is exhausted, any
+        # further reasoning bytes become ``response.output_text.delta``
+        # so the user actually sees a reply instead of an infinite
+        # silent thinking block.
+        _reasoning_cap = getattr(responses_request, "reasoning_max_tokens", None)
+        _reasoning_tokens_emitted = 0
+        _reasoning_cap_hit = False
+        _reasoning_close_injected = False
+
+        def _account_for_reasoning(text: str) -> tuple[str, str, bool]:
+            """Returns ``(kept_reasoning, overflow_content, just_hit)``.
+
+            Codex round-12 BLOCKING #2: cumulative-CHARACTER accounting
+            against ``cap * 4`` (not per-chunk ceiling). The earlier
+            ``max(1, ceil(len/4))`` made fragmented reasoning deltas
+            consume more tokens than the same contiguous text, so the
+            cap fired at different points depending only on SSE chunk
+            boundaries. Now identical model output hits the cap at the
+            same character offset regardless of chunking — matches
+            ``helpers._apply_reasoning_cap`` (non-stream) AND the
+            postprocessor's cumulative-char path.
+
+            The shared ``_reasoning_tokens_emitted`` counter now holds
+            CHARACTERS post-round-12 (name kept for back-compat). The
+            cap *4 limit lives in ``_reasoning_max_chars`` captured
+            from the request via the enclosing closure.
+            """
+            nonlocal _reasoning_tokens_emitted, _reasoning_cap_hit
+            if _reasoning_cap is None or not text:
+                return text, "", False
+            if _reasoning_cap_hit:
+                return "", text, False
+            max_chars = _reasoning_cap * 4
+            new_total_chars = _reasoning_tokens_emitted + len(text)
+            if new_total_chars < max_chars:
+                _reasoning_tokens_emitted = new_total_chars
+                return text, "", False
+            if new_total_chars == max_chars:
+                # Exact-boundary latch (codex round-2 BLOCKING #3).
+                _reasoning_tokens_emitted = new_total_chars
+                _reasoning_cap_hit = True
+                return text, "", True
+            remaining_chars = max_chars - _reasoning_tokens_emitted
+            keep_chars = max(0, remaining_chars)
+            _reasoning_tokens_emitted = max_chars
+            _reasoning_cap_hit = True
+            return text[:keep_chars], text[keep_chars:], True
+
+        def _emit_pending_leading_items() -> list[str]:
+            """Emit any "leading" output items that MUST land before the
+            message item per the OpenAI Responses SSE spec.
+
+            Today the only leading item is ``reasoning`` (Mira r12 R-4:
+            even when the model produced no reasoning text, the canonical
+            /v1/responses surface emits an empty ``reasoning`` item BEFORE
+            the message). Future leading-item kinds (e.g. pre-message
+            ``function_call`` items for parallel tool calls) hook in here.
+
+            Idempotent: subsequent calls return ``[]`` once the leading
+            items have been emitted. The reasoning ``done`` event is shipped
+            from the post-loop emitter with the accumulated chain-of-thought,
+            so this helper only opens the item (status="in_progress",
+            summary=[]).
+            """
+            nonlocal reasoning_item_id, reasoning_output_index, reasoning_item_added
+            events: list[str] = []
+            if not reasoning_item_added:
+                reasoning_item_id = _item_id("reasoning", "rs")
+                # Leading items occupy the lowest output indices. The
+                # message item (and any post-message tool_call items)
+                # take strictly later indices, computed in
+                # ``_open_message_item`` and the tool_call loop.
+                reasoning_output_index = 0
+                reasoning_item_added = True
+                events.append(
+                    _emit(
+                        "response.output_item.added",
+                        {
+                            "type": "response.output_item.added",
+                            "output_index": reasoning_output_index,
+                            "item": {
+                                "type": "reasoning",
+                                "id": reasoning_item_id,
+                                "status": "in_progress",
+                                "summary": [],
+                            },
+                        },
+                    )
+                )
+            return events
+
+        def _close_reasoning_before_message() -> list[str]:
+            """Close the active reasoning ladder before opening a message.
+
+            Codex's Responses stream reducer tracks one active output item.
+            Interleaving ``reasoning added -> message added/done -> reasoning
+            summary/done`` loses the reasoning item and produces
+            ``ReasoningSummaryPartAdded without active item``.  Once public
+            content arrives the reasoning phase is necessarily complete, so
+            its summary can be finalized immediately and contiguously.
+            """
+            nonlocal reasoning_item_finalized, reasoning_item_payload_done
+            if reasoning_item_finalized or not reasoning_item_added:
+                return []
+            assert reasoning_item_id is not None
+            assert reasoning_output_index is not None
+
+            events: list[str] = []
+            summary = []
+            if accumulated_reasoning_text:
+                summary_part = {
+                    "type": "summary_text",
+                    "text": accumulated_reasoning_text,
+                }
+                events.extend(
+                    [
+                        _emit(
+                            "response.reasoning_summary_part.added",
+                            {
+                                "type": "response.reasoning_summary_part.added",
+                                "item_id": reasoning_item_id,
+                                "output_index": reasoning_output_index,
+                                "summary_index": 0,
+                                "part": {"type": "summary_text", "text": ""},
+                            },
+                        ),
+                        _emit(
+                            "response.reasoning_summary_text.delta",
+                            {
+                                "type": "response.reasoning_summary_text.delta",
+                                "item_id": reasoning_item_id,
+                                "output_index": reasoning_output_index,
+                                "summary_index": 0,
+                                "delta": accumulated_reasoning_text,
+                            },
+                        ),
+                        _emit(
+                            "response.reasoning_summary_text.done",
+                            {
+                                "type": "response.reasoning_summary_text.done",
+                                "item_id": reasoning_item_id,
+                                "output_index": reasoning_output_index,
+                                "summary_index": 0,
+                                "text": accumulated_reasoning_text,
+                            },
+                        ),
+                        _emit(
+                            "response.reasoning_summary_part.done",
+                            {
+                                "type": "response.reasoning_summary_part.done",
+                                "item_id": reasoning_item_id,
+                                "output_index": reasoning_output_index,
+                                "summary_index": 0,
+                                "part": summary_part,
+                            },
+                        ),
+                    ]
+                )
+                summary = [summary_part]
+
+            reasoning_item_payload_done = {
+                "type": "reasoning",
+                "id": reasoning_item_id,
+                "status": "completed",
+                "summary": summary,
+            }
+            events.append(
+                _emit(
+                    "response.output_item.done",
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": reasoning_output_index,
+                        "item": reasoning_item_payload_done,
+                    },
+                )
+            )
+            reasoning_item_finalized = True
+            return events
+
+        async def _open_message_item() -> list[str]:
+            """Emit response.output_item.added + response.content_part.added.
+
+            Returns the event strings so callers can yield them in order.
+            The bookkeeping for ``message_open`` / ``content_part_open``
+            lives here so the open/close pair stays symmetric.
+
+            R10-C3 / Yuki F8: the OpenAI Responses SSE spec puts
+            ``response.content_part.added`` between the message item-added
+            event and the first text delta. Pre-fix this event was missing;
+            the openai-python SDK's ``AsyncResponseStreamManager`` therefore
+            never materialized the ``output_text`` content part and the
+            terminal ``response.completed`` consumer raised on missing state.
+
+            R12-M3 (Mira r12 R-4): leading items (currently just
+            ``reasoning``) MUST be flushed BEFORE the message ``added``
+            event. The ``_emit_pending_leading_items`` call below is the
+            ordering-invariant fix — the message item's wire ``output_index``
+            is computed AFTER any leading items have been claimed, so the
+            indices stay monotonically consistent with the terminal
+            ``response.completed.response.output[]`` array.
+            """
+            nonlocal \
+                message_item_id, \
+                message_output_index, \
+                message_open, \
+                content_part_open
+            # Flush any leading items first — the ordering invariant.
+            leading_events = _emit_pending_leading_items()
+            leading_events.extend(_close_reasoning_before_message())
+            message_item_id = _item_id("message", "msg")
+            # Leading-item count drives the message's output_index. Today
+            # the only leading item is reasoning (index 0 when emitted), so
+            # the message lands at index 1; pre-fix (and when no leading
+            # items ship, e.g. nothing else to come) it stays at 0. The
+            # latter never happens in the lazy-open path today but the
+            # arithmetic stays correct if a future leading-item kind opts
+            # out of emission.
+            message_output_index = 1 if reasoning_item_added else 0
+            message_open = True
+            content_part_open = True
+            return [
+                *leading_events,
+                _emit(
+                    "response.output_item.added",
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": message_output_index,
+                        "item": {
+                            "type": "message",
+                            "id": message_item_id,
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": [],
+                        },
+                    },
+                ),
+                _emit(
+                    "response.content_part.added",
+                    {
+                        "type": "response.content_part.added",
+                        "item_id": message_item_id,
+                        "output_index": message_output_index,
+                        "content_index": 0,
+                        "part": {
+                            "type": "output_text",
+                            "text": "",
+                            "annotations": [],
+                        },
+                    },
+                ),
+            ]
+
+        async def _emit_text_delta(delta: str) -> AsyncIterator[str]:
+            """Yield the message item-added event (lazily) + a text delta.
+
+            Under forced-choice mode (Yuki F6 codex r1 BLOCKING #2), the
+            delta is BUFFERED in ``deferred_text`` instead of being
+            yielded — final flush decision happens after the engine
+            stream completes and we know whether synthesis is needed.
+            """
+            nonlocal accumulated_text
+            if not delta:
+                return
+            if _defer_public_text:
+                deferred_text.append(delta)
+                return
+            if not message_open:
+                for ev in await _open_message_item():
+                    yield ev
+            accumulated_text += delta
+            yield _emit(
+                "response.output_text.delta",
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": message_item_id,
+                    "output_index": message_output_index,
+                    "content_index": 0,
+                    "delta": delta,
+                    # R10-C3: openai-python ``ResponseTextDeltaEvent`` marks
+                    # ``logprobs`` as required. The Responses lane doesn't
+                    # surface logprobs (Codex CLI doesn't render them) so
+                    # always emit an empty array — spec-compliant absent.
+                    "logprobs": [],
+                },
+            )
+
+        async def _emit_reasoning_fragment(text: str | None) -> AsyncIterator[str]:
+            released_content = _append_reasoning(text)
+            if not released_content:
+                return
+            content = strip_special_tokens(released_content)
+            if not content:
+                return
+            filtered = tool_filter.process(content)
+            if filtered:
+                async for ev in _emit_text_delta(filtered):
+                    yield ev
+
+        async def _flush_deferred_text_if_no_synthesis(
+            will_synthesise: bool,
+        ) -> AsyncIterator[str]:
+            """Forced-choice deferred-text resolution (codex r1 BLOCKING #2).
+
+            Called after the model finished and we know whether
+            ``_enforce_responses_tool_choice`` will synthesise. If
+            synthesis WILL fire, the deferred text is dropped (and the
+            message item never opens — no spurious assistant content
+            ships before the tool_call). If synthesis won't fire (the
+            model returned a real tool_call, or no forced choice was
+            set), the buffered deltas are emitted as a single
+            ``output_text.delta`` so the client still sees the
+            assistant's actual text content.
+            """
+            nonlocal accumulated_text
+            if will_synthesise:
+                _clear_deferred_text()
+                return
+            joined = _take_deferred_text()
+            if not joined:
+                return
+            if not message_open:
+                for ev in await _open_message_item():
+                    yield ev
+            accumulated_text += joined
+            yield _emit(
+                "response.output_text.delta",
+                {
+                    "type": "response.output_text.delta",
+                    "item_id": message_item_id,
+                    "output_index": message_output_index,
+                    "content_index": 0,
+                    "delta": joined,
+                    # R10-C3: openai-python ``ResponseTextDeltaEvent`` marks
+                    # ``logprobs`` as required. The Responses lane doesn't
+                    # surface logprobs (Codex CLI doesn't render them) so
+                    # always emit an empty array — spec-compliant absent.
+                    "logprobs": [],
+                },
+            )
+
+        from rapid_mlx.telemetry import inference as _telemetry_inference
+
+        engine_stream = _telemetry_inference.emit_failed_on_stream_error(
+            engine.stream_chat(messages=messages, **chat_kwargs),
+            model=served_telemetry_id or "<custom>",
+            endpoint="/v1/responses",
+            caller_agent=caller_agent,
+            caller_client=caller_client,
+            failure_latch=telemetry_failure_emitted,
+        )
+        async for output in engine_stream:
+            delta_text = output.new_text
+            # Accumulate the RAW model output (pre-filter, pre-router) so the
+            # post-loop tool_call parser can see `<tool_call>...</tool_call>`
+            # XML that tool_filter rightly suppresses from the user-facing
+            # text channel. Without this, `accumulated_text` is empty in the
+            # tool-calling case and no `response.function_call` SSE event
+            # gets emitted — Codex sees turn.completed with zero output
+            # items and the agent loop silently ends. The chat-completions
+            # route avoids this by parsing `output.text` (the full
+            # non-streamed text) directly; the streaming path needs an
+            # explicit raw accumulator.
+            # D-STOP-THINK matched_stop accumulator (PR #799).
+            _chunk_matched_stop = getattr(output, "matched_stop", None)
+            if _chunk_matched_stop:
+                stream_matched_stop = _chunk_matched_stop
+            # D-STOP-THINK finish_reason accumulator (codex round-6, PR #799).
+            _chunk_finish_reason = getattr(output, "finish_reason", None)
+            if _chunk_finish_reason:
+                stream_finish_reason = _chunk_finish_reason
+
+            if hasattr(output, "prompt_tokens") and output.prompt_tokens:
+                prompt_tokens = output.prompt_tokens
+            if hasattr(output, "completion_tokens") and output.completion_tokens:
+                completion_tokens = output.completion_tokens
+            if hasattr(output, "cached_tokens") and output.cached_tokens:
+                cached_tokens = output.cached_tokens
+            # r6-A R6-C2: capture the most-recent ``finish_reason`` from
+            # the engine stream so the post-loop degenerate-output guard
+            # can narrow itself to the ``"length"`` abort signature.
+            _frx = getattr(output, "finish_reason", None)
+            if _frx is not None:
+                last_finish_reason = _frx
+            chunk_is_terminal = bool(getattr(output, "finished", False) or _frx)
+            if chunk_is_terminal:
+                last_response_metrics = _build_response_metrics(output)
+
+            terminal_reasoning_text = getattr(output, "reasoning_text", "")
+            if terminal_reasoning_text:
+                # Treat terminal ``reasoning_text`` as a hidden sidecar:
+                # it proves the model generated reasoning before stopping,
+                # but it is not a safe public summary. Parser/channel
+                # reasoning deltas accumulated below remain the only text
+                # we expose in ``reasoning.summary``.
+                terminal_reasoning_sidecar_seen = True
+            terminal_raw_text = getattr(output, "raw_text", "")
+            if chunk_is_terminal and terminal_raw_text:
+                accumulated_raw_parts.append(terminal_raw_text)
+
+            engine_tool_calls = getattr(output, "tool_calls", None) or []
+            if engine_tool_calls:
+                accumulated_structured_tool_calls.extend(engine_tool_calls)
+                continue
+
+            if not delta_text:
+                continue
+
+            # Channel-routed engines (harmony / gemma4) — honor the
+            # channel directly. ``reasoning`` channel drops here
+            # because Responses-API streams don't have a reasoning
+            # delta event Codex parses (Codex maps it from a separate
+            # ``response.reasoning_text.delta`` we omit in v1).
+            output_channel = getattr(output, "channel", None)
+            if output_channel is not None:
+                if output_channel in ("content", "tool_call", "reasoning"):
+                    accumulated_raw_parts.append(delta_text)
+                if output_channel == "content":
+                    # R11-B codex r7 BLOCKING: a TRUE content chunk
+                    # proves the model left the ``<think>`` block —
+                    # this is the precise signal the mid-think gate
+                    # needs (NOT ``accumulated_text`` which can include
+                    # reasoning overflow reclassified via
+                    # _account_for_reasoning below).
+                    reasoning_block_closed = True
+                    content = strip_special_tokens(
+                        _transition_reasoning_to_content(delta_text)
+                    )
+                    if content:
+                        filtered = tool_filter.process(content)
+                        if filtered:
+                            async for ev in _emit_text_delta(filtered):
+                                yield ev
+                elif output_channel == "tool_call":
+                    # #591 HIGH (item 2): tool_call channel bytes are
+                    # tool-call argument JSON, NOT assistant-visible
+                    # text. The earlier code routed them through
+                    # ``_emit_text_delta``, which works today only
+                    # because every channel-emitting engine (harmony /
+                    # gemma4) populates ``output.tool_calls`` with
+                    # structured calls — the ``engine_tool_calls``
+                    # branch above ``continue``s before we reach here.
+                    # If a future channel-emitting engine ever surfaces
+                    # tool args through the channel itself (without the
+                    # structured ``output.tool_calls`` sidecar), those
+                    # JSON bytes would leak into the assistant message
+                    # as raw text. Drop them from the wire here; the
+                    # post-loop ``_parse_tool_calls_with_parser`` reads
+                    # ``accumulated_raw`` (populated above) so the
+                    # text-parser fallback still recovers the call.
+                    # Mid-think gate still flips — leaving the thinking
+                    # block to emit a tool call still counts as "left
+                    # ``<think>``".
+                    reasoning_block_closed = True
+                elif output_channel == "reasoning":
+                    # R11-B (R11-M-F1): accumulate reasoning text for the
+                    # post-loop ``reasoning`` output-item emitter so
+                    # ``max_output_tokens`` cut-offs during the think
+                    # phase ship a populated ``output[]`` array instead
+                    # of an empty one. Cap reclassification still wins
+                    # over accumulation for overflow bytes (those leave
+                    # as ``content`` per the original contract).
+                    kept_reasoning, overflow, _ = _account_for_reasoning(delta_text)
+                    if kept_reasoning:
+                        async for ev in _emit_reasoning_fragment(kept_reasoning):
+                            yield ev
+                    # Reasoning-cap reclassification: once the per-request
+                    # cap fires, route the overflow portion of this and
+                    # every subsequent reasoning chunk to ``content`` so
+                    # the user actually sees a reply instead of an
+                    # unending silent reasoning stream. Without the cap
+                    # the chunk drops as before (v1 Responses contract).
+                    if overflow:
+                        content = strip_special_tokens(
+                            _sanitize_reasoning_overflow(overflow)
+                        )
+                        if content:
+                            filtered = tool_filter.process(content)
+                            if filtered:
+                                async for ev in _emit_text_delta(filtered):
+                                    yield ev
+                # ``reasoning`` and unknown channels are dropped for v1.
+                continue
+
+            accumulated_raw_parts.append(delta_text)
+
+            if reasoning_parser:
+                # Keep ``accumulated_raw`` to real model output only.
+                # ``previous_raw`` is the already-accepted prefix;
+                # ``parser_current`` may locally include a synthetic
+                # close marker for cap handling, but that marker never
+                # enters the shared raw buffer.
+                previous_raw = accumulated_raw
+                # Text-parser path: once the cap fires, splice ``</think>``
+                # in front of the next chunk so the parser flips to
+                # content. Idempotent — only fires once per request.
+                #
+                # Codex round-9 BLOCKING #2: the earlier
+                # ``accumulated_raw = previous_raw + delta_text`` (where
+                # ``delta_text`` had been mutated to start with
+                # ``</think>``) wrote the forged marker INTO the shared
+                # buffer. The terminal injection path then re-parsed
+                # that mutated buffer via ``finalize_streaming``,
+                # potentially mis-classifying the synthetic bytes.
+                # Fix: keep ``accumulated_raw`` to real model output
+                # only (the original ``delta_text`` was already
+                # appended above), and build a LOCAL ``parser_current``
+                # for the parser call that includes the synthetic
+                # marker. The parser sees ``previous + "</think>" +
+                # original``; the shared buffer holds ``previous +
+                # original``.
+                # Codex round-10 BLOCKING #2: only flip the close-
+                # injected latch AFTER the parser call succeeds. The
+                # earlier draft flipped before the call, so a parser
+                # exception on the injection-carrying chunk left the
+                # latch set and the next chunk would skip injection —
+                # leaving the parser permanently mid-think.
+                injected_this_chunk = False
+                if _reasoning_cap_hit and not _reasoning_close_injected:
+                    _prepare_forced_reasoning_end()
+                    parser_delta_text = reasoning_close_marker + delta_text
+                    parser_current = previous_raw + parser_delta_text
+                    injected_this_chunk = True
+                else:
+                    parser_delta_text = delta_text
+                    parser_current = previous_raw + delta_text
+                # Compatibility path: reasoning parsers still consume
+                # the legacy ``previous + delta == current`` API. This
+                # cumulative concat remains O(n^2) for active
+                # reasoning_parser streams; the list buffer above only
+                # fixes the no-reasoning hot path and final parse.
+                accumulated_raw = previous_raw + delta_text
+                delta_msg = reasoning_parser.extract_reasoning_streaming(
+                    previous_raw, parser_current, parser_delta_text
+                )
+                if injected_this_chunk:
+                    # Parser call succeeded with the synthetic marker
+                    # — latch so subsequent chunks don't re-inject.
+                    _reasoning_close_injected = True
+                if delta_msg is None:
+                    continue
+                raw_overflow_content = ""
+                # R11-B codex r7 BLOCKING: latch the close signal from
+                # the PARSER'S OWN content output (i.e. ``delta_msg.content``
+                # populated by ``extract_reasoning_streaming`` BEFORE any
+                # cap-overflow promotion below). When the parser emits
+                # content, the model has formally left ``<think>`` —
+                # exactly the signal the mid-think gate needs.
+                # Reasoning-cap overflow that the route REPACKAGES as
+                # content (lines 1859/1867) is NOT this signal; that's
+                # routed through ``_emit_text_delta`` and lands in
+                # ``accumulated_text``, but the parser may still be
+                # mid-think (overflow only flips on successful
+                # ``</think>`` injection).
+                if delta_msg.content:
+                    reasoning_block_closed = True
+                if delta_msg.reasoning:
+                    # Account for reasoning bytes against the per-request
+                    # cap. Overflow is whatever crossed the budget mid-
+                    # chunk; it must NOT be promoted to content until the
+                    # parser has formally transitioned out of thinking,
+                    # otherwise (codex round-7 BLOCKING #2) clients see
+                    # ``response.output_text.delta`` while the parser
+                    # state is still logically inside reasoning. Force
+                    # the parser flip in THIS same chunk by re-running
+                    # the streaming extractor with a synthetic
+                    # ``</think>`` delta against a locally-built
+                    # ``current`` (don't mutate ``accumulated_raw`` —
+                    # the round-6 local-buffer invariant applies here
+                    # too).
+                    kept_reasoning, overflow, _ = _account_for_reasoning(
+                        delta_msg.reasoning
+                    )
+                    # R11-B (R11-M-F1): also accumulate the parser-routed
+                    # reasoning text so the post-loop reasoning emitter
+                    # has something to ship when the engine cuts off
+                    # mid-think under ``max_output_tokens``.
+                    if kept_reasoning:
+                        async for ev in _emit_reasoning_fragment(kept_reasoning):
+                            yield ev
+                    flip_succeeded = _reasoning_close_injected
+                    if overflow and not _reasoning_close_injected:
+                        # Codex round-10 BLOCKING #2: flip the latch
+                        # AFTER success only — if the parser raises,
+                        # next chunk retries the forced transition.
+                        # Codex round-13 BLOCKING #2: position the
+                        # synthetic ``</think>`` AT THE CAP BOUNDARY
+                        # (not after the full over-budget chunk).
+                        # ``previous_raw`` is the buffer before THIS
+                        # delta arrived; ``previous_raw +
+                        # kept_reasoning`` represents the model output
+                        # up to the cap firing point. Without the
+                        # boundary positioning, stateful parsers
+                        # would see ``</think>`` AFTER the over-budget
+                        # bytes and potentially mis-classify them.
+                        flip_previous = previous_raw + kept_reasoning
+                        flip_delta = reasoning_close_marker
+                        flip_current = flip_previous + flip_delta
+                        try:
+                            _prepare_forced_reasoning_end()
+                            flip_msg = reasoning_parser.extract_reasoning_streaming(
+                                flip_previous, flip_current, flip_delta
+                            )
+                            _reasoning_close_injected = True
+                            flip_succeeded = True
+                        except Exception as e:
+                            # Codex round-8 BLOCKING #2: when the flip
+                            # raises, the parser may still be mid-think.
+                            # Emitting ``overflow`` here would leak
+                            # reasoning bytes onto the wire as
+                            # ``response.output_text.delta`` even though
+                            # the parser hasn't transitioned. Suppress
+                            # overflow on flip failure; log so operators
+                            # can see the parser bug. Worst case the
+                            # client sees a slightly-truncated response,
+                            # strictly preferable to mixing reasoning
+                            # into content under a failed transition.
+                            logger.warning(
+                                "responses in-chunk close-marker flip raised "
+                                "on %r: %s — parser state may stay mid-think; "
+                                "suppressing %d-byte overflow on this chunk "
+                                "to avoid leaking reasoning bytes as content",
+                                type(reasoning_parser).__name__,
+                                e,
+                                len(overflow),
+                            )
+                            flip_msg = None
+                        # Whatever content the flip released stays
+                        # ahead of the overflow bytes on the wire
+                        # (parser-derived content first, cap-overflow
+                        # bytes second).
+                        flip_content = (
+                            getattr(flip_msg, "content", None)
+                            if flip_msg is not None
+                            else None
+                        )
+                        if isinstance(flip_content, str) and flip_content:
+                            delta_msg.content = (delta_msg.content or "") + flip_content
+                    if overflow and flip_succeeded:
+                        # Safe to promote overflow: either the flip
+                        # this iteration succeeded, OR the parser
+                        # already transitioned on a PRIOR chunk
+                        # (``_reasoning_close_injected`` was already
+                        # True on entry, captured in ``flip_succeeded``
+                        # via the initial assignment above).
+                        raw_overflow_content = overflow
+                if delta_msg.content:
+                    content = strip_special_tokens(
+                        _transition_reasoning_to_content(delta_msg.content)
+                    )
+                    if content:
+                        filtered = tool_filter.process(content)
+                        if filtered:
+                            async for ev in _emit_text_delta(filtered):
+                                yield ev
+                if raw_overflow_content:
+                    sanitized_overflow_content = _sanitize_reasoning_overflow(
+                        raw_overflow_content
+                    )
+                    content = strip_special_tokens(sanitized_overflow_content)
+                    if content:
+                        filtered = tool_filter.process(content)
+                        if filtered:
+                            async for ev in _emit_text_delta(filtered):
+                                yield ev
+                # delta_msg.reasoning routed to ``accumulated_reasoning_text``
+                # above (R11-B). The bytes are NOT emitted as wire deltas in
+                # v1 (Codex CLI doesn't render ``response.reasoning_text.delta``),
+                # but they ARE preserved so the terminal ``response.completed``
+                # event ships a populated ``reasoning`` output item under
+                # ``max_output_tokens`` cutoffs.
+                continue
+
+            # Default path: text-only stream with think_router stripping
+            # ``<think>...</think>`` from the text channel.
+            content = strip_special_tokens(delta_text)
+            if not content:
+                continue
+            filtered = tool_filter.process(content)
+            if not filtered:
+                continue
+            pieces = think_router.process(filtered)
+            for block_type, piece in pieces:
+                if block_type == "text" and piece:
+                    # R11-B codex r7 BLOCKING: think_router routes
+                    # post-``</think>`` bytes to the "text" block —
+                    # that's the close signal for this path.
+                    reasoning_block_closed = True
+                    piece = _transition_reasoning_to_content(piece)
+                    async for ev in _emit_text_delta(piece):
+                        yield ev
+                elif block_type == "thinking" and piece:
+                    # R11-B (R11-M-F1): accumulate so the post-loop
+                    # reasoning-item emitter has bytes to ship under
+                    # ``max_output_tokens`` cutoffs. Same rationale as
+                    # the reasoning_parser path above.
+                    async for ev in _emit_reasoning_fragment(piece):
+                        yield ev
+
+        # Flush filters
+        remaining = tool_filter.flush()
+        if remaining:
+            if reasoning_parser:
+                remaining = _transition_reasoning_to_content(remaining)
+                async for ev in _emit_text_delta(remaining):
+                    yield ev
+            else:
+                for block_type, piece in think_router.process(remaining):
+                    if block_type == "text" and piece:
+                        # R11-B codex r7 BLOCKING: see in-loop branch.
+                        reasoning_block_closed = True
+                        piece = _transition_reasoning_to_content(piece)
+                        async for ev in _emit_text_delta(piece):
+                            yield ev
+                    elif block_type == "thinking" and piece:
+                        # R11-B: same rationale as the in-loop think_router
+                        # branch above — preserve mid-think bytes for the
+                        # terminal reasoning output item.
+                        async for ev in _emit_reasoning_fragment(piece):
+                            yield ev
+
+        if not reasoning_parser:
+            for block_type, piece in think_router.flush():
+                if block_type == "text" and piece:
+                    # R11-B codex r7 BLOCKING: see in-loop branch.
+                    reasoning_block_closed = True
+                    piece = _transition_reasoning_to_content(piece)
+                    async for ev in _emit_text_delta(piece):
+                        yield ev
+                elif block_type == "thinking" and piece:
+                    # R11-B: same rationale as the in-loop think_router
+                    # branch above.
+                    async for ev in _emit_reasoning_fragment(piece):
+                        yield ev
+
+        # Codex round-3 BLOCKING #3: if the reasoning cap latched on the
+        # last engine chunk of the stream (terminal exact-boundary case
+        # OR the model stopped immediately after overflow), the
+        # ``</think>`` close marker was never spliced into the parser —
+        # so any held content past the cap stays buffered and the
+        # client sees a silent reasoning-only response with no
+        # ``output_text.delta`` ever emitted. Force the injection here
+        # so a terminal cap-hit flips the parser to content and any
+        # trailing bytes are promoted to ``response.output_text.delta``.
+        # Idempotent via ``_reasoning_close_injected``.
+        terminal_injection_attempted = False
+        if accumulated_raw_parts and not accumulated_raw:
+            accumulated_raw = "".join(accumulated_raw_parts)
+
+        if (
+            reasoning_parser is not None
+            and _reasoning_cap_hit
+            and not _reasoning_close_injected
+        ):
+            _reasoning_close_injected = True
+            terminal_injection_attempted = True
+            # Codex round-6 BLOCKING #2: build the parser's
+            # ``current`` argument LOCALLY rather than mutating the
+            # shared ``accumulated_raw``. If the injection produces no
+            # content (no held bytes / parser early-returns), the
+            # subsequent ``finalize_streaming(accumulated_raw)`` would
+            # otherwise re-parse a buffer that ends with the synthetic
+            # ``</think>`` marker and could mis-classify the forged
+            # bytes as model output. Symmetric with the postprocessor
+            # fix in service/postprocessor.py.
+            previous_raw = accumulated_raw
+            injected_delta = reasoning_close_marker
+            local_current = previous_raw + injected_delta
+            try:
+                _prepare_forced_reasoning_end()
+                final_inject = reasoning_parser.extract_reasoning_streaming(
+                    previous_raw, local_current, injected_delta
+                )
+            except Exception as e:
+                # Codex round-5 BLOCKING #3: an earlier draft emitted a
+                # diagnostic string ``"[reasoning cap hit — parser
+                # flush failed]"`` as ``response.output_text.delta``,
+                # which fabricates assistant content from an INTERNAL
+                # server failure — clients see an "answer" that the
+                # model never produced. Log the parser failure and
+                # leave the assistant content empty. The route's
+                # existing 5xx / disconnect-guard semantics handle
+                # truly catastrophic failures upstream; a single
+                # reasoning-cap parser bug must not invent text.
+                logger.warning(
+                    "responses terminal close-marker injection raised on %r: %s — "
+                    "trailing reasoning content (if any) will not be "
+                    "promoted to output_text.delta for this request",
+                    type(reasoning_parser).__name__,
+                    e,
+                )
+                final_inject = None
+            if final_inject is not None and getattr(final_inject, "content", None):
+                content = strip_special_tokens(
+                    _transition_reasoning_to_content(final_inject.content)
+                )
+                if content:
+                    filtered = tool_filter.process(content)
+                    if filtered:
+                        async for ev in _emit_text_delta(filtered):
+                            yield ev
+
+        # Codex round-4 BLOCKING #1 + round-6 BLOCKING #2: when the
+        # terminal injection above ran at all (whether or not it
+        # produced content), skip the parser's non-stream finalize
+        # pass. Two distinct hazards:
+        #
+        #   1. Injection emitted content — running ``finalize_streaming``
+        #      next would re-emit the SAME bytes the streaming
+        #      extraction just released (qwen3 / deepseek parsers'
+        #      ``finalize_streaming`` re-parses the whole accumulated
+        #      buffer and can't distinguish already-streamed from
+        #      still-held content).
+        #   2. Injection produced no content — the parser already had
+        #      its chance to flush via the forced ``</think>``. Running
+        #      the non-stream finalize on the original
+        #      ``accumulated_raw`` (which excludes ``</think>`` per
+        #      the round-5/6 local-buffer fix) might still re-classify
+        #      the cap-truncated reasoning as content via the
+        #      non-stream parser's broader heuristics, double-emitting
+        #      bytes already routed past the cap.
+        #
+        # When NO terminal injection was attempted (cap never fired,
+        # or it fired and was already injected mid-stream), the
+        # finalize pass still runs as the safety net for normal
+        # parser-held content.
+        if reasoning_parser and accumulated_raw and not terminal_injection_attempted:
+            # D-STOP-THINK (PR #799): pass matched_stop AND the
+            # ``_starts_thinking`` boolean (chat template injected
+            # ``<think>`` AND ``enable_thinking`` is non-False) so
+            # parsers can distinguish a prompt-injected mid-think
+            # truncation from a casual stop-terminated answer. Both
+            # signals together are required (codex round-4
+            # BLOCKING). Mirrors routes/anthropic.py.
+            final_msg = (
+                finalize_streaming_compat(
+                    reasoning_parser,
+                    accumulated_raw,
+                    matched_stop=stream_matched_stop,
+                    prompt_thinking_active=_starts_thinking,
+                    finish_reason=stream_finish_reason,
+                )
+                if hasattr(reasoning_parser, "finalize_streaming")
+                else None
+            )
+            if final_msg and final_msg.content:
+                content = strip_special_tokens(
+                    _transition_reasoning_to_content(final_msg.content)
+                )
+                if content:
+                    async for ev in _emit_text_delta(content):
+                        yield ev
+            # R11-B (R11-M-F1): tap any reasoning bytes the finalize pass
+            # surfaces, but ONLY if the in-loop ``extract_reasoning_streaming``
+            # accumulator didn't already capture them. Qwen3 / deepseek /
+            # glm4 release reasoning incrementally on each delta AND
+            # re-emit the full chain on ``finalize_streaming`` (it
+            # re-parses ``accumulated_raw``), so naively appending would
+            # double the text. Parsers that only release on finalize
+            # (none in-tree today, but the contract allows it) still
+            # contribute correctly. The streaming surface's accumulator
+            # is the canonical source when both are populated.
+            if (
+                final_msg
+                and getattr(final_msg, "reasoning", None)
+                and not accumulated_reasoning_text
+            ):
+                if reasoning_stream_seen:
+                    reasoning_sanitizer = StreamingReasoningSanitizer()
+                async for ev in _emit_reasoning_fragment(final_msg.reasoning):
+                    yield ev
+
+        sanitized_overflow_tail = _flush_reasoning_sanitizer()
+        if sanitized_overflow_tail:
+            content = strip_special_tokens(sanitized_overflow_tail)
+            if content:
+                filtered = tool_filter.process(content)
+                if filtered:
+                    async for ev in _emit_text_delta(filtered):
+                        yield ev
+        remaining = tool_filter.flush()
+        if remaining:
+            async for ev in _emit_text_delta(remaining):
+                yield ev
+
+        # Parse tool_calls FIRST so the forced-choice deferred-text
+        # resolution (Yuki F6 codex r1 BLOCKING #2) can decide whether
+        # the message item should open at all.
+        # Pass `accumulated_raw` (pre-filter model output) not
+        # `accumulated_text` (post-filter user-visible text) — tool_filter
+        # rightly suppresses `<tool_call>...</tool_call>` XML from
+        # `accumulated_text`, but the post-loop parser needs that XML
+        # to extract structured tool_calls. Without this swap, the
+        # text-parser path returned zero tool_calls and Codex's agent
+        # loop silently terminated with no items emitted.
+        _, parsed_tool_calls = _parse_tool_calls_with_parser(
+            accumulated_raw,
+            openai_request,
+            structured_tool_calls=accumulated_structured_tool_calls or None,
+        )
+
+        # Yuki F6 (0.8.5 dogfood): mirror the non-stream synthesis so
+        # ``tool_choice="required"`` / named-function always produce a
+        # ``response.output_item.added`` event of type ``function_call``
+        # (or ``computer_call`` for Computer-Use), honouring the
+        # OpenAI ``tool_call guaranteed`` contract on the streaming
+        # surface too. Codex r2 BLOCKING (PR #817): the non-stream
+        # path raises 422 for multi-tool ``required`` with no model
+        # call, but we cannot raise mid-stream after SSE headers
+        # are out — emit a ``response.failed`` event with the same
+        # error envelope instead so the client sees a clean shutdown
+        # signal.
+        try:
+            tool_calls = _enforce_responses_tool_choice(
+                parsed_tool_calls, responses_request, openai_request
+            )
+            # Streaming must enforce the same post-parse schema contract as
+            # the non-streaming Responses lane. This used to be restricted to
+            # DeepSeek, so Hermes/Qwen calls such as ``arguments="12"`` could
+            # reach Codex as response.completed even though the declared tool
+            # requires a JSON object with required properties.
+            if tool_calls and openai_request.tools:
+                _validate_tool_call_params(
+                    tool_calls, openai_request.tools, enforce_required=True
+                )
+        except HTTPException as forced_choice_err:
+            # Drop any deferred buffered text — the request failed
+            # under forced choice, the deferred prose has no
+            # legitimate destination on the wire.
+            _clear_deferred_text()
+            err_detail = forced_choice_err.detail
+            if isinstance(err_detail, dict):
+                err_envelope = err_detail.get("error", {})
+                err_code = err_envelope.get("code", "tool_choice_unfulfilled")
+                err_msg = err_envelope.get(
+                    "message", "tool_choice could not be fulfilled"
+                )
+            else:
+                err_code = getattr(
+                    forced_choice_err,
+                    "rapid_mlx_error_code",
+                    "tool_choice_unfulfilled",
+                )
+                err_msg = str(err_detail)
+            _record_failed("output_contract_unmet")
+            yield _emit(
+                "response.failed",
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "id": response_id,
+                        "status": "failed",
+                        "error": {
+                            "code": err_code,
+                            "message": err_msg,
+                        },
+                    },
+                },
+            )
+            # ``response.failed`` IS the terminal event for the
+            # OpenAI Responses SSE spec — there is no ``data: [DONE]``
+            # sentinel on this surface (see module docstring + the
+            # ``_sse`` helper docstring). Codex r2 reviewer flagged a
+            # missing ``[DONE]`` but that's chat-completions-only;
+            # Responses-API clients (Codex CLI, openai-python) detect
+            # stream end via the terminal event type, not a sentinel
+            # data line.
+            return
+        # Codex r1 BLOCKING #2 (PR #817): under forced choice the
+        # ``deferred_text`` buffer holds text deltas we held back. Flush
+        # them ONLY if synthesis won't fire — i.e. the model produced
+        # a real tool_call, so the assistant's prose is legitimate
+        # context. When synthesis WILL fire (model only emitted text),
+        # drop the deferred text so the client doesn't see both a
+        # message AND a synthesised tool_call.
+        _synthesis_fired = bool(tool_calls) and not parsed_tool_calls
+        async for ev in _flush_deferred_text_if_no_synthesis(_synthesis_fired):
+            yield ev
+
+        # R10-C3: track the final ``output[]`` array so ``response.completed``
+        # carries the full reconstructed response object. Sven r10-R1 captured
+        # 0.8.11 emitting a completed payload with no ``output`` field at all
+        # — that broke the openai-python SDK's response-object materialization
+        # because ``Response.output`` is a required list field. Mirror what the
+        # non-streaming path emits via ``openai_to_responses`` so streaming
+        # and non-streaming consumers see the same final shape.
+        #
+        # R12-M3 (Mira r12 R-4): the array is built in spec order
+        # ``reasoning → message → function_call/computer_call`` so the wire
+        # ``output_index`` (claimed in ``_emit_pending_leading_items`` /
+        # ``_open_message_item`` / the tool_call loop) lines up 1:1 with
+        # the array position. Reasoning is reserved at index 0 whenever
+        # the leading item was emitted on the wire.
+        completed_output: list[dict] = []
+        # Reserve the reasoning slot at index 0 with a placeholder so the
+        # message/tool-call append calls below put items at the correct
+        # subsequent indices. The placeholder is overwritten in the
+        # post-loop reasoning emitter; if the reasoning leading item was
+        # NOT emitted on the wire (no message and no reasoning text — a
+        # pure-tool-call shape), the placeholder is dropped before
+        # ``response.completed`` ships so the terminal array stays
+        # consistent with what the wire actually showed.
+        _reasoning_slot_reserved = reasoning_item_added
+        if _reasoning_slot_reserved:
+            completed_output.append(reasoning_item_payload_done or {})
+
+        def _stream_usage_payload() -> dict:
+            # #591 P2 (item 6): floor-clamp before the upper clamp. A buggy
+            # engine that surfaces a negative ``cached_tokens`` would
+            # otherwise pass through unchanged and emit
+            # ``input_tokens_details.cached_tokens=-N`` on the wire.
+            cached_tokens_clamped = max(0, min(cached_tokens, prompt_tokens))
+            # Credit accumulated reasoning bytes against usage the same
+            # way for both ``response.completed`` and ``response.failed``.
+            # Keep the invariant ``reasoning_tokens <= output_tokens``.
+            reasoning_token_credit = 0
+            if accumulated_reasoning_text and completion_tokens:
+                reasoning_token_credit = min(
+                    max(1, len(accumulated_reasoning_text) // 4),
+                    completion_tokens,
+                )
+            return {
+                "input_tokens": prompt_tokens,
+                "output_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+                "input_tokens_details": {
+                    "cached_tokens": cached_tokens_clamped
+                    if cached_tokens_clamped
+                    else 0,
+                    "cache_write_tokens": 0,
+                },
+                "output_tokens_details": {"reasoning_tokens": reasoning_token_credit},
+            }
+
+        def _stream_response_payload(
+            status: str,
+            *,
+            error: dict | None = None,
+            incomplete_details: dict | None = None,
+        ) -> dict:
+            payload = {
+                "id": response_id,
+                "object": "response",
+                "created_at": created_at,
+                "status": status,
+                "model": served_model,
+                "output": list(completed_output),
+                "usage": _stream_usage_payload(),
+                "parallel_tool_calls": bool(responses_request.parallel_tool_calls),
+                "tool_choice": responses_request.tool_choice or "auto",
+                "tools": responses_request.tools or [],
+            }
+            if error is not None:
+                payload["error"] = error
+            if incomplete_details is not None:
+                payload["incomplete_details"] = incomplete_details
+            if last_response_metrics is not None:
+                payload["metrics"] = last_response_metrics.model_dump(exclude_none=True)
+            return payload
+
+        def _build_reasoning_done_payload() -> dict:
+            return {
+                "type": "reasoning",
+                "id": reasoning_item_id,
+                "status": reasoning_status,
+                "summary": (
+                    [
+                        {
+                            "type": "summary_text",
+                            "text": accumulated_reasoning_text,
+                        }
+                    ]
+                    if accumulated_reasoning_text
+                    else []
+                ),
+            }
+
+        def _emit_reasoning_summary_events() -> list[str]:
+            if (
+                not accumulated_reasoning_text
+                or reasoning_item_id is None
+                or reasoning_output_index is None
+            ):
+                return []
+            summary_part = {
+                "type": "summary_text",
+                "text": accumulated_reasoning_text,
+            }
+            part_done = {
+                "type": "response.reasoning_summary_part.done",
+                "item_id": reasoning_item_id,
+                "output_index": reasoning_output_index,
+                "summary_index": 0,
+                "part": summary_part,
+            }
+            if reasoning_status == "incomplete":
+                part_done["status"] = "incomplete"
+            return [
+                _emit(
+                    "response.reasoning_summary_part.added",
+                    {
+                        "type": "response.reasoning_summary_part.added",
+                        "item_id": reasoning_item_id,
+                        "output_index": reasoning_output_index,
+                        "summary_index": 0,
+                        "part": {"type": "summary_text", "text": ""},
+                    },
+                ),
+                _emit(
+                    "response.reasoning_summary_text.delta",
+                    {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": reasoning_item_id,
+                        "output_index": reasoning_output_index,
+                        "summary_index": 0,
+                        "delta": accumulated_reasoning_text,
+                    },
+                ),
+                _emit(
+                    "response.reasoning_summary_text.done",
+                    {
+                        "type": "response.reasoning_summary_text.done",
+                        "item_id": reasoning_item_id,
+                        "output_index": reasoning_output_index,
+                        "summary_index": 0,
+                        "text": accumulated_reasoning_text,
+                    },
+                ),
+                _emit(
+                    "response.reasoning_summary_part.done",
+                    part_done,
+                ),
+            ]
+
+        def _finalize_reasoning_item_events() -> tuple[list[str], dict | None, bool]:
+            nonlocal reasoning_item_id, reasoning_output_index, reasoning_item_added
+            nonlocal reasoning_item_finalized, reasoning_item_payload_done
+            events: list[str] = []
+            uses_reserved_slot = bool(reasoning_item_added)
+            if reasoning_item_finalized:
+                return events, reasoning_item_payload_done, uses_reserved_slot
+            if accumulated_reasoning_text:
+                reasoning_output_index = len(completed_output)
+                reasoning_item_id = _item_id("reasoning", "rs")
+                reasoning_item_added = True
+                events.append(
+                    _emit(
+                        "response.output_item.added",
+                        {
+                            "type": "response.output_item.added",
+                            "output_index": reasoning_output_index,
+                            "item": {
+                                "type": "reasoning",
+                                "id": reasoning_item_id,
+                                "status": "in_progress",
+                                "summary": [],
+                            },
+                        },
+                    )
+                )
+            else:
+                return events, None, uses_reserved_slot
+
+            reasoning_item_payload_done = _build_reasoning_done_payload()
+            events.extend(_emit_reasoning_summary_events())
+            events.append(
+                _emit(
+                    "response.output_item.done",
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": reasoning_output_index,
+                        "item": reasoning_item_payload_done,
+                    },
+                )
+            )
+            reasoning_item_finalized = True
+            return events, reasoning_item_payload_done, uses_reserved_slot
+
+        # Close the message item if we ever opened it.
+        if message_open:
+            message_content_block = {
+                "type": "output_text",
+                "text": accumulated_text,
+                "annotations": [],
+            }
+            # R10-C3 / Yuki F8 (0.8.5 dogfood): emit
+            # ``response.output_text.done`` AND ``response.content_part.done``
+            # BEFORE the message item ``done`` event — required by the
+            # OpenAI Responses SSE spec. The openai-python SDK marks the
+            # output_text part as finalized on ``content_part.done`` and
+            # raises if ``output_item.done`` arrives without it.
+            if content_part_open:
+                yield _emit(
+                    "response.output_text.done",
+                    {
+                        "type": "response.output_text.done",
+                        "item_id": message_item_id,
+                        "output_index": message_output_index,
+                        "content_index": 0,
+                        "text": accumulated_text,
+                        # R10-C3: openai-python ``ResponseTextDoneEvent``
+                        # marks ``logprobs`` as required (same as the
+                        # delta event). Empty array — spec-compliant absent.
+                        "logprobs": [],
+                    },
+                )
+                yield _emit(
+                    "response.content_part.done",
+                    {
+                        "type": "response.content_part.done",
+                        "item_id": message_item_id,
+                        "output_index": message_output_index,
+                        "content_index": 0,
+                        "part": message_content_block,
+                    },
+                )
+                content_part_open = False
+            message_item_payload = {
+                "type": "message",
+                "id": message_item_id,
+                "status": "completed",
+                "role": "assistant",
+                "content": [message_content_block],
+            }
+            yield _emit(
+                "response.output_item.done",
+                {
+                    "type": "response.output_item.done",
+                    "output_index": message_output_index,
+                    "item": message_item_payload,
+                },
+            )
+            completed_output.append(message_item_payload)
+
+        # R11-B (R11-M-F1) + R12-M3 (Mira r12 R-4): emit / finalize the
+        # ``reasoning`` output item carrying any accumulated chain-of-thought.
+        #
+        # Two cases:
+        #
+        # 1. ``reasoning_item_added`` (R12-M3 leading slot was already
+        #    flushed by ``_open_message_item``): the wire already saw the
+        #    ``response.output_item.added`` event at ``output_index=0``
+        #    BEFORE the message item. Here we only ship the matching
+        #    ``response.output_item.done`` event with the accumulated
+        #    summary (empty if the model produced no reasoning bytes —
+        #    matches the OpenAI reference, which always emits a reasoning
+        #    item before the message).
+        #
+        # 2. ``not reasoning_item_added`` (the leading slot was never
+        #    claimed — no message was emitted): if reasoning text exists,
+        #    emit BOTH added + done at the next available output_index
+        #    (preserves pre-R12-M3 behaviour for pure-tool-call shapes
+        #    with reasoning). If reasoning text is empty AND no message
+        #    was emitted, suppress the reasoning item entirely to match
+        #    the non-stream ``openai_to_responses`` shape (reasoning-only
+        #    or tool-only turns don't get a phantom empty reasoning item).
+        #
+        # Item status mirrors the non-stream convention:
+        # ``incomplete`` when the engine reported ``finish_reason=="length"``
+        # AND no downstream output was seen (the model was still mid-think
+        # when its budget ran out), else ``completed``.
+        #
+        # Pre-fix the streaming path dropped every reasoning delta on the
+        # floor — so when ``max_output_tokens`` cut the model off WHILE
+        # STILL inside ``<think>...</think>`` the message item never
+        # opened, ``completed_output`` shipped empty, and the terminal
+        # ``response.completed`` ran with ``output:[]`` + ``status:"completed"``
+        # (the wire shape Mira R1 F1 captured). The non-streaming path
+        # always surfaced this same input as a ``reasoning`` item +
+        # ``status:"incomplete"`` via ``openai_to_responses``; both R11-B
+        # and R12-M3 close cross-path parity gaps.
+        # R11-B codex r7 BLOCKING: ``reasoning_block_closed`` is
+        # the precise signal — set ONLY when the parser/router
+        # emitted a TRUE content/tool channel chunk. We can't use
+        # ``accumulated_text`` here because reasoning-cap overflow
+        # bytes also land in ``accumulated_text`` via
+        # ``_emit_text_delta``, but the parser may still be
+        # logically mid-think (overflow only promotes after a
+        # successful ``</think>`` flip). ``reasoning_block_closed``
+        # is true whenever the parser's OWN content/text channel
+        # emitted; tool_calls is the orthogonal "closed-then-tool-emit"
+        # signal. Message_open is also a downstream-output signal
+        # (R12-M3: the leading reasoning slot fires alongside the
+        # message ``added`` event — so by the time we reach this
+        # post-loop block with ``message_open=True``, the model
+        # definitionally produced downstream content).
+        downstream_output_seen = bool(
+            reasoning_block_closed or tool_calls or message_open
+        )
+        # GPT-OSS/Codex dogfood: ``reasoning_block_closed`` only proves
+        # the model/parser left the hidden reasoning channel. It is NOT
+        # itself a client-consumable answer. A stream can close the
+        # reasoning block, emit only stripped control tokens (or no
+        # content/tool payload), and then stop; Codex CLI then sees a
+        # successful response with no final answer. Keep the broader
+        # ``downstream_output_seen`` signal above for the length-cutoff
+        # mid-think decision, but gate stop-reason success on output the
+        # Responses client can actually consume.
+        # A lazily-opened message can still contain only formatting
+        # whitespace (observed with DeepSeek V4 Flash ending immediately
+        # after ``</think>``).  Codex renders that as a successful blank turn
+        # and never retries or executes a tool.  Require semantic text, not
+        # merely a message event ladder, before declaring the turn consumable.
+        consumable_output_seen = bool(tool_calls or accumulated_text.strip())
+        # R12-M3 codex r1 BLOCKING: ``mid_think_cutoff`` is the
+        # "cut off while still inside ``<think>``" signal; it must
+        # additionally require reasoning bytes actually accumulated.
+        # Without this guard, a length-cut response that never produced
+        # reasoning bytes but DID open the message could in principle
+        # flip to ``incomplete`` on a future refactor of
+        # ``downstream_output_seen`` — making the explicit text-gate
+        # an invariant that mirrors the semantic ("mid-think" implies
+        # "produced think tokens"). Today ``message_open`` already
+        # contributes to ``downstream_output_seen`` so the outcome is
+        # the same, but the guard pins the contract.
+        mid_think_cutoff = (
+            last_finish_reason == "length"
+            and not downstream_output_seen
+            and bool(accumulated_reasoning_text)
+        )
+        reasoning_status = "incomplete" if mid_think_cutoff else "completed"
+
+        # If the model stops after generating tokens/hidden content but
+        # never opens a client-consumable message or tool call, expose any
+        # captured reasoning item and then fail the response. Preserve the
+        # legitimate immediate-EOS shape by requiring some generation
+        # signal beyond ``finish_reason="stop"``.
+        raw_generation_probe = accumulated_raw + "".join(accumulated_raw_parts)
+        raw_generation_signal = bool(strip_special_tokens(raw_generation_probe).strip())
+        no_final_answer_generated_signal = bool(
+            accumulated_reasoning_text
+            or terminal_reasoning_sidecar_seen
+            or raw_generation_signal
+            or accumulated_text
+        )
+        no_final_answer_stop = (
+            last_finish_reason == "stop"
+            and not consumable_output_seen
+            # Immediate EOS remains a valid empty response for ordinary prose
+            # requests.  It is not valid for an agent turn that supplied tools:
+            # Codex has nothing to render or execute and otherwise treats the
+            # empty turn as success instead of retrying.
+            and (no_final_answer_generated_signal or bool(responses_request.tools))
+        )
+
+        # A reasoning parser that returns to the reasoning channel after
+        # public content has started violates the Responses item ordering
+        # contract. The reasoning item is already closed at that point and
+        # Codex cannot accept another summary ladder after the message item.
+        # Fail explicitly instead of silently dropping the late bytes.
+        emitted_reasoning = ""
+        if reasoning_item_payload_done is not None:
+            emitted_reasoning = "".join(
+                str(part.get("text") or "")
+                for part in reasoning_item_payload_done.get("summary", [])
+                if isinstance(part, dict)
+            )
+        if reasoning_item_finalized and emitted_reasoning != accumulated_reasoning_text:
+            _record_failed("output_contract_unmet")
+            yield _emit(
+                "response.failed",
+                {
+                    "type": "response.failed",
+                    "response": _stream_response_payload(
+                        "failed",
+                        error={
+                            "code": "invalid_reasoning_event_order",
+                            "message": (
+                                "The model emitted reasoning after public content; "
+                                "retry the request."
+                            ),
+                        },
+                    ),
+                },
+            )
+            return
+
+        if no_final_answer_stop:
+            reasoning_events, reasoning_item_payload_done, uses_reserved_slot = (
+                _finalize_reasoning_item_events()
+            )
+            for event in reasoning_events:
+                yield event
+            if reasoning_item_payload_done is not None:
+                if uses_reserved_slot:
+                    completed_output[reasoning_output_index] = (
+                        reasoning_item_payload_done
+                    )
+                else:
+                    completed_output.append(reasoning_item_payload_done)
+            error_code = "model_no_final_answer"
+            error_message = (
+                "The model stopped after generating hidden output but did "
+                "not produce a final answer or tool call. Retry the "
+                "request; if it repeats, reduce the prompt or reasoning "
+                "budget."
+            )
+            logger.warning(
+                "Responses (stream): non-progress stop (%s); surfacing as "
+                "response.failed (completion_tokens=%d)",
+                error_code,
+                completion_tokens,
+            )
+            _record_failed("output_contract_unmet")
+            yield _emit(
+                "response.failed",
+                {
+                    "type": "response.failed",
+                    "response": _stream_response_payload(
+                        "failed",
+                        error={
+                            "code": error_code,
+                            "message": error_message,
+                        },
+                    ),
+                },
+            )
+            elapsed = time.perf_counter() - start_time
+            logger.info(
+                f"Responses (stream, failed): prompt={prompt_tokens} + "
+                f"completion={completion_tokens} tokens in {elapsed:.2f}s"
+            )
+            return
+
+        reasoning_events, reasoning_item_payload_done, uses_reserved_slot = (
+            _finalize_reasoning_item_events()
+        )
+        for event in reasoning_events:
+            yield event
+        if reasoning_item_payload_done is not None:
+            if uses_reserved_slot:
+                completed_output[reasoning_output_index] = reasoning_item_payload_done
+            else:
+                completed_output.append(reasoning_item_payload_done)
+
+        # R12-8 codex r2 #4: streaming Responses parity with non-stream.
+        # Non-stream Responses runs `_apply_reasoning_cutoff_notice` via
+        # the chat layer, then `openai_to_responses` materializes the
+        # rescue text into an `output_text` message item. The streaming
+        # path emits the reasoning item with status=incomplete (above)
+        # but never surfaces the rescue payload — clients rendering only
+        # text output see empty output despite the reasoning being
+        # available. Mirror the non-stream shape: when the mid-think
+        # cutoff fired AND no real downstream output was seen, build the
+        # rescue payload and emit a synthetic message item using the
+        # canonical added → content_part.added → output_text.delta →
+        # output_text.done → content_part.done → output_item.done
+        # ladder. Gating mirrors `_apply_reasoning_cutoff_notice` —
+        # message_open + tool_calls already preclude rescue.
+        # R12-M3 codex r2 BLOCKING: gate the rescue path on
+        # ``mid_think_cutoff`` directly (the single source of truth for
+        # "model was still mid-think when cut off"), not on a redundant
+        # ``accumulated_reasoning_text`` check. ``mid_think_cutoff``
+        # itself already requires ``bool(accumulated_reasoning_text)``
+        # above, so this is equivalent today, but the structural change
+        # ensures that any future widening of the rescue trigger (e.g.,
+        # rescue on a different cap signal) routes through the same
+        # invariant rather than getting silently skipped because the
+        # outer text gate was forgotten.
+        if mid_think_cutoff and not message_open and not tool_calls:
+            rescue_text = _apply_reasoning_cutoff_notice(
+                final_content=None,
+                reasoning_text=accumulated_reasoning_text,
+                tool_calls=None,
+                finish_reason=last_finish_reason,
+                include_reasoning_tail=not _uses_deepseek_v4_reasoning(cfg),
+            )
+            if rescue_text:
+                rescue_output_index = len(completed_output)
+                rescue_item_id = _item_id("message", "msg")
+                rescue_part = {
+                    "type": "output_text",
+                    "text": rescue_text,
+                    "annotations": [],
+                }
+                yield _emit(
+                    "response.output_item.added",
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": rescue_output_index,
+                        "item": {
+                            "type": "message",
+                            "id": rescue_item_id,
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": [],
+                        },
+                    },
+                )
+                yield _emit(
+                    "response.content_part.added",
+                    {
+                        "type": "response.content_part.added",
+                        "item_id": rescue_item_id,
+                        "output_index": rescue_output_index,
+                        "content_index": 0,
+                        "part": {
+                            "type": "output_text",
+                            "text": "",
+                            "annotations": [],
+                        },
+                    },
+                )
+                yield _emit(
+                    "response.output_text.delta",
+                    {
+                        "type": "response.output_text.delta",
+                        "item_id": rescue_item_id,
+                        "output_index": rescue_output_index,
+                        "content_index": 0,
+                        "delta": rescue_text,
+                        "logprobs": [],
+                    },
+                )
+                yield _emit(
+                    "response.output_text.done",
+                    {
+                        "type": "response.output_text.done",
+                        "item_id": rescue_item_id,
+                        "output_index": rescue_output_index,
+                        "content_index": 0,
+                        "text": rescue_text,
+                        "logprobs": [],
+                    },
+                )
+                yield _emit(
+                    "response.content_part.done",
+                    {
+                        "type": "response.content_part.done",
+                        "item_id": rescue_item_id,
+                        "output_index": rescue_output_index,
+                        "content_index": 0,
+                        "part": rescue_part,
+                    },
+                )
+                rescue_message_done = {
+                    "type": "message",
+                    "id": rescue_item_id,
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [rescue_part],
+                }
+                yield _emit(
+                    "response.output_item.done",
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": rescue_output_index,
+                        "item": rescue_message_done,
+                    },
+                )
+                completed_output.append(rescue_message_done)
+
+        # Ana C-06 (0.8.5 dogfood): when the request used Computer-Use,
+        # translate ``function.name == "computer"`` tool_calls into the
+        # ``computer_call`` envelope so SDK consumers walking
+        # ``output_item.type`` for ``computer_call`` find them.
+        uses_computer_use = request_uses_computer_use(responses_request)
+
+        # R11-B codex r1 HIGH #1: derive ``tool_output_index`` from
+        # ``len(completed_output)`` so it accounts for ALL items
+        # already appended (message + reasoning), not just the
+        # pre-R11 message-only shape. Pre-fix, when the stream
+        # emitted both a message AND reasoning item before any
+        # tool_call, ``tool_output_index`` collided with the
+        # reasoning item's index (both were 1).
+        tool_output_index = len(completed_output)
+        for tc in tool_calls or []:
+            # R10-C3: inline the tool-call event triplet here (instead of
+            # delegating to ``_emit_function_call_item`` / ``_emit_computer_call_item``)
+            # so the ``completed_output`` array can be populated with the
+            # finalized ``done`` item — needed for the terminal
+            # ``response.completed.response.output[]`` payload. The inlined
+            # logic uses the route-local ``_emit`` helper (monotonic
+            # sequence numbers) instead of the module-level ``_sse`` the
+            # helpers used to call.
+            if uses_computer_use and (tc.function.name or "") == "computer":
+                # Lazy import mirrors ``_emit_computer_call_item`` to avoid
+                # a circular import at module load time.
+                from ..api.responses_adapter import _parse_computer_action
+
+                cu_id = _item_id("computer_call", "cu")
+                action = _parse_computer_action(tc.function.arguments or "")
+                yield _emit(
+                    "response.output_item.added",
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": tool_output_index,
+                        "item": {
+                            "type": "computer_call",
+                            "id": cu_id,
+                            "call_id": tc.id,
+                            "status": "in_progress",
+                            "action": action,
+                            "pending_safety_checks": [],
+                        },
+                    },
+                )
+                cu_done_item = {
+                    "type": "computer_call",
+                    "id": cu_id,
+                    "call_id": tc.id,
+                    "status": "completed",
+                    "action": action,
+                    "pending_safety_checks": [],
+                }
+                yield _emit(
+                    "response.output_item.done",
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": tool_output_index,
+                        "item": cu_done_item,
+                    },
+                )
+                completed_output.append(cu_done_item)
+            else:
+                fc_id = _item_id("function_call", "fc")
+                # issue #2114: re-attach the originating MCP namespace so
+                # Codex routes the call to the right server. Absent for
+                # direct tools and ambiguous name collisions (the mapping
+                # only carries unambiguously-attributable names).
+                fc_namespace = (namespace_by_tool or {}).get(tc.function.name or "")
+                fc_added_item = {
+                    "type": "function_call",
+                    "id": fc_id,
+                    "call_id": tc.id,
+                    "name": tc.function.name,
+                    "arguments": "",
+                    "status": "in_progress",
+                }
+                if fc_namespace:
+                    fc_added_item["namespace"] = fc_namespace
+                yield _emit(
+                    "response.output_item.added",
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": tool_output_index,
+                        "item": fc_added_item,
+                    },
+                )
+                # Codex CLI accepts the args as a single delta — we don't
+                # have token-by-token streaming for tool_call arguments in
+                # the underlying engine yet, so emit the whole JSON string
+                # at once. Codex concatenates these the same way regardless
+                # of chunk count.
+                yield _emit(
+                    "response.function_call_arguments.delta",
+                    {
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": fc_id,
+                        "output_index": tool_output_index,
+                        "delta": tc.function.arguments or "",
+                    },
+                )
+                fc_done_item = {
+                    "type": "function_call",
+                    "id": fc_id,
+                    "call_id": tc.id,
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments or "",
+                    "status": "completed",
+                }
+                if fc_namespace:
+                    fc_done_item["namespace"] = fc_namespace
+                yield _emit(
+                    "response.output_item.done",
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": tool_output_index,
+                        "item": fc_done_item,
+                    },
+                )
+                completed_output.append(fc_done_item)
+            tool_output_index += 1
+
+        # Strict requests do not reach this live engine stream loop: they
+        # use the buffered validation/repair path, then replay its result
+        # through the normal Responses SSE event ladder.
+
+        # r6-A R6-C2: streaming-path mirror of the non-stream
+        # degenerate-output guard. When the stream emits no user-visible
+        # content (no accumulated text, no tool_calls) AND the engine
+        # credited zero completion tokens AND the engine reported
+        # ``finish_reason="length"``, the underlying engine almost
+        # certainly aborted before producing its first token (e.g. a
+        # ``metal::malloc`` Resource-limit wedge — the R6-C1 sibling).
+        # Pre-fix, the path terminated with ``response.completed`` +
+        # ``status="completed"`` (or ``"incomplete"`` if finish_reason
+        # surfaced as "length") with zero usage, so SDK consumers
+        # walking the stream couldn't distinguish a genuine
+        # zero-budget reply from a runtime abort. Emit
+        # ``response.failed`` instead so the consumer sees the same
+        # clean shutdown signal the OpenAI cloud Responses API uses
+        # for errored streams (mirror of the spec ``response.failed``
+        # event the late-stream tool_choice-unfulfilled path already
+        # emits at line ~1718).
+        #
+        # Codex r1 IMPORTANT (narrowed): require
+        # ``last_finish_reason == "length"`` so the guard doesn't fire
+        # on legitimate immediate-stop / zero-budget / stop-sequence
+        # streams (those report ``"stop"``). Matches the non-stream
+        # guard's narrowing.
+        if (
+            last_finish_reason == "length"
+            and completion_tokens == 0
+            and not (accumulated_text or tool_calls or accumulated_reasoning_text)
+        ):
+            logger.warning(
+                "Responses (stream): engine produced no output "
+                "(accumulated_text empty, no tool_calls, completion_tokens=0); "
+                "surfacing as response.failed"
+            )
+            _record_failed("output_contract_unmet")
+            yield _emit(
+                "response.failed",
+                {
+                    "type": "response.failed",
+                    "response": _stream_response_payload(
+                        "failed",
+                        error={
+                            "code": "engine_no_output",
+                            "message": (
+                                "The engine returned no usable output "
+                                "(no text or tool_calls and zero completion "
+                                "tokens). This usually indicates a runtime "
+                                "abort before generation produced its first "
+                                "token (e.g. a Metal allocation failure). "
+                                "Inspect the server logs for the underlying "
+                                "engine error."
+                            ),
+                        },
+                    ),
+                },
+            )
+            elapsed = time.perf_counter() - start_time
+            logger.info(
+                f"Responses (stream, failed): prompt={prompt_tokens} + "
+                f"completion=0 tokens in {elapsed:.2f}s"
+            )
+            return
+
+        # response.completed — terminal event. Codex treats a missing
+        # one as a hard failure (it logs "stream closed before
+        # response.completed").
+        # R11-B (R11-M-F1): mirror the non-stream
+        # ``_convert_status`` mapping — ``finish_reason="length"``
+        # surfaces as ``status="incomplete"`` and pins a structured
+        # ``incomplete_details.reason`` block so SDK consumers (Codex
+        # CLI, openai-python) can distinguish a budget-exhaust
+        # truncation from a stop-sequence / EOS completion. Pre-fix
+        # the streaming path always reported ``status="completed"``
+        # regardless of the underlying truncation, so a mid-think
+        # ``max_output_tokens`` cutoff was indistinguishable from a
+        # clean finish on the wire.
+        if is_cancellation_finish_reason(last_finish_reason):
+            yield _emit(
+                "response.failed",
+                {
+                    "type": "response.failed",
+                    "response": _stream_response_payload(
+                        "failed",
+                        error=cancellation_error(),
+                    ),
+                },
+            )
+            return
+
+        if last_finish_reason == "length":
+            completed_status = "incomplete"
+            incomplete_details: dict | None = {"reason": "max_output_tokens"}
+        else:
+            completed_status = "completed"
+            incomplete_details = None
+
+        completed_response_payload = _stream_response_payload(
+            completed_status,
+            incomplete_details=incomplete_details,
+        )
+        yield _emit(
+            "response.completed",
+            {
+                "type": "response.completed",
+                "response": completed_response_payload,
+            },
+        )
+        if emit_telemetry:
+            from rapid_mlx.telemetry import inference as _telemetry_inference
+
+            _telemetry_inference.emit_completed_request(
+                model=served_telemetry_id or "<custom>",
+                endpoint="/v1/responses",
+                caller_agent=caller_agent,
+                caller_client=caller_client,
+                result="ok",
+            )
+
+        elapsed = time.perf_counter() - start_time
+        tokens_per_sec = completion_tokens / elapsed if elapsed > 0 else 0
+        logger.info(
+            f"Responses (stream): prompt={prompt_tokens} + "
+            f"completion={completion_tokens} tokens in {elapsed:.2f}s "
+            f"({tokens_per_sec:.1f} tok/s)"
+        )
+
+    except Exception as e:  # noqa: BLE001
+        # response.failed gives Codex a clean shutdown signal instead of
+        # a half-stream-then-EOF; matches how the OpenAI cloud
+        # Responses API closes errored streams.
+        logger.exception("Responses stream failed: %s", e)
+        from rapid_mlx.telemetry import inference as _telemetry_inference
+
+        _record_failed(_telemetry_inference.classify_inference_failure(e))
+        yield _emit(
+            "response.failed",
+            {
+                "type": "response.failed",
+                "response": {
+                    "id": response_id,
+                    "status": "failed",
+                    "error": {
+                        "code": "internal_error",
+                        "message": str(e),
+                    },
+                },
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _log_request(req: ResponsesRequest) -> None:
+    """One-line request log mirroring the other route surfaces."""
+    if isinstance(req.input, str):
+        n_items = 1
+        total_chars = len(req.input)
+    else:
+        n_items = len(req.input)
+        total_chars = 0
+        for item in req.input:
+            if isinstance(item.content, str):
+                total_chars += len(item.content)
+            elif item.content:
+                for c in item.content:
+                    if c.text:
+                        total_chars += len(c.text)
+            if item.arguments:
+                total_chars += len(item.arguments)
+    n_tools = len(req.tools) if req.tools else 0
+    instr_chars = len(req.instructions) if req.instructions else 0
+    logger.info(
+        f"[REQUEST] POST /v1/responses (codex) stream={req.stream} "
+        f"model={req.model!r} max_output_tokens={req.max_output_tokens} "
+        f"input_items={n_items} total_chars={total_chars} "
+        f"instructions_chars={instr_chars} tools={n_tools}"
+    )

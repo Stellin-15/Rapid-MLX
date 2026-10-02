@@ -1,0 +1,357 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Redaction primitives — every "could this leak PII?" decision lives here.
+
+Phase 1 ships these as pure functions with thorough unit tests. Phase 2
+event sites call them; the contract is "if it didn't go through redact,
+it doesn't leave the machine".
+
+Bucketing rationale: exact counts (token totals, TTFT in ms) are a soft
+fingerprint when joined with other fields. Bucketing into a small fixed
+set of strings collapses the join surface to something an aggregation
+pipeline can actually count without re-identifying a session.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import platform
+import re
+import traceback
+from functools import lru_cache
+from pathlib import Path
+
+# ---------------------------------------------------------------- bucketing
+
+
+_TOKEN_BUCKETS: tuple[tuple[int, str], ...] = (
+    (256, "0-256"),
+    (1024, "256-1k"),
+    (4096, "1k-4k"),
+    (16384, "4k-16k"),
+    (65536, "16k-64k"),
+)
+_TOKEN_OVERFLOW = "64k+"
+
+
+def bucket_tokens(n: int) -> str:
+    """Map a token count to one of 6 fixed buckets.
+
+    Edges go to the *upper* bucket — exactly 256 tokens lands in
+    ``"256-1k"``, not ``"0-256"`` — because the buckets read as
+    half-open intervals ``[lower, upper)``.
+    """
+    if n < 0:
+        return "0-256"
+    for upper, label in _TOKEN_BUCKETS:
+        if n < upper:
+            return label
+    return _TOKEN_OVERFLOW
+
+
+_TTFT_BUCKETS: tuple[tuple[float, str], ...] = (
+    (100, "<100ms"),
+    (500, "100-500ms"),
+    (1500, "500-1500ms"),
+    (5000, "1.5-5s"),
+)
+_TTFT_OVERFLOW = ">5s"
+
+
+def bucket_ttft_ms(ms: float) -> str:
+    if ms < 0:
+        return "<100ms"
+    for upper, label in _TTFT_BUCKETS:
+        if ms < upper:
+            return label
+    return _TTFT_OVERFLOW
+
+
+_TPS_BUCKETS: tuple[tuple[float, str], ...] = (
+    (10, "<10"),
+    (30, "10-30"),
+    (50, "30-50"),
+    (100, "50-100"),
+)
+_TPS_OVERFLOW = ">100"
+
+
+def bucket_tps(tps: float) -> str:
+    if tps < 0:
+        return "<10"
+    for upper, label in _TPS_BUCKETS:
+        if tps < upper:
+            return label
+    return _TPS_OVERFLOW
+
+
+def bucket_memory_gb(bytes_: int) -> int:
+    """Round a byte count to the nearest GB. Negatives clamp to 0."""
+    if bytes_ <= 0:
+        return 0
+    return round(bytes_ / (1024**3))
+
+
+# ---------------------------------------------------------------- model paths
+
+# A HuggingFace repo ID is roughly ``org/name`` with letters, digits,
+# dot, dash, and underscore. We deliberately keep this strict — anything
+# else gets redacted, even at the cost of losing the model identity for
+# users who downloaded directly via git clone or symlinked HF cache.
+_HF_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+
+
+def normalize_model_path(path: str) -> str:
+    """Pass through ``org/name`` repo IDs; redact local paths to ``"<local>"``.
+
+    A local ``./qwen3.5-9b-4bit`` checkout that resolve_model() prefers over
+    the alias would otherwise leak the user's home-directory layout via
+    the model name.
+    """
+    if not path:
+        return "<empty>"
+    # Local-path heuristics, layered from cheap-string to robust-Path:
+    # the early returns keep the common HF-ID case fast.
+    if path.startswith(("/", "./", "../", "~/")) or "\\" in path:
+        return "<local>"
+    if path.startswith("file://"):
+        return "<local>"
+    # Catch Windows drive-letter forms (``C:Users\...``, ``C:\\...``)
+    # and UNC paths that the cheap prefix check above misses.
+    try:
+        if Path(path).is_absolute():
+            return "<local>"
+    except (TypeError, ValueError, OSError):
+        return "<local>"
+    # Any ``/`` that survives must be the org/name separator and the
+    # whole string must match the repo-ID pattern.
+    if "/" in path:
+        if _HF_REPO_RE.match(path):
+            return path
+        return "<local>"
+    # Bare alias names (``qwen3.5-9b-4bit``) are public + harmless.
+    return path
+
+
+# ------------------------------------------------------------- caller agent
+
+# Map an inbound HTTP ``User-Agent`` to a SMALL fixed allowlist of caller
+# buckets. This is the ``[NIT] no caller-controlled free-form text`` red-line
+# in action: the raw UA carries versions and sometimes custom tokens, so we
+# NEVER return it — we return one of the labels below (or ``"other"`` /
+# ``"unknown"``). Matching is substring-on-lowercase because SDKs vary the
+# surrounding version/format (``OpenAI/Python 1.2``, ``openai-python/1.2``).
+# Order matters: more specific agent markers are checked before the generic
+# HTTP-client fallbacks so e.g. an agent that rides ``python-httpx`` still
+# resolves to the agent, not ``python-httpx``.
+#
+# Task C (instrumentation-release) audit: candidate product UAs (kimi, codex,
+# opencode, gemini-cli, zed) were evaluated and intentionally NOT added — none
+# is provable, i.e. none sets a recognizable ``User-Agent`` substring; codex /
+# opencode (verified against the installed binaries) carry no product UA and
+# ride the underlying SDK (openai-rust, undici, ...) which the allowlist below
+# already buckets. Adding a marker here without a verified substring would be
+# body-based guessing, which the ``no caller free-text`` red-line forbids.
+# Documented limitation: an agent that passes openai-python (or another SDK)
+# UA through verbatim is indistinguishable at the UA layer and correctly stays
+# bucketed to that SDK — we never fabricate product attribution from the body.
+# The attribution fix for those agents is the /v1/messages (anthropic.py) +
+# /v1/completions wiring (task C), which surfaces the ALREADY-listed markers
+# (claude-code, anthropic-sdk, openai-python, ...) instead of ``other``.
+_CALLER_AGENT_MARKERS: tuple[tuple[str, str], ...] = (
+    ("claude-code", "claude-code"),
+    ("claudecode", "claude-code"),
+    ("claude-cli", "claude-code"),
+    ("cursor", "cursor"),
+    ("aider", "aider"),
+    ("cline", "cline"),
+    ("continue", "continue"),
+    ("openai-python", "openai-python"),
+    ("openai/python", "openai-python"),
+    ("openai-node", "openai-node"),
+    # openai-node sends ``${this.constructor.name}/JS ${VERSION}`` -- e.g.
+    # "OpenAI/JS 4.95.1" (github.com/openai/openai-node src/client.ts; core.js
+    # ``getUserAgent()`` in the 4.x build). No "openai-node" token ever appears.
+    ("openai/js", "openai-node"),
+    ("anthropic", "anthropic-sdk"),
+    ("litellm", "litellm"),
+    ("langchain", "langchain"),
+    ("llama-index", "llamaindex"),
+    ("llamaindex", "llamaindex"),
+    ("ollama", "ollama"),
+    # Generic HTTP clients — last, so a named agent above wins.
+    ("python-httpx", "python-httpx"),
+    ("httpx", "python-httpx"),
+    ("python-requests", "python-requests"),
+    ("requests", "python-requests"),
+    # aiohttp's default client UA is ``SERVER_SOFTWARE`` =
+    # "Python/<major>.<minor> aiohttp/<version>" (aiohttp/http.py, applied in
+    # aiohttp/client_reqrep.py when the caller sets no User-Agent).
+    ("aiohttp", "python-aiohttp"),
+    ("node-fetch", "node-fetch"),
+    ("undici", "node-fetch"),
+    ("axios", "axios"),
+    ("curl", "curl"),
+    ("wget", "curl"),
+    ("okhttp", "okhttp"),
+    ("go-http-client", "go-http"),
+)
+
+
+def normalize_caller_agent(
+    user_agent: str | None, client_header: str | None = None
+) -> str:
+    """Bucket an inbound caller to a fixed allowlist label.
+
+    ``client_header`` is the inbound ``X-Rapid-Client`` header. It WINS over
+    the User-Agent when its value is one of our own closed label set
+    (``rapid_mlx.client_header.RAPID_CLIENT_LABELS``) — a Rapid-owned client
+    knows what it is, while its UA is whatever HTTP library it happens to
+    use this release. Any other header value is ignored outright and never
+    echoed: like the UA, it is caller-controlled input, so it may only ever
+    *select* one of our labels, never introduce a string.
+
+    Returns ``"unknown"`` for a missing/empty UA and ``"other"`` for a UA
+    that matches no marker. The raw string is never returned, so no
+    caller-controlled free-form text lands on a payload.
+    """
+    if isinstance(client_header, str):
+        from rapid_mlx.client_header import RAPID_CLIENT_LABELS
+
+        candidate = client_header.strip()
+        if candidate in RAPID_CLIENT_LABELS:
+            return candidate
+    if not user_agent or not isinstance(user_agent, str):
+        return "unknown"
+    ua = user_agent.lower()
+    for marker, label in _CALLER_AGENT_MARKERS:
+        if marker in ua:
+            return label
+    return "other"
+
+
+# ---------------------------------------------------------------- argv flags
+
+# Captures ``--flag``, ``--flag-name``, and short ``-x`` (single letter
+# only — multi-char short opts like ``-xy`` are uncommon enough we don't
+# bother). Dashes inside the name are kept; everything after ``=`` is
+# dropped before we ever see it because we only return names.
+_LONG_FLAG_RE = re.compile(r"^--([A-Za-z][A-Za-z0-9-]*)(?:=.*)?$")
+_SHORT_FLAG_RE = re.compile(r"^-([A-Za-z])$")
+
+
+def hash_flag_names(argv: list[str]) -> list[str]:
+    """Extract flag names from argv. Values are NEVER returned.
+
+    Only the name of each flag survives. ``--api-key sk-xxx`` becomes
+    ``["api-key"]`` (note: ``sk-xxx`` is never even read by this
+    function — we simply skip non-flag tokens). Returns sorted unique
+    list so the output is order-independent.
+    """
+    names: set[str] = set()
+    for token in argv:
+        if not isinstance(token, str):
+            continue
+        m = _LONG_FLAG_RE.match(token)
+        if m:
+            names.add(m.group(1))
+            continue
+        m = _SHORT_FLAG_RE.match(token)
+        if m:
+            names.add(m.group(1))
+    return sorted(names)
+
+
+# ---------------------------------------------------------------- traceback
+
+
+def fingerprint_traceback(exc: BaseException) -> str:
+    """Hash a traceback's *frame paths only* — never message text, never
+    the exception's full module path.
+
+    We include only the bare exception class name (``ValueError``, not
+    ``transformers.models.llama.ModelError``) plus per-frame
+    ``basename:function:lineno``. Crucially we do NOT include ``str(exc)``
+    — exception messages routinely contain user input ("could not open
+    /Users/alice/secret.txt").
+
+    Returns a 16-hex-char prefix of sha256 — enough to distinguish ~10^9
+    distinct sites with negligible collision risk, short enough to
+    eyeball in a dashboard.
+    """
+    tb = traceback.TracebackException.from_exception(exc)
+    # Bare class name only — not ``__module__`` — so the fingerprint
+    # input does not reveal which third-party packages the user has
+    # installed (a soft fingerprint we don't need).
+    parts: list[str] = [exc.__class__.__name__]
+    for frame in tb.stack:
+        # frame.filename is an absolute path — strip the directory part
+        # to avoid leaking the user's home. We keep the basename + the
+        # function name + line number, which is enough to identify the
+        # site without revealing where rapid-mlx is installed.
+        basename = Path(frame.filename).name
+        parts.append(f"{basename}:{frame.name}:{frame.lineno}")
+    digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+    return digest[:16]
+
+
+# ---------------------------------------------------------------- platform
+
+
+@lru_cache(maxsize=1)
+def _read_chip_brand() -> str:
+    """Best-effort Apple Silicon chip name (e.g. ``"Apple M3 Ultra"``).
+
+    Falls back to ``platform.processor()`` on non-Darwin or when sysctl
+    is unavailable. Never raises. Cached because chip identity does not
+    change at runtime and Phase 2 will call ``platform_info()`` per
+    event — without the cache that's a subprocess fork per request.
+    """
+    if platform.system() != "Darwin":
+        return platform.processor() or "unknown"
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"],
+            capture_output=True,
+            text=True,
+            timeout=1,
+            check=False,
+        )
+        brand = result.stdout.strip()
+        return brand or platform.processor() or "unknown"
+    except (OSError, subprocess.TimeoutExpired):
+        return platform.processor() or "unknown"
+
+
+def _read_total_memory_bytes() -> int:
+    """Best-effort total RAM in bytes. Returns 0 if unknown."""
+    try:
+        import psutil
+
+        return int(psutil.virtual_memory().total)
+    except Exception:
+        return 0
+
+
+def platform_info() -> dict:
+    """Coarse platform fingerprint — schema-stable, no full kernel string.
+
+    Notes:
+    - ``os_version`` is major.minor only (Darwin 25.3.0 → "25.3"). The
+      patch number changes weekly and is a soft fingerprint.
+    - ``python_version`` is also major.minor only.
+    - ``memory_gb`` is rounded — exact byte counts can identify
+      individual machines.
+    """
+    os_release = platform.release() or ""
+    os_version = ".".join(os_release.split(".")[:2]) or os_release
+    py_version = "{}.{}".format(*platform.python_version_tuple()[:2])
+    return {
+        "os": platform.system().lower(),
+        "os_version": os_version,
+        "arch": platform.machine(),
+        "chip": _read_chip_brand(),
+        "memory_gb": bucket_memory_gb(_read_total_memory_bytes()),
+        "python_version": py_version,
+    }

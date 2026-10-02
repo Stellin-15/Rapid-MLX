@@ -14,8 +14,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_mlx import cli, server
-from vllm_mlx.routes import video
+from rapid_mlx import cli, server
+from rapid_mlx.routes import video
 
 
 @pytest.fixture(autouse=True)
@@ -855,13 +855,14 @@ def test_unified_serve_parser_exposes_video_output_directory(tmp_path: Path) -> 
 
 def test_both_server_entrypoints_configure_the_shared_video_store() -> None:
     unified_source = inspect.getsource(cli.serve_command)
+    standalone_parser_source = inspect.getsource(server._build_parser)
     standalone_source = inspect.getsource(server.main)
 
     assert (
         'configure_video_jobs(getattr(args, "video_output_dir", None))'
         in unified_source
     )
-    assert "_add_video_job_args_to_server_parser(parser)" in standalone_source
+    assert "_add_video_job_args_to_server_parser(parser)" in standalone_parser_source
     assert "configure_video_jobs(args.video_output_dir)" in standalone_source
     assert unified_source.index("configure_video_jobs(") < unified_source.index(
         "_ensure_model_downloaded("
@@ -897,7 +898,7 @@ def test_standalone_server_reports_video_store_configuration_failure(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["vllm_mlx.server", "--video-output-dir", "/unwritable"],
+        ["rapid_mlx.server", "--video-output-dir", "/unwritable"],
     )
 
     with pytest.raises(SystemExit) as exc:

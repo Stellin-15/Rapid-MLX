@@ -18,8 +18,8 @@ import logging
 
 import pytest
 
-from vllm_mlx.mcp.config import create_example_config, validate_config
-from vllm_mlx.mcp.types import MCPConfig, MCPTransport
+from rapid_mlx.mcp.config import create_example_config, validate_config
+from rapid_mlx.mcp.types import MCPConfig, MCPTransport
 
 _SERVER = {"command": "python3", "args": ["-m", "some_mcp_server"]}
 
@@ -35,7 +35,7 @@ def _stub_command_path_lookup(monkeypatch):
     unrelated to what's under test.
     """
     monkeypatch.setattr(
-        "vllm_mlx.mcp.security.shutil.which", lambda cmd: f"/usr/bin/{cmd}"
+        "rapid_mlx.mcp.security.shutil.which", lambda cmd: f"/usr/bin/{cmd}"
     )
 
 
@@ -88,6 +88,24 @@ def test_globals_only_config_does_not_warn(caplog):
         cfg = validate_config({"default_timeout": 45.0})
     assert cfg.servers == {}
     assert not any("neither" in r.getMessage() for r in caplog.records)
+
+
+def test_flat_legacy_agent_map_keeps_sibling_servers():
+    # ``agent`` disambiguates this historical flat form, but it must not
+    # cause the loader to discard the other servers in the same map.
+    data = {
+        "agent": dict(_SERVER),
+        "filesystem": dict(_SERVER),
+        "default_timeout": 45.0,
+    }
+
+    validated = validate_config(data)
+    parsed = MCPConfig.from_dict(data)
+
+    assert list(validated.servers) == ["agent", "filesystem"]
+    assert list(parsed.servers) == ["agent", "filesystem"]
+    assert validated.default_timeout == 45.0
+    assert parsed.default_timeout == 45.0
 
 
 def test_empty_mcpservers_does_not_warn(caplog):

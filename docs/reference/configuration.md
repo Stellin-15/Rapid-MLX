@@ -11,8 +11,8 @@ category. The exhaustive flag list (every flag visible in
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--host` | Server host address (loopback-only by default; pass `0.0.0.0` to expose on LAN) | `127.0.0.1` |
-| `--port` | Server port | `8000` |
-| `--listen-fd` | File descriptor of a pre-bound listening socket (3-1023) for socket activation; when set, `--host`/`--port` are ignored for binding | None |
+| `--port` | Server port; when omitted, selects the first free port in 8000–8009; an explicit port never falls back | First free in `8000`–`8009` |
+| `--listen-fd` | File descriptor of a pre-bound listening socket (3-1023) for socket activation; when set, `--host`/`--port` are ignored for binding. Native MTP, DSpark K4, DFlash, and DDTree reject this option with rc 2. | None |
 | `--log-level` | Log level for Python logging and uvicorn (`DEBUG`, `INFO`, `WARNING`, `ERROR`) | `INFO` |
 | `--served-model-name` | Model name reported by the API; when unset the `model` argument is used | None |
 | `--max-tokens` | Default max tokens | `32768` |
@@ -79,7 +79,7 @@ needed by the application; leave it unset for URL/base64-only deployments.
 | `--enable-prefix-cache` / `--disable-prefix-cache` | Toggle prefix caching for repeated prompts | enabled |
 | `--prefix-cache-index` | Prefix-cache lookup index: `radix` (token trie) or `hash` (legacy bisect) | `radix` |
 | `--cache-memory-mb` | Cache memory limit in MB | Auto |
-| `--cache-memory-percent` | Fraction of RAM for cache | `0.20` |
+| `--cache-memory-percent` | Fraction of available RAM for cache. When the flag is not passed, the 0.20 default is raised to the agent-session floor (a third of the Metal headroom left after the weights, at most 4 GiB) when that is larger. An explicit value is always kept | `0.20` |
 | `--idle-cache-clear-seconds` | Clear reusable KV cache after idle time; model weights remain loaded | Disabled |
 | `--no-memory-aware-cache` | Use legacy entry-count cache | `false` |
 | `--pin-system-prompt` | Auto-pin the system prompt in the prefix cache to prevent eviction under memory pressure | `false` |
@@ -158,10 +158,12 @@ into the same config path.
 | `{"method":"dflash","model":"<drafter>"}` | Enable DFlash. Curated aliases may supply the drafter automatically; unknown/unverified targets require it explicitly. |
 | `{"method":"ddtree","model":"<drafter>","num_speculative_tokens":16,"tree_budget":24}` | Enable DDTree. Unknown/unverified targets require all structural inputs explicitly. |
 | `{"method":"dspark","num_speculative_tokens":5}` | Enable checkpoint-native DSpark for a local DeepSeek V4 Flash checkpoint. The token count must match the checkpoint's complete DSpark block. Greedy single-request decoding is accelerated; unsupported request shapes safely use baseline decoding. |
+| `{"method":"dspark","model":"LiquidAI/LFM2.5-VL-3B-DSpark","num_speculative_tokens":7}` | Attach the official DSpark companion to the BF16 `LiquidAI/LFM2.5-VL-3B` target. This first qualified server path is revision-pinned, serial, and greedy-only; it supports text and image prompts. Sampling, logprobs, tools, seeds, and logits processors return HTTP 400 before generation. The public value counts seven proposals; mlx-vlm receives an internal block width of eight including its anchor. |
 | `{"method":"mtp"}` | Enable MTP speculative decoding for checkpoints accepted by the existing MTP eligibility gate. |
 | `{"method":"mtp","model":"<sidecar-head-repo>"}` | Attach a standalone MTP **sidecar head** (e.g. `mlx-community/Qwen3.6-27B-MTP-4bit`) to a full base checkpoint. The base must be MTP-eligible; the head repo goes in the `model` field — **not** in the `serve` positional. See [MTP sidecar heads are not standalone models](#mtp-sidecar-heads-are-not-standalone-models) below. Gemma 4 sidecar MTP remains disabled after its greedy-lossless A/B failed. |
 | `{"method":"mtp","num_speculative_tokens":3}` | Set the MTP max-K controller ceiling. |
 | `{"method":"mtp","disable_auto_k":true}` | Disable the MTP EV depth controller for fixed-K parity benches. |
+| `{"method":"mtp","backend":"native"}` | Use a qualified serial native verifier. Current immutable pairs are `qwen3.6-35b-4bit` and `glm5.3-flash-4bit`; see below. |
 | `{"method":"suffix","num_speculative_tokens":8}` | Enable explicit SuffixDecoding for high-overlap workloads. |
 
 Rapid-MLX separates capability from recommendation. Registry flags identify
@@ -173,10 +175,22 @@ or produce worse application-level output. True incompatibilities—missing or
 mismatched drafter metadata, unsupported verifiers, unavailable runtimes, and
 mutually exclusive modes—still fail before generation.
 
+The LFM2.5-VL companion path requires exactly `mlx-vlm==0.7.2` and accepts
+only the target/drafter/K combination shown above. Rapid-MLX resolves both Hub
+repositories at immutable revisions and validates their structural ABI before
+loading weights. A download, load, compatibility, attach, or generation
+failure is surfaced as an error; this path never silently falls back to
+autoregressive generation. Omitting `model` keeps the existing DeepSeek V4
+checkpoint-native DSpark behavior and its K=5 default.
+For the exact LFM target, `{"method":"dspark"}` selects this catalog companion
+and proposal count automatically. Runtime identity and readiness are available
+from `/healthz`, `/v1/status`, and the `speculative_decoding` object returned by
+`/v1/models`.
+
 Generate the all-alias/all-method policy report with:
 
 ```bash
-python -m vllm_mlx.spec_decode.report
+python -m rapid_mlx.spec_decode.report
 ```
 
 #### MTP is not free — measure before you enable it
@@ -214,6 +228,44 @@ Mac mini M2 Pro / 32GB, `temperature=0`, medians over 4 repetitions:
 (Acceptance and the fixed-K throughput are from the same run, so they
 describe the same work; the auto-K row is a separate run of the same
 protocol.)
+
+The exact `qwen3.6-35b-4bit` target/sidecar pair also has a separately
+qualified native serial backend on large Apple Silicon systems:
+
+```bash
+rapid-mlx serve qwen3.6-35b-4bit \
+  --speculative-config '{"method":"mtp","backend":"native"}'
+```
+
+This path pins both artifacts to the revisions Rapid-MLX qualified, accepts
+greedy requests only (`temperature=0`), and target-verifies every draft. On an
+M3 Ultra with 256 GB unified memory, five workload categories and 30 paired
+runs were byte-identical to target-only greedy output. Median decode throughput
+was 83.32 -> 130.93 tok/s; a steady 192-token HTTP request completed in
+1.52-1.54 seconds (about 125 tok/s end to end). The standard Rapid MTP server
+handled the same request at 97.4 tok/s.
+
+Native MTP is explicit because it is a single-user serial text server. It
+supports `/healthz`, `/v1/models`, and `/v1/chat/completions`, including
+streaming, automatic tool-call parsing, reasoning parsing, auth, rate limits,
+deadlines, cancellation, and bounded admission. It does not support image,
+audio, embeddings, MCP, prefix caching, structured-output constraints,
+logprobs, sampling penalties, or continuous batching. Use ordinary MTP or plain
+decode when those capabilities matter more than singleton latency.
+
+`glm5.3-flash-4bit` selects its qualified native pair automatically when the
+compatible optional runtime is installed. Rapid pins the target and 4-bit MTP
+sidecar by immutable revision and uses one drafted token (`block_size=2`). On
+M3 Ultra / 256 GB, two six-task Rapid-server runs preserved complete AR
+reasoning and final output byte-for-byte. The repeated category median was
+35.54 tok/s; the second run improved paired task throughput by 34.1%, with
+per-task gains of 1.405x, 1.377x, 1.306x, 1.390x, 1.285x, and 1.106x.
+
+If the compatible optional runtime is absent, an unflagged serve remains on
+plain AR rather than failing. `--no-spec-decode` always forces AR. Nonzero
+temperature also uses AR for that request because the qualified MTP equivalence
+contract is greedy-only; sampling remains available and does not produce a
+400 response.
 
 An 86% acceptance rate buys a 9% ceiling here, and per-round overhead
 consumes it. The architecture is why: this is a linear-attention hybrid,
@@ -417,7 +469,7 @@ flag always wins over its env-var fallback when both are set.
 | `RAPID_MLX_BODY_RECEIVE_TIMEOUT_SECONDS` | 15 | Max idle seconds between request-body chunks (slowloris defense); exceeded connections get HTTP 408. 0 disables. |
 | `RAPID_MLX_IDLE_CACHE_CLEAR_SECONDS` | 0 (disabled) | Fallback for `--idle-cache-clear-seconds`: clear reusable KV state after this many idle seconds, keeping model weights loaded. An explicit CLI value (including 0) wins. |
 | `RAPID_MLX_WATCHDOG_PPID` | unset (disabled) | Fallback for `--watchdog-ppid`: self-terminate when the parent with this PID dies |
-| `RAPID_MLX_TELEMETRY` | unset | Telemetry kill switch: `0` / `false` / `no` / `off` / empty force-disables telemetry regardless of stored consent. Truthy values do NOT force-enable (consent is interactive-only). |
+| `RAPID_MLX_TELEMETRY` | unset (reporting defaults on) | Telemetry kill switch: `0` / `false` / `no` / `off` / empty force-disables telemetry regardless of stored consent. Truthy values do not force-enable. |
 | `DO_NOT_TRACK` | unset | Cross-tool opt-out convention: `1` / `true` force-disables telemetry regardless of stored consent (other values are ignored). Same precedence as `RAPID_MLX_TELEMETRY=0`; `rapid-mlx telemetry status` reports it as the reason. |
 | `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, `CIRCLECI`, `TRAVIS`, `BUILDKITE`, `JENKINS_URL`, `TEAMCITY_VERSION` | unset | Any of these set to a non-empty value marks a build machine and force-disables telemetry (build machines are never users). `rapid-mlx telemetry status` reports `ci (<VAR> is set)`. |
 | `RAPID_MLX_KV_CHECKPOINT_MAX_BYTES` | 21474836480 (20 GiB) | Disk cap for `~/.cache/rapid-mlx/kv_checkpoints/` when `--kv-disk-checkpoint-interval` is enabled; oldest files evicted first. Read at scan time, so it can change without a restart. |
@@ -432,7 +484,7 @@ flag always wins over its env-var fallback when both are set.
 | `RAPID_MLX_DEFAULT_MODEL` | `qwen3.5-4b-4bit` | Default model alias used by `rapid-mlx launch` when `--model` is not given |
 | `RAPID_MLX_DISABLE_VERSION_CHECK` | unset | Set to any non-empty value to skip new-version checks, including the passive `serve` startup-log notice |
 | `RAPID_MLX_TRUST_REMOTE_CODE` | unset | Set `0`/`false`/`no`/`off` to force `trust_remote_code=False` process-wide for tokenizer loading |
-| `VLLM_MLX_TEST_MODEL` | unset | Default model for tests |
+| `RAPID_MLX_TEST_MODEL` | unset | Default model for tests (legacy `VLLM_MLX_TEST_MODEL` still honored) |
 | `HF_TOKEN` | unset | HuggingFace authentication token |
 
 ### Client-side (SDK) variables

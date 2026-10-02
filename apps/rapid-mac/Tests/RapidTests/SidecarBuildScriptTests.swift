@@ -61,7 +61,7 @@ struct SidecarBuildScriptTests {
         let script = try String(contentsOf: Self.scriptURL, encoding: .utf8)
         let constraints = try String(contentsOf: Self.constraintsURL, encoding: .utf8)
 
-        #expect(constraints.contains("mlx-vlm==0.6.17"))
+        #expect(constraints.contains("mlx-vlm==0.7.2"))
         #expect(constraints.contains("sentencepiece==0.2.2"),
                 "SD3.5's T5 tokenizer dependency must not float in signed builds.")
         #expect(!script.contains("'mlx-vlm>=0.6.3,!=0.6.4,<0.7'"),
@@ -82,13 +82,13 @@ struct SidecarBuildScriptTests {
             #expect(script.contains(architecture),
                     "Every Desktop-advertised vision architecture needs a bundled import smoke.")
         }
-        #expect(script.contains("from vllm_mlx.image.hidream_runtime import HiDreamO1"),
+        #expect(script.contains("from rapid_mlx.image.hidream_runtime import HiDreamO1"),
                 "The bundled sidecar must include the HiDream image adapter, not only mlx-vlm.")
-        #expect(script.contains("from vllm_mlx.image.sd35_runtime import SD35Large"),
+        #expect(script.contains("from rapid_mlx.image.sd35_runtime import SD35Large"),
                 "The bundled sidecar must include the vendored SD3.5 image adapter.")
         #expect(script.contains("import sentencepiece"),
                 "The bundled sidecar must prove SD3.5's tokenizer dependency imports.")
-        #expect(script.contains("from vllm_mlx.image.sdxl_runtime import SDXL"),
+        #expect(script.contains("from rapid_mlx.image.sdxl_runtime import SDXL"),
                 "The bundled sidecar must include the vendored SDXL image adapter.")
         #expect(script.contains(#"find_spec("cv2") is None"#))
         #expect(script.contains(#"find_spec("torch") is None"#))
@@ -114,7 +114,7 @@ struct SidecarBuildScriptTests {
         let script = try String(contentsOf: Self.scriptURL, encoding: .utf8)
         let constraints = try String(contentsOf: Self.constraintsURL, encoding: .utf8)
 
-        #expect(constraints.contains("mflux==0.19.0"),
+        #expect(constraints.contains("mflux==0.20.0"),
                 "The no-deps sidecar install must never float within a range.")
         // The Images tab is only shippable because mflux's module-level
         // `import torch` is deferred into the three torch-only loading modes —
@@ -133,7 +133,9 @@ struct SidecarBuildScriptTests {
                 "The Qwen Image import path must defer PiD's optional torch checkpoint converter.")
         #expect(script.contains(#"importlib.import_module("mflux.models.qwen.variants.txt2img.qwen_image")"#),
                 "The bundle build must prove qwen-image itself imports without torch.")
-        #expect(script.contains(#"importlib.import_module("vllm_mlx.image.bonsai_runtime")"#),
+        #expect(script.contains(#"importlib.import_module("mflux.models.qwen21.variants.txt2img.qwen_image_21")"#),
+                "The bundle build must prove Qwen-Image 2.1 imports without torch.")
+        #expect(script.contains(#"importlib.import_module("rapid_mlx.image.bonsai_runtime")"#),
                 "The bundle build must prove the Desktop-advertised Bonsai adapter imports without torch.")
         #expect(script.contains("SIDECAR_IMAGE_SMOKE_MODEL"),
                 "Release-candidate builds must opt into a real image-generation model.")
@@ -156,10 +158,10 @@ struct SidecarBuildScriptTests {
 
         #expect(pyproject.contains("\naudio-desktop = ["),
                 "The bounded desktop audio dependency group must remain separately installable.")
-        #expect(pyproject.contains(#""mlx-audio>=0.2.9,<0.4.4""#))
+        #expect(pyproject.contains(#""mlx-audio>=0.5.3,<0.6""#))
         #expect(pyproject.contains(#""soundfile>=0.12.0""#))
-        #expect(script.contains(#""${RAPID_MLX_INSTALL_TARGET}[audio-desktop]""#),
-                "The desktop sidecar must install the bounded desktop audio dependency set.")
+        #expect(script.contains(#""${RAPID_MLX_INSTALL_TARGET}[audio-desktop,computer-use]""#),
+                "The desktop sidecar must install the bounded audio and Computer Use dependency sets.")
         #expect(script.contains(#"RAPID_MLX_WHEEL="${RAPID_MLX_WHEEL:-}""#),
                 "Release builds must be able to promote the exact candidate wheel into the sidecar.")
         #expect(script.contains("from mlx_audio.stt.utils import load_model"),
@@ -176,12 +178,13 @@ struct SidecarBuildScriptTests {
                 "The smoke must cover the resampler after SciPy trimming.")
         #expect(script.contains("TTSEngine.__new__(TTSEngine).to_bytes"),
                 "The smoke must encode a WAV after scipy.io has been trimmed.")
-        #expect(script.contains(#"-not -name qwen3_tts -not -name __pycache__"#),
-                "Only model-family directories outside Qwen3 TTS may be removed.")
+        #expect(script.contains(#"-not -name qwen3_tts -not -name chatterbox -not -name __pycache__"#),
+                "Qwen3 TTS and its mlx-audio 0.5.3 Chatterbox codec closure must survive trimming.")
         #expect(!script.contains(#"rm -rf "$STAGE/site-packages/mlx_audio/tts/models""#),
                 "The trim must never remove the complete TTS model directory.")
-        #expect(script.contains(#"MACHO_BASELINE_COUNT="${MACHO_BASELINE_COUNT:-173}""#),
-                "The signing baseline must include the bundled FFmpeg executable.")
+        // 173 pre-CUA Mach-O files plus 21 trimmed PyObjC extension modules.
+        #expect(script.contains(#"MACHO_BASELINE_COUNT="${MACHO_BASELINE_COUNT:-194}""#),
+                "The signing baseline must include FFmpeg and the measured PyObjC closure.")
     }
 
     @Test("Desktop video runtime is pinned, OpenCV-free, LGPL, and smoke-proven")

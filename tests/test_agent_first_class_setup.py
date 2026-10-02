@@ -4,12 +4,12 @@ import json
 
 import pytest
 
-from vllm_mlx.agents.setup import (
+from rapid_mlx.agents.setup import (
     apply_setup_plan,
     build_setup_plan,
     verify_server,
 )
-from vllm_mlx.launch import claude_code, continue_dev
+from rapid_mlx.launch import claude_code, continue_dev
 
 
 @pytest.fixture
@@ -91,7 +91,10 @@ def test_verify_server_checks_health_and_models(monkeypatch):
         return Response(json.dumps({"data": [{"id": "served-model"}]}).encode())
 
     monkeypatch.setattr("urllib.request.urlopen", fake_open)
-    assert verify_server("http://localhost:8000/v1", "default") == "served-model"
+    assert (
+        verify_server("http://localhost:8000/v1", "default", agent="deepseek-harness")
+        == "served-model"
+    )
     assert urls == [
         "http://localhost:8000/health",
         "http://localhost:8000/v1/models",
@@ -110,15 +113,15 @@ def test_dsh_plan_and_profile_template_agree_on_the_provider_contract(monkeypatc
     """
     import yaml
 
-    from vllm_mlx.agents import get_profile
-    from vllm_mlx.agents.setup import build_setup_plan
+    from rapid_mlx.agents import get_profile
+    from rapid_mlx.agents.setup import build_setup_plan
 
     base_url = "http://localhost:8000/v1"
     model = "qwen3.6-35b-4bit"
     context = 131072
 
     monkeypatch.setattr(
-        "vllm_mlx.agents.setup._dsh_settings_path",
+        "rapid_mlx.agents.setup._dsh_settings_path",
         lambda: __import__("pathlib").Path("/nonexistent/settings.yaml"),
     )
     plan = build_setup_plan("dsh", base_url, model, context_length=context)
@@ -159,7 +162,7 @@ def builtin_profiles(tmp_path, monkeypatch):
     pins. Point HOME at an empty tmp dir for the reload, then restore
     the real registry afterwards.
     """
-    from vllm_mlx import agents as agents_registry
+    from rapid_mlx import agents as agents_registry
 
     monkeypatch.setenv("HOME", str(tmp_path))
     agents_registry.load_profiles()
@@ -172,7 +175,7 @@ def test_agents_continue_dev_resolves_to_the_continue_profile(builtin_profiles):
     """``agents continue-dev`` is the launch registry's slug for the same
     product; it must resolve to the exact profile ``agents continue``
     uses (#2082)."""
-    from vllm_mlx.agents import get_profile
+    from rapid_mlx.agents import get_profile
 
     canonical = get_profile("continue")
     aliased = get_profile("continue-dev")
@@ -183,7 +186,7 @@ def test_agents_continue_dev_resolves_to_the_continue_profile(builtin_profiles):
 def test_framework_kind_comes_from_profile_metadata(builtin_profiles):
     """Exactly the three framework profiles declare ``kind: framework``;
     every other profile defaults to ``agent`` (#2082)."""
-    from vllm_mlx.agents import list_profiles
+    from rapid_mlx.agents import list_profiles
 
     profiles = list_profiles()
     frameworks = {p.name for p in profiles if p.kind == "framework"}
@@ -196,7 +199,7 @@ def test_agents_footer_counts_agents_and_frameworks_separately(
 ):
     """The ``rapid-mlx agents`` footer must not count frameworks as
     agents: 13 rows are 10 agents + 3 frameworks (#2082)."""
-    import vllm_mlx.cli as cli
+    import rapid_mlx.cli as cli
 
     monkeypatch.setattr("sys.argv", ["rapid-mlx", "agents"])
     cli.main()
@@ -209,7 +212,7 @@ def test_agents_footer_counts_agents_and_frameworks_separately(
 
 
 def test_cli_parser_exposes_setup_safety_flags(monkeypatch):
-    import vllm_mlx.cli as cli
+    import rapid_mlx.cli as cli
 
     captured = {}
     monkeypatch.setattr(cli, "agents_command", lambda args: captured.update(vars(args)))
@@ -226,7 +229,7 @@ def test_cli_parser_exposes_setup_safety_flags(monkeypatch):
 def test_cli_reports_saved_config_when_connection_check_fails(
     setup_paths, monkeypatch, capsys
 ):
-    import vllm_mlx.cli as cli
+    import rapid_mlx.cli as cli
 
     _, continue_path = setup_paths
     monkeypatch.setattr(
@@ -242,8 +245,10 @@ def test_cli_reports_saved_config_when_connection_check_fails(
         ],
     )
     monkeypatch.setattr(
-        "vllm_mlx.agents.setup.verify_server",
-        lambda *_args: (_ for _ in ()).throw(RuntimeError("connection refused")),
+        "rapid_mlx.agents.setup.verify_server",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("connection refused")
+        ),
     )
 
     with pytest.raises(SystemExit) as exit_info:
@@ -260,8 +265,8 @@ def test_user_continue_dev_overlay_wins_over_the_builtin_alias(tmp_path, monkeyp
     """The ``continue-dev`` -> ``continue`` alias must be a FALLBACK only: a
     user who installs their own ``~/.rapid-mlx/agents/continue-dev.yaml``
     gets that profile, not the aliased built-in (#2082 codex review)."""
-    from vllm_mlx import agents as agents_registry
-    from vllm_mlx.agents import get_profile
+    from rapid_mlx import agents as agents_registry
+    from rapid_mlx.agents import get_profile
 
     user_dir = tmp_path / ".rapid-mlx" / "agents"
     user_dir.mkdir(parents=True)

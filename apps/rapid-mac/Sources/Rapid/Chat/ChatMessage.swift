@@ -582,6 +582,22 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
     var parentID: UUID?
     let createdAt: Date
 
+    /// Wire-only trailer appended after this row's prose AND its attachment
+    /// extracts — see ``modelContent``.
+    ///
+    /// Deliberately absent from ``CodingKeys``: it is set on the throwaway
+    /// array ``ChatViewModel`` builds for one request, never on the
+    /// transcript, so it is not part of the conversation and must not reach
+    /// `conversations.json`. ``init(from:)`` therefore restores it as `nil`.
+    ///
+    /// The one producer is ``ChatViewModel/stampingClockContext(on:calendar:)``,
+    /// which needs each user turn's wall clock to land after that turn's
+    /// attachment extracts. Writing it into ``content`` instead would put it
+    /// in FRONT of the extract, so the first request carrying a document and
+    /// the next one would diverge before the document rather than after it,
+    /// and the engine's prefix cache could not reuse the document.
+    var wireSuffix: String?
+
     init(
         id: UUID = UUID(),
         role: Role,
@@ -602,7 +618,8 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
         toolCallArtifactSuppressed: Bool = false,
         wireVisibility: WireVisibility = .model,
         parentID: UUID? = nil,
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        wireSuffix: String? = nil
     ) {
         self.id = id
         self.role = role
@@ -624,6 +641,7 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
         self.wireVisibility = wireVisibility
         self.parentID = parentID
         self.createdAt = createdAt
+        self.wireSuffix = wireSuffix
     }
 
     /// Codex r1 MAJOR-1: keep ``reasoningTruncated`` decodable from
@@ -746,17 +764,32 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
         // assumed to mean "root" until that repair has run.
         self.parentID = try c.decodeIfPresent(UUID.self, forKey: .parentID)
         self.createdAt = try c.decode(Date.self, forKey: .createdAt)
+        // Transient by construction — a persisted turn carries no wire
+        // trailer, and the next request mints a fresh one.
+        self.wireSuffix = nil
     }
 
     /// Text sent to the model. Document extracts stay out of the visible
     /// ``content`` property but remain part of this turn on every retry and
     /// follow-up request.
+    /// ``wireSuffix`` is joined LAST, after the attachment extracts, so a
+    /// per-request trailer cannot displace the document text that the
+    /// engine's prefix cache needs to find unchanged.
     var modelContent: String {
-        guard !fileAttachments.isEmpty else { return content }
+        let trailer = wireSuffix.flatMap {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : [$0]
+        } ?? []
+        guard !fileAttachments.isEmpty else {
+            guard !trailer.isEmpty else { return content }
+            // An empty prose row must not gain a leading blank line.
+            let head = content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? [] : [content]
+            return (head + trailer).joined(separator: "\n\n")
+        }
         let request = content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? "Analyze the attached file and summarize the important findings."
             : content
-        return ([request] + fileAttachments.map(\.promptText))
+        return ([request] + fileAttachments.map(\.promptText) + trailer)
             .joined(separator: "\n\n")
     }
 
@@ -1022,6 +1055,13 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
     ///     would contradict the chip on screen. A tool that ERRORED does
     ///     NOT count as succeeded — a hallucinated raw answer after a
     ///     failed tool is exactly the shape we still want to flag.
+    ///   * ``promptHadAttachment == false``, OR the prompt is not one
+    ///     an attached document could answer
+    ///     (``promptIsAttachmentAnswerable``). An answer read off an
+    ///     attached file is grounded, not guessed — but a page cannot
+    ///     ground "what is today's stock price", has nothing to do
+    ///     with "calculate 17*23", and is not what "search for Ada
+    ///     Lovelace's biography" asks for.
     ///   * ``finishReason`` is ``nil`` or anything OTHER than
     ///     ``"tool_calls"`` — a real tool-call turn doesn't need
     ///     the caption (the chip row already speaks for it). A
@@ -1032,13 +1072,30 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
     ///   * Prose body matches ``shouldFlagToolNotCalled``'s
     ///     numeric-or-short heuristic AND the user's prompt looks
     ///     calculator-shaped (see ``promptLooksCalculatorish``).
+    ///   * When the caller knows WHICH tools were advertised
+    ///     (``advertisedToolNames``), at least one of them could have
+    ///     served the prompt's lane (see ``advertisedToolCouldServe``).
+    ///     "Answered without calling any of the available tools" is
+    ///     only a caution when an available tool was the right call:
+    ///     a chat that advertises web search, weather and document
+    ///     reading has no tool that computes `17 * 23`, so a correct
+    ///     `391` wore the caption for nothing (0.14.3 dogfood,
+    ///     2026-09-18). ``nil`` keeps the pre-existing behaviour for
+    ///     callers that only know "some tools were on".
     ///
-    /// The heuristic is intentionally loose — a false-positive
-    /// caption ("model probably tool-called; this caption is wrong")
-    /// is annoying but harmless; a false-negative (silent wrong
-    /// answer) is the bug we're fixing. The view layer is
-    /// responsible for making the caption dismissible (one-shot per
-    /// session) so a user who knows better can mute it.
+    /// The heuristic leans towards firing — a false-negative (a
+    /// silent wrong answer) is the bug we're fixing, and the view
+    /// layer makes the caption dismissible (one-shot per session) so
+    /// a user who knows better can mute it. But false positives are
+    /// NOT free, which the original #308 note understated: the
+    /// caption's whole value is that the user believes it, and each
+    /// time it appears under a demonstrably correct answer it teaches
+    /// them to ignore the next one. That is why the prompt heuristic
+    /// matches whole words (see ``promptLooksCalculatorish``) and why
+    /// a document-grounded turn is exempt (Gate 1c) instead of
+    /// relying on the user to dismiss it — and equally why that
+    /// exemption is *narrow*: an attachment on the turn does not make
+    /// a live-data question answerable from the page.
     ///
     /// Role-agnostic (assertion-only check); the view layer enforces
     /// "only paint on assistant rows".
@@ -1048,7 +1105,9 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
         toolCalls: [ToolCall]?,
         finishReason: String?,
         toolsRequested: Bool,
-        toolSucceededThisTurn: Bool = false
+        toolSucceededThisTurn: Bool = false,
+        promptHadAttachment: Bool = false,
+        advertisedToolNames: [String]? = nil
     ) -> Bool {
         // Gate 1: tools must have actually been advertised. Without
         // this gate every short numeric answer would wear the caption.
@@ -1067,6 +1126,27 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
         // computed at the call site from the turn's message history (see
         // ``ChatViewModel.turnHadSuccessfulTool``).
         guard !toolSucceededThisTurn else { return false }
+        // Gate 1c: the user's turn carried a document AND the question
+        // is one that document could answer. When it is, the answer is
+        // grounded in text the user supplied in the prompt, so
+        // "answered without calling any of the available tools" is not
+        // a caution — it is the correct behaviour, and no tool on the
+        // roster could have improved it. Dogfooding 0.14.1 hit exactly
+        // this: a scanned-invoice turn whose grounded, correct total
+        // wore the caption, which reads as "this number may be a
+        // guess" directly under a number the model had in fact read
+        // off the page. Flagging a right answer is not a harmless
+        // false positive — it spends the user's trust in the caption,
+        // so the next one (a real hallucinated total) gets ignored too.
+        //
+        // But the exemption has to be narrow, because an attachment is
+        // not a general licence — three review rounds each found a
+        // prompt that carried a document and still could not be
+        // answered from it. So the test is stated positively, as the
+        // one shape a page CAN answer: math vocabulary whose operands
+        // live on that page. See ``promptIsAttachmentAnswerable`` for
+        // the table of what that excludes and why.
+        if promptHadAttachment, promptIsAttachmentAnswerable(userPrompt) { return false }
         // Gate 2: model must have produced no tool_calls. A real
         // tool-call turn doesn't need the caption.
         let noToolCalls = (toolCalls?.isEmpty ?? true)
@@ -1086,7 +1166,155 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
         // "yes" / "no" assistant reply to a casual question would
         // wear the caption.
         guard promptLooksCalculatorish(userPrompt) else { return false }
+        // Gate 6: one of the advertised tools must actually fit the lane
+        // the prompt is in. The caption's copy — "answered without
+        // calling any of the available tools" — is a claim that a tool
+        // SHOULD have run; when nothing on the roster could have, the
+        // claim is false and each false alarm spends the trust the next
+        // real one needs. Only enforced when the caller names the roster,
+        // and never on a turn that carried an attachment: there the tool
+        // that should have run is `read_document` — the operands live on
+        // the page and reading them IS the job — which no lane table
+        // captures, and Gate 1c already exempts the shapes a page can
+        // answer. Anything it left standing keeps the caption exactly as
+        // before this gate existed (pr_validate codex, run 3).
+        if let advertisedToolNames, !promptHadAttachment {
+            guard advertisedToolCouldServe(prompt: userPrompt, toolNames: advertisedToolNames) else {
+                return false
+            }
+        }
         return true
+    }
+
+    /// Could any tool in `toolNames` have answered `prompt`?
+    ///
+    /// Maps each tool-shaped lane of ``promptLooksCalculatorish`` to the
+    /// capability that serves it and asks whether an advertised tool carries
+    /// that capability. The built-in roster is classified by exact name
+    /// (``builtinToolCapabilities``); anything else — MCP connectors, whose
+    /// names are arbitrary — is classified by the words in its name
+    /// (``capabilities(ofToolNamed:)``): `calculator`, `execute_python`,
+    /// `fetch_url` all read as intended. Words, not substrings, so
+    /// `profile_update` does not read as a file tool. A name that matches
+    /// no word at all is UNCLASSIFIED, and an unclassified tool keeps the
+    /// caption: an MCP `arithmetic` tool can compute `17 * 23`, so a bare
+    /// `390` under it must still be flagged. Erring towards "servable" is
+    /// the safe direction (a caution the user can dismiss, not a silent
+    /// wrong number); the only tools that are known NOT to serve a lane are
+    /// the ones whose purpose is spelled out.
+    ///
+    /// | lane | capability | built-ins | name words |
+    /// | --- | --- | --- | --- |
+    /// | arithmetic / math vocabulary | compute | — | calc, math, python, interpreter, eval, compute, arith, solve, wolfram |
+    /// | live data (weather, prices, news) | network | web_search, browse, weather | search, web, weather, browse, fetch, http, url, news, stock, price, forecast, internet, crawl, scrape |
+    /// | external retrieval (search for, look up) | retrieval | web_search, browse | search, web, browse, fetch, http, url, read, document, doc, pdf, page, file, find, lookup, wiki, retrieve, query |
+    ///
+    /// The local workspace tools (`local_search`, `local_read`,
+    /// `local_write`, `local_trash`, `local_run`) serve none of the three
+    /// lanes. `local_run` can execute Python, but it is "Run development
+    /// command" behind an approval sheet, not a calculator: a model that
+    /// multiplies `17 * 23` in its head instead of asking permission to run
+    /// a shell did the right thing, and a caption telling the user it should
+    /// have run a tool is the false alarm this gate removes (0.14.3 dogfood,
+    /// 2026-09-18, default roster). A dedicated compute tool — `calculator`,
+    /// `code_interpreter`, `execute_python` — is a different matter and
+    /// keeps the caption.
+    static func advertisedToolCouldServe(prompt: String, toolNames: [String]) -> Bool {
+        var roster = Set<ToolCapability>()
+        for name in toolNames {
+            // Unclassified → assume it could have served; keep the caption.
+            guard let caps = capabilities(ofToolNamed: name) else { return true }
+            roster.formUnion(caps)
+        }
+        let lowered = prompt.lowercased()
+        if roster.contains(.compute),
+           promptContainsSelfContainedArithmetic(lowered) || promptContainsMathKeyword(lowered) {
+            return true
+        }
+        if roster.contains(.network), promptAsksForLiveData(lowered) { return true }
+        if roster.contains(.retrieval), promptAsksForExternalRetrieval(lowered) { return true }
+        return false
+    }
+
+    /// What a tool can do for the purposes of ``advertisedToolCouldServe``.
+    enum ToolCapability: Hashable {
+        /// Evaluate arithmetic or run code on demand.
+        case compute
+        /// Reach the network for live data.
+        case network
+        /// Search for or read external material.
+        case retrieval
+    }
+
+    /// Exact-name classification of the tools this app ships. An empty set
+    /// is a real answer ("serves none of the lanes"), distinct from the
+    /// `nil` an unknown name gets from ``capabilities(ofToolNamed:)``.
+    static let builtinToolCapabilities: [String: Set<ToolCapability>] = [
+        "web_search": [.network, .retrieval],
+        "browse": [.network, .retrieval],
+        "weather": [.network],
+        // Reads the user's own attachments by id — grounding for a document
+        // question (Gate 1c), not a way to search for or fetch anything.
+        "read_document": [],
+        "local_search": [],
+        "local_read": [],
+        "local_write": [],
+        "local_trash": [],
+        "local_run": [],
+    ]
+
+    /// Capabilities of a tool judged by its name: built-ins by exact match,
+    /// everything else by the words in the name (split on `_`, `-`, `.`,
+    /// digits and camelCase; a word matches a fragment when it starts with
+    /// it, so `calculator`/`calc`, `urls`/`url`, `searching`/`search`).
+    /// `nil` when no word is recognised.
+    static func capabilities(ofToolNamed name: String) -> Set<ToolCapability>? {
+        if let known = builtinToolCapabilities[name] { return known }
+        let words = toolNameWords(name)
+        func hasAny(_ fragments: [String]) -> Bool {
+            words.contains { word in fragments.contains { word.hasPrefix($0) } }
+        }
+        var caps = Set<ToolCapability>()
+        // Not "code": `code_search` / `code_review` are not calculators, and
+        // `code_interpreter` is caught by "interpreter". An `execute_code`
+        // tool has no recognised word and keeps the caption.
+        if hasAny(["calc", "math", "python", "interpreter", "eval", "compute", "arith", "solve", "wolfram"]) {
+            caps.insert(.compute)
+        }
+        if hasAny(["search", "web", "weather", "browse", "fetch", "http", "url", "news", "stock", "price", "forecast", "internet", "crawl", "scrape"]) {
+            caps.insert(.network)
+        }
+        if hasAny(["search", "web", "browse", "fetch", "http", "url", "read", "document", "doc", "pdf", "page", "file", "find", "lookup", "wiki", "retrieve", "query"]) {
+            caps.insert(.retrieval)
+        }
+        return caps.isEmpty ? nil : caps
+    }
+
+    /// Lower-cased words of a tool name. `fetchURL` → `fetch`, `url`;
+    /// `URLCalculator` → `url`, `calculator`; `execute_python3` → `execute`,
+    /// `python`; `read-document` → `read`, `document`. camelCase splits
+    /// before an uppercase letter that follows a lowercase one, and before
+    /// the last capital of an acronym run when a lowercase letter follows it.
+    static func toolNameWords(_ name: String) -> [String] {
+        let letters = Array(name.unicodeScalars).map(Character.init)
+        var words: [String] = []
+        var current = ""
+        for (index, ch) in letters.enumerated() {
+            guard ch.isLetter else {
+                if !current.isEmpty { words.append(current); current = "" }
+                continue
+            }
+            if ch.isUppercase, !current.isEmpty {
+                let previous = letters[index - 1]
+                let next: Character? = index + 1 < letters.count ? letters[index + 1] : nil
+                let boundary = previous.isLowercase
+                    || (previous.isUppercase && (next?.isLowercase ?? false))
+                if boundary { words.append(current); current = "" }
+            }
+            current.append(ch.lowercased())
+        }
+        if !current.isEmpty { words.append(current) }
+        return words
     }
 
     // MARK: - Issue #513: raw tool-call artifact suppression
@@ -1131,6 +1359,30 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
         // the last moment even if the captured array reads empty — be
         // conservative and leave it alone.
         if finishReason == "tool_calls" { return false }
+        // Gate 4b: a turn that answered in prose and THEN emitted an
+        // envelope. The 0.14.1 dogfood repro: 5,413 characters of
+        // "Let me read the first page more carefully…" followed by
+        // `<tool_call> {"name":"read_document","arguments":{…,"greP":…`,
+        // which no parser claimed — so no tool round fired, the model kept
+        // generating for six more minutes, and the user watched a sentence
+        // that promised an action be followed by nothing at all. The
+        // leading-only check below cannot see it, because the artifact is
+        // the TAIL of an otherwise real answer.
+        if trailingToolCallArtifactProse(in: content) != nil { return true }
+        // Not a gate, but the question every reviewer asks here: what about a
+        // COMPLETE, well-formed, unfenced example that legitimately ends an
+        // answer? Two things cover it. Gates 1-3 are themselves the
+        // "parser-rejected" evidence — tools were advertised and the turn came
+        // back with no tool call at all, so an envelope the engine's parser
+        // could read would have been dispatched and never reached this line.
+        // And #513 documents the remainder as an accepted residual: a turn
+        // that IS only a raw call shape cannot be told apart from a leak by
+        // content, suppression is non-destructive (the raw text stays on the
+        // message; copy and export reproduce it verbatim, and since this PR
+        // the prose above it renders), and in the target population — a local
+        // model whose call the parser lost — a leak is far likelier than a
+        // deliberately-requested example. A fenced example, which is how a
+        // model actually answers "show me one", is never touched.
         // Gate 4: the content must actually look like a raw tool-call
         // artifact, not a genuine answer that merely embeds JSON.
         //
@@ -1150,6 +1402,375 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
         // deliberately-requested example. Prose-FRAMED examples ("here's a
         // JSON example: …") are NOT suppressed — see the detector.
         return contentLooksLikeToolCallArtifact(content)
+    }
+
+    /// The prose an assistant turn actually said, when its content is real
+    /// text followed by a malformed tool-call envelope — or nil when there
+    /// is no such tail.
+    ///
+    /// Companion to ``contentLooksLikeToolCallArtifact``, which only fires
+    /// when the artifact IS the whole turn. Here the answer is genuine and
+    /// only its tail is machine syntax, so the prose is kept and the tail is
+    /// replaced by ``toolCallArtifactSuppressedCaptionCopy``.
+    ///
+    /// Conservative in the same three ways as the leading check:
+    ///   * The marker must OPEN A LINE and be followed by that format's
+    ///     payload — the ``leadingEnvelopeLeak`` gate, applied to the tail,
+    ///     plus a block anchor — so an answer that explains `<tool_call>` in
+    ///     a sentence is left alone whether or not it fences the example.
+    ///     (The DeepSeek U+2581 token is exempt from the anchor: it never
+    ///     appears in prose, so there is no inline shape to protect.)
+    ///   * A marker inside a fenced code block is never a leak. An answer to
+    ///     "show me what a tool call looks like" puts its example in a fence,
+    ///     and that fence is the whole point of asking. Fences are parsed
+    ///     (``fencedRanges``), not counted: backticks and tildes, three or
+    ///     more, closer matching the opener. A fenced marker is SKIPPED, not
+    ///     a verdict: the scan carries on to the next candidate, so an answer
+    ///     that shows a fenced example and then trails off into a real
+    ///     envelope is still caught.
+    ///   * There must be real prose before it. With none, the leading check
+    ///     owns the turn and this returns nil, so the caption-only render
+    ///     stays exactly as it was.
+    ///   * The envelope must be the turn's TAIL — inside the terminal run of
+    ///     machine syntax (``terminalMachineSyntaxRunStart``). An answer that
+    ///     shows a raw call and then explains it keeps its explanation.
+    static func trailingToolCallArtifactProse(in content: String) -> String? {
+        // Candidate openers for the machine-syntax tail.
+        //
+        // Strict on purpose: each pattern requires that format's payload to
+        // follow the marker (whitespace only in between). The leading check
+        // can afford its looser "carries a closing tag somewhere" fallback,
+        // because it has already established that the envelope IS the whole
+        // turn; a tail cannot. An answer that mentions `<tool_call>` in a
+        // sentence and shows a fenced example further down would match from
+        // the sentence onward under the loose gate, and eat the explanation
+        // along with the example.
+        let patterns = [
+            // Every XML/bracket envelope must OPEN A LINE (leading whitespace
+            // allowed). A leaked call is emitted as its own block after the
+            // model stops writing prose; an answer that documents the syntax
+            // does it mid-sentence — `Use <tool_call>{"name":"search"}` — and
+            // truncating that sentence at the tag is the false positive this
+            // detector must not have. The dogfood repro and every other real
+            // leak shape put the envelope on its own line.
+            #"(?m)^[ \t]*</?(tool_call|function_call)[^>]*>\s*[\{\[<]"#,
+            // `<function=NAME>` must also OPEN a payload: JSON, or the nested
+            // `<parameter=` block the llama/qwen fragment shape uses. The bare
+            // tag is not enough — prose about the syntax carries it too. (The
+            // leading check can keep accepting the bare prefix: prose never
+            // OPENS a turn with `<function=`.)
+            #"(?m)^[ \t]*<function=[^<>\s]+>\s*(?:[\{\[]|<parameter=)"#,
+            // A `<parameter=…>` block on its own line AND closed by
+            // `</parameter>`. Both halves are required for the same reason:
+            // inline inside a sentence it is documentation.
+            #"(?m)^[ \t]*<parameter=[^<>\s]+>[\s\S]{0,4096}?</parameter>"#,
+            #"(?m)^[ \t]*\[TOOL_CALLS\]\s*[\{\[]"#,
+            // The DeepSeek marker is deliberately NOT line-anchored: its
+            // U+2581 separators never occur in human prose, so there is no
+            // inline-documentation shape to protect and a real emit can follow
+            // the last prose character directly. The `<\u{FF5C}` opener is folded
+            // into the match so the prose above it does not keep a dangling
+            // half-tag.
+            "[<\u{FF5C}]*tool\u{2581}calls\u{2581}begin",
+        ]
+
+        // The turn must END in machine syntax, and only the terminal run of
+        // it is a candidate tail.
+        //
+        // This is what "tail" means, and without it a genuine answer that
+        // shows a raw (unfenced) call on its own line and then EXPLAINS it
+        // lost the explanation: suppression ran from the marker to the end of
+        // the turn, so the closing sentences went with the example. Confining
+        // the search to the terminal machine-syntax run also fixes the general
+        // case — example, prose, then a real envelope — because the earlier
+        // example is no longer even a candidate.
+        guard let runStart = terminalMachineSyntaxRunStart(in: content) else { return nil }
+        let searchRange = runStart..<content.endIndex
+
+        // Fences next: one line pass, reused by every pattern below.
+        let fenced = fencedRanges(in: content)
+
+        // The earliest UNFENCED candidate across every pattern.
+        //
+        // Two things this must not do. It must not stop at the first match of
+        // a pattern and decide on it alone — a legitimate fenced example
+        // earlier in the turn would then hide the genuine unfenced envelope
+        // after it, and that envelope renders raw. And it must not cap the
+        // number of candidates it will look at — a cap is spent by the
+        // examples and loses the real tail that follows them. Instead a match
+        // inside a fence advances the cursor past the WHOLE fenced block, so a
+        // fence holding a thousand examples costs one step, not a thousand.
+        var earliest: String.Index?
+        for pattern in patterns {
+            var from = runStart
+            // `fenced` is ascending and disjoint and a pattern's matches only
+            // move forward, so one cursor walks the fence list ONCE per
+            // pattern. Asking `fenced.first { … }` per match instead rescans
+            // every range from the start, which is quadratic in the number of
+            // fenced examples — on the transcript render path.
+            var block = 0
+            while from < content.endIndex,
+                  let found = content.range(
+                      of: pattern, options: [.regularExpression],
+                      range: from..<searchRange.upperBound
+                  ) {
+                while block < fenced.count, fenced[block].upperBound <= found.lowerBound {
+                    block += 1
+                }
+                if block < fenced.count, fenced[block].contains(found.lowerBound) {
+                    from = max(fenced[block].upperBound, content.index(after: found.lowerBound))
+                    continue
+                }
+                // Matches arrive in increasing order, so the first unfenced
+                // one is this pattern's earliest; no need to scan its tail.
+                if earliest == nil || found.lowerBound < earliest! { earliest = found.lowerBound }
+                break
+            }
+        }
+
+        // Nothing unfenced, or the turn OPENS with machine syntax: either way
+        // this returns nil — in the second case the leading check owns the
+        // turn and the caption stands alone. Testing the first UNFENCED
+        // candidate (rather than the first candidate of any kind) is what
+        // keeps a turn that opens with a fenced example from bailing here.
+        guard let start = earliest, start > content.startIndex else { return nil }
+        let prose = String(content[content.startIndex..<start])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // Whitespace only: the artifact is effectively the whole turn, so the
+        // leading check owns it and the caption stands alone.
+        return prose.isEmpty ? nil : prose
+    }
+
+    /// What to render above the suppression caption: the prose of a turn
+    /// whose tail was machine syntax, or nil when the artifact was the whole
+    /// turn and the caption stands alone.
+    static func proseAboveSuppressedToolCallArtifact(content: String) -> String? {
+        // Trailing wins when it fires: its own gates already establish that
+        // there is real prose before the machine syntax, which the leading
+        // check cannot tell (it matches the DeepSeek marker ANYWHERE in the
+        // turn, so a prose answer that trailed off into one used to lose the
+        // prose as well as the tail).
+        trailingToolCallArtifactProse(in: content)
+    }
+
+    /// Where the turn's terminal run of machine syntax begins, or nil when
+    /// the turn does not end in machine syntax at all.
+    ///
+    /// Walks lines from the end: a blank line or a machine-syntax line
+    /// (``isMachineSyntaxLine``) belongs to the run, and the first line that
+    /// reads as prose stops it.
+    ///
+    /// Deliberately a line-shape test rather than a JSON/XML parse: the run
+    /// only has to tell an envelope dump — what a model emits when the parser
+    /// lost its call and generation simply stopped — from a sentence, and the
+    /// input is by definition syntax no parser could read. Every test is kept
+    /// strict, because widening one moves the boundary EARLIER, and an
+    /// over-early boundary eats real prose. A closing ```` ``` ```` stops the
+    /// run too, which is correct: a turn that ENDS with a fenced example is
+    /// showing the example, not leaking a call.
+    private static func terminalMachineSyntaxRunStart(in content: String) -> String.Index? {
+        var runStart: String.Index?
+        var sawContent = false
+        var lineStart = content.startIndex
+        var index = content.startIndex
+        // Forward pass recording the last prose line's successor, which is the
+        // same answer as walking backwards and cheaper on String.Index.
+        while true {
+            let lineEnd = content[index...].firstIndex(of: "\n") ?? content.endIndex
+            let trimmed = content[lineStart..<lineEnd]
+                .trimmingCharacters(in: .whitespaces)
+            if !trimmed.isEmpty {
+                if isMachineSyntaxLine(trimmed) {
+                    if runStart == nil { runStart = lineStart }
+                    sawContent = true
+                } else {
+                    // Prose: everything up to and including this line is the
+                    // answer, so any run starts after it.
+                    runStart = nil
+                }
+            }
+            guard lineEnd < content.endIndex else { break }
+            index = content.index(after: lineEnd)
+            lineStart = index
+        }
+        return sawContent ? runStart : nil
+    }
+
+    /// True when a line is a piece of an envelope dump rather than a sentence.
+    ///
+    /// Structural per opener, not "the first character is punctuation". Prose
+    /// opens with punctuation often enough that the loose form ate real
+    /// content: a Markdown link (`[That syntax](…) is invalid`), a reference
+    /// definition (`[1]: …`), a quoted sentence. Each case below accepts the
+    /// shape an envelope actually produces and nothing wider.
+    private static func isMachineSyntaxLine(_ trimmed: String) -> Bool {
+        // Never in prose, wherever it appears.
+        if trimmed.contains("tool\u{2581}calls\u{2581}") { return true }
+        guard let first = trimmed.first else { return false }
+        switch first {
+        case "{", "}", "]", ",":
+            // These open no sentence BY THEMSELVES, but prose can open with
+            // one: "} closes the object; this is why …". A JSON fragment — `}`,
+            // `},`, `},{"name":"x"}`, `{"limit": 10,` — carries no unquoted
+            // word; a sentence does.
+            return hasNoUnquotedWord(trimmed)
+        case "[":
+            // Reject Markdown first: a link (`[label](url)`) or a reference
+            // definition (`[1]: url`). The digit branch below has to accept
+            // `[1, 2]`, so `[1]: url` would otherwise read as an array.
+            if trimmed.range(
+                of: #"^\[[^\]\n]*\]\s*[:(]"#,
+                options: .regularExpression) != nil {
+                return false
+            }
+            // A JSON array opening, or the Mistral marker.
+            return trimmed.range(
+                of: #"^\[(\s*$|\s*[\{\[\]"'\-0-9]|TOOL_CALLS\])"#,
+                options: .regularExpression) != nil
+        case "\"":
+            // A JSON key or a bare string element, not a quoted sentence.
+            return trimmed.range(
+                of: #"^"(\\.|[^"\\])*"\s*(:|,?$)"#,
+                options: .regularExpression) != nil
+        case "<":
+            // A tag, not prose that happens to open with a less-than sign.
+            return trimmed.contains(">")
+                && trimmed.range(
+                    of: #"^</?[A-Za-z\uFF5C|]"#,
+                    options: .regularExpression) != nil
+        default:
+            return isJSONScalarLine(trimmed)
+        }
+    }
+
+    /// True when a line carries no word outside a string literal.
+    ///
+    /// This is what separates a JSON fragment from a sentence that merely
+    /// OPENS with a brace or bracket. Words inside string literals do not
+    /// count — they are data, and a leaked call is full of them. The JSON
+    /// keywords are allowed through unquoted, since `{"ok": true}` is a
+    /// fragment; a run that stops matching one of them (`"trus"`) is a word.
+    private static func hasNoUnquotedWord(_ line: String) -> Bool {
+        let keywords = ["true", "false", "null"]
+        var inString = false
+        var escaped = false
+        var run = ""
+        for character in line {
+            if escaped { escaped = false; continue }
+            if inString, character == "\\" { escaped = true; continue }
+            if character == "\"" {
+                inString.toggle()
+                run = ""
+                continue
+            }
+            if inString { continue }
+            guard character.isLetter else { run = ""; continue }
+            run.append(character)
+            // One letter is never a word here — `1e5` and a bare `n` in a
+            // truncated `null` both have to pass.
+            guard run.count >= 2 else { continue }
+            let lowered = run.lowercased()
+            if !keywords.contains(where: { $0.hasPrefix(lowered) }) { return false }
+        }
+        return true
+    }
+
+    /// True for a line that is nothing but a JSON scalar with an optional
+    /// trailing comma — the continuation lines of a pretty-printed array
+    /// (`10,`, `true`, `null`). Quoted strings and the bracket/brace forms are
+    /// already covered by the first-character test.
+    private static func isJSONScalarLine(_ trimmed: String) -> Bool {
+        var body = Substring(trimmed)
+        if body.hasSuffix(",") { body = body.dropLast() }
+        body = Substring(body.trimmingCharacters(in: .whitespaces))
+        if body == "true" || body == "false" || body == "null" { return true }
+        return body.range(
+            of: #"^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?$"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    /// The character ranges of ``content`` that sit inside a fenced code
+    /// block, opening fence line included.
+    ///
+    /// CommonMark's actual rule, not a count of literal ```` ``` ````
+    /// sequences: a fence opens on a line whose first non-space content is a
+    /// run of three or more backticks OR tildes, and closes on a later line
+    /// whose run uses the SAME character, is at least as long, and carries
+    /// nothing but whitespace after it. Counting
+    /// triple-backtick occurrences — the shape this check started as —
+    /// misreads a ```` ~~~ ```` fence (no backticks at all) and a
+    /// four-backtick fence (the standard way to show a nested example) as
+    /// unfenced, which turns the example the user asked for into a "leak"
+    /// and truncates the answer at it. Same fence vocabulary the release-notes
+    /// renderer already accepts.
+    static func fencedRanges(in content: String) -> [Range<String.Index>] {
+        var ranges: [Range<String.Index>] = []
+        var openStart: String.Index?
+        var openMarker: FenceRun?
+        var index = content.startIndex
+        while index < content.endIndex {
+            let lineEnd = content[index...].firstIndex(of: "\n") ?? content.endIndex
+            let next = lineEnd < content.endIndex ? content.index(after: lineEnd) : content.endIndex
+            if let found = fenceRun(in: content[index..<lineEnd]) {
+                if let open = openMarker, let start = openStart {
+                    // A closer must use the opener's character, be at least as
+                    // long, and carry NOTHING but whitespace after the run.
+                    // CommonMark gives a closing fence no info string, so a
+                    // ```` ```swift ```` line inside a ``` block is content —
+                    // treating it as a closer would leave the rest of the
+                    // example unfenced and truncate the answer there.
+                    if found.marker == open.marker, found.run >= open.run, found.isBare {
+                        ranges.append(start..<next)
+                        openMarker = nil
+                        openStart = nil
+                    }
+                } else {
+                    openMarker = found
+                    openStart = index
+                }
+            }
+            index = next
+        }
+        // An unterminated fence runs to the end of the turn: a streamed answer
+        // cut off mid-example is still an example, not a leak.
+        if let start = openStart { ranges.append(start..<content.endIndex) }
+        return ranges
+    }
+
+    /// A fence line's delimiter run: which character, how long, and whether
+    /// anything follows it (an info string, which only an OPENER may have).
+    private struct FenceRun {
+        let marker: Character
+        let run: Int
+        let isBare: Bool
+    }
+
+    /// The fence run a line carries, or nil when the line is not a fence line.
+    ///
+    /// Indentation is measured in COLUMNS with tabs expanded to the next
+    /// four-column stop, because that is what decides the CommonMark cutoff:
+    /// four columns in is an indented code block, not a fence opener, and a
+    /// single leading tab already reaches four. A backtick fence's info string
+    /// may not contain a backtick, which is what keeps inline `` `code` ``
+    /// spans off this path.
+    private static func fenceRun(in line: Substring) -> FenceRun? {
+        var rest = line
+        var column = 0
+        while let first = rest.first, first == " " || first == "\t" {
+            column = first == "\t" ? (column / 4 + 1) * 4 : column + 1
+            if column > 3 { return nil }
+            rest = rest.dropFirst()
+        }
+        guard let marker = rest.first, marker == "`" || marker == "~" else { return nil }
+        let run = rest.prefix { $0 == marker }.count
+        guard run >= 3 else { return nil }
+        let info = rest.dropFirst(run)
+        if marker == "`", info.contains("`") { return nil }
+        return FenceRun(
+            marker: marker, run: run,
+            isBare: info.allSatisfy { $0 == " " || $0 == "\t" }
+        )
     }
 
     /// True when ``content`` is *essentially just* a malformed tool-call
@@ -1395,8 +2016,10 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
     /// True when the user's prompt reads as a calculator-, web-
     /// search-, or weather-style query — i.e. the kind of question
     /// where a tool-call SHOULD have been the right shape. The
-    /// match is keyword-based and intentionally inclusive; the
-    /// caption is dismissible and a false-positive is harmless.
+    /// match is keyword-based and inclusive, but WHOLE-WORD (see
+    /// ``containsKeyword``): substring matching flagged any prose
+    /// containing "computer", "sometimes" or "surplus", and a
+    /// caption under a correct answer costs more than #308 assumed.
     ///
     /// Heuristics:
     ///   * Math operators (``+``, ``-``, ``*``, ``/``, ``%``, ``=``,
@@ -1410,6 +2033,70 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
     ///     ``news``, ``today``, ``current``).
     ///   * Weather-shaped keywords (``weather``, ``temperature``,
     ///     ``forecast``).
+    /// True when ``keyword`` appears in ``haystack`` as a whole word
+    /// (or whole phrase) rather than as a substring of a longer word.
+    ///
+    /// ``lowered.contains(kw)`` is what shipped with #308, and it
+    /// misfires on ordinary English: ``compute`` matches "computer"
+    /// and "computing", ``times`` matches "sometimes", ``plus``
+    /// matches "surplus", ``minus`` matches "minuscule",
+    /// ``forecast`` matches "forecasting", ``sum of`` matches
+    /// "consum[er] of". Every one of those turns a normal prose
+    /// question into a "calculator-shaped" one, and a short answer
+    /// containing any digit then wears the caution. Dogfooding
+    /// 0.14.1 tripped it on a document question with "computed" in
+    /// the prose.
+    ///
+    /// A boundary is anything that is not a letter or a digit, plus
+    /// the ends of the string — so "compute 17*23", "(compute)" and
+    /// "compute." all match while "computer" does not. Multi-word
+    /// keywords keep working because only the outer edges of the
+    /// phrase are checked.
+    static func containsKeyword(_ keyword: String, in haystack: String) -> Bool {
+        guard !keyword.isEmpty else { return false }
+        func isWordScalar(_ scalar: Unicode.Scalar) -> Bool {
+            CharacterSet.alphanumerics.contains(scalar)
+        }
+        /// A boundary, or a regular English plural immediately followed by
+        /// one. codex flagged the regression this closes: moving from
+        /// substring to whole-word matching silently dropped "temperatures",
+        /// "forecasts" and "current prices", all of which the old substring
+        /// match caught and all of which are ordinary live-data questions.
+        /// Accepting a trailing "s"/"es" before the boundary keeps the
+        /// inflections without reopening the substring bug — "forecasting"
+        /// is still rejected (the next scalar is "i"), "forecasted" too
+        /// ("ed" is not "es"), and "concurrent" never contained a keyword to
+        /// begin with.
+        func boundaryFollows(_ index: String.Index) -> Bool {
+            if index == haystack.endIndex { return true }
+            if !isWordScalar(haystack[index].unicodeScalars.first!) { return true }
+            for suffix in ["es", "s"] where haystack[index...].hasPrefix(suffix) {
+                let after = haystack.index(index, offsetBy: suffix.count)
+                if after == haystack.endIndex
+                    || !isWordScalar(haystack[after].unicodeScalars.first!) {
+                    return true
+                }
+            }
+            return false
+        }
+        var searchStart = haystack.startIndex
+        while let range = haystack.range(
+            of: keyword,
+            range: searchStart..<haystack.endIndex
+        ) {
+            let leftOK = range.lowerBound == haystack.startIndex
+                || !isWordScalar(
+                    haystack[haystack.index(before: range.lowerBound)]
+                        .unicodeScalars.first!
+                )
+            if leftOK && boundaryFollows(range.upperBound) { return true }
+            // Overlapping matches matter ("timestimes"), so advance by
+            // one character rather than past the whole keyword.
+            searchStart = haystack.index(after: range.lowerBound)
+        }
+        return false
+    }
+
     static func promptLooksCalculatorish(_ prompt: String) -> Bool {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
@@ -1423,34 +2110,166 @@ struct ChatMessage: Identifiable, Codable, Equatable, Hashable {
         let hasOperator = lowered.contains(where: { mathOperators.contains($0) })
         if hasDigit && hasOperator { return true }
 
-        // Math keywords.
+        // The three remaining lanes each live in their own predicate, so
+        // Gate 1c can name exactly which of them an attachment neutralises
+        // without either copy of the keyword lists drifting.
+        if promptContainsMathKeyword(lowered) { return true }
+        // Note: codex r1 MAJOR-1 (#308 PR) dropped the bare
+        // ``"what is the"`` keyword — it matched every plain factual
+        // question ("What is the capital of France?") and false-flagged
+        // short prose answers like "Paris." Web-search keywords must
+        // point at LIVE / DATED information; an evergreen factual
+        // lookup is not the failure mode this caption guards against.
+        if promptAsksForLiveData(lowered) { return true }
+        if promptAsksForExternalRetrieval(lowered) { return true }
+
+        return false
+    }
+
+    /// Math vocabulary with no literal expression — "calculate the total",
+    /// "sum of the line items", "what percent of it".
+    ///
+    /// This is the ONE lane an attachment neutralises (see Gate 1c of
+    /// ``shouldFlagToolNotCalled``): the operands can live on the page, so
+    /// reading them off it is the grounded, correct answer.
+    static func promptContainsMathKeyword(_ prompt: String) -> Bool {
+        let lowered = prompt.lowercased()
         let mathKeywords: [String] = [
             "square root", "sqrt", "percent", "calculate", "compute", "solve",
             "divide", "multiply", "sum of", "product of", "plus", "minus",
             "times", "divided by"
         ]
-        for kw in mathKeywords where lowered.contains(kw) { return true }
+        for kw in mathKeywords where containsKeyword(kw, in: lowered) { return true }
+        return false
+    }
 
-        // Web-search keywords. Note: codex r1 MAJOR-1 (#308 PR)
-        // dropped the bare ``"what is the"`` keyword — it matched
-        // every plain factual question ("What is the capital of
-        // France?") and false-flagged short prose answers like
-        // "Paris." Web-search keywords must point at LIVE / DATED
-        // information; an evergreen factual lookup is not the
-        // failure mode this caption guards against.
-        let webKeywords: [String] = [
-            "search for", "google for", "look up", "look it up",
+    /// Asks for something to be fetched from outside the conversation.
+    ///
+    /// These used to sit with the math keywords on the theory that "look up
+    /// the invoice number" is answered by an attached page. codex was right
+    /// that the theory does not survive its own counterexample: attach a
+    /// résumé and ask to "search for Ada Lovelace's biography" and the page
+    /// grounds nothing, yet the exemption silenced the caption on a
+    /// completely ungrounded answer — the #308 failure mode itself.
+    ///
+    /// So external-retrieval language now withholds the exemption. The cost
+    /// is accepted knowingly: "look up the invoice number" with the invoice
+    /// attached will wear a caution it does not deserve. Of the two errors,
+    /// the false negative is the one this feature exists to prevent, and the
+    /// caption is dismissible while a silent wrong answer is not.
+    static func promptAsksForExternalRetrieval(_ prompt: String) -> Bool {
+        let lowered = prompt.lowercased()
+        let retrievalKeywords: [String] = ["search for", "look up", "look it up"]
+        for kw in retrievalKeywords where containsKeyword(kw, in: lowered) { return true }
+        return false
+    }
+
+    /// True when an attached document could actually answer `prompt`.
+    ///
+    /// Stated as what IS exempt rather than as a list of disqualifiers,
+    /// because the disqualifier form grew a hole every review round. Of the
+    /// four lanes that make a prompt tool-shaped at all
+    /// (``promptLooksCalculatorish``), exactly one is answerable from a page
+    /// the user attached:
+    ///
+    /// | lane | attached document can answer it? |
+    /// | --- | --- |
+    /// | math keywords, no literal expression | **yes** — operands are on the page |
+    /// | self-contained arithmetic (`17*23`) | no — prompt brought its own numbers |
+    /// | live data (today's price, the weather) | no — no page holds a moving target |
+    /// | external retrieval (search for, look up) | no — it asks to leave the document |
+    static func promptIsAttachmentAnswerable(_ prompt: String) -> Bool {
+        guard !promptAsksForLiveData(prompt) else { return false }
+        guard !promptContainsSelfContainedArithmetic(prompt) else { return false }
+        guard !promptAsksForExternalRetrieval(prompt) else { return false }
+        return promptContainsMathKeyword(prompt)
+    }
+
+    /// True when `prompt` names a MOVING target — something that
+    /// changes without the conversation changing, so no document the
+    /// user attached can contain the answer.
+    ///
+    /// This is the line that makes Gate 1c of
+    /// ``shouldFlagToolNotCalled`` safe to draw. Without it, any
+    /// attachment on the turn silences the caption, including for
+    /// "here is my portfolio PDF — what is today's stock price?",
+    /// where a bare number with no tool call is exactly the
+    /// hallucination the caption exists to flag.
+    ///
+    /// ``"google for"`` lives here rather than with the
+    /// retrieval-shaped keywords in ``promptLooksCalculatorish``
+    /// because it names an external service outright; ``"search
+    /// for"`` / ``"look up"`` do not, and pointing either of those at
+    /// an attached document is an ordinary thing for a user to do.
+    ///
+    /// Whole-word matching throughout (see ``containsKeyword``), so
+    /// "temperature" does not fire on "temperatures"' neighbours and
+    /// "current" does not fire on "concurrent".
+    static func promptAsksForLiveData(_ prompt: String) -> Bool {
+        let lowered = prompt.lowercased()
+        let liveKeywords: [String] = [
+            "google for",
             "latest news", "latest version", "news about",
             "today's", "this week's", "right now",
             "current price", "stock price", "exchange rate",
-            "current weather"
+            "current weather",
+            // Looser than the phrases above, and deliberately so: a
+            // bare "weather" / "temperature" / "forecast" is always a
+            // live-data question, attachment or not.
+            "weather", "temperature", "forecast"
         ]
-        for kw in webKeywords where lowered.contains(kw) { return true }
+        for kw in liveKeywords where containsKeyword(kw, in: lowered) { return true }
+        return false
+    }
 
-        // Weather keywords (looser than the web list above).
-        let weatherKeywords: [String] = ["weather", "temperature", "forecast"]
-        for kw in weatherKeywords where lowered.contains(kw) { return true }
-
+    /// True when `prompt` carries arithmetic that stands on its own — a
+    /// digit and an operator, as in "17*23" or "1200 * 0.15".
+    ///
+    /// Such a question does not become document-grounded just because a
+    /// document happens to be attached: the numbers are in the prompt,
+    /// the page is irrelevant, and the calculator is exactly the tool
+    /// that should have run. So this withholds Gate 1c's exemption
+    /// alongside ``promptAsksForLiveData``.
+    ///
+    /// Note what it deliberately does NOT cover: math *keywords* with
+    /// no literal expression — "what is the total due? calculate it
+    /// from the invoice", the 0.14.1 dogfood case — where the operands
+    /// live on the page and reading them off it is the grounded,
+    /// correct answer. The discriminator is whether the prompt brought
+    /// its own numbers.
+    static func promptContainsSelfContainedArithmetic(_ prompt: String) -> Bool {
+        let hasDigit = prompt.unicodeScalars.contains { scalar in
+            scalar.value >= 0x30 && scalar.value <= 0x39
+        }
+        guard hasDigit else { return false }
+        let mathOperators: Set<Character> = ["+", "*", "/", "%", "=", "^"]
+        if prompt.contains(where: { mathOperators.contains($0) }) { return true }
+        // "-" only counts with a number on each side: a hyphenated filename
+        // or a dashed aside ("attached is my resume - what does it say?") is
+        // not arithmetic, but "1200-180" and "1200 - 180" both are. codex
+        // caught the spaced form being missed, which is the way most people
+        // actually type it.
+        let scalars = Array(prompt.unicodeScalars)
+        func isDigit(_ index: Int) -> Bool {
+            scalars.indices.contains(index)
+                && scalars[index].value >= 0x30
+                && scalars[index].value <= 0x39
+        }
+        func digitLookingBack(from index: Int) -> Bool {
+            var i = index
+            while scalars.indices.contains(i), scalars[i] == " " || scalars[i] == "\t" { i -= 1 }
+            return isDigit(i)
+        }
+        func digitLookingForward(from index: Int) -> Bool {
+            var i = index
+            while scalars.indices.contains(i), scalars[i] == " " || scalars[i] == "\t" { i += 1 }
+            return isDigit(i)
+        }
+        for (offset, scalar) in scalars.enumerated() where scalar == "-" {
+            if digitLookingBack(from: offset - 1), digitLookingForward(from: offset + 1) {
+                return true
+            }
+        }
         return false
     }
 

@@ -26,16 +26,16 @@ from unittest.mock import patch
 
 import pytest
 
-from vllm_mlx.model_aliases import (
+from rapid_mlx.model_aliases import (
     AliasProfile,
     list_aliases,
     list_profiles,
     resolve_model,
     resolve_profile,
 )
-from vllm_mlx.model_auto_config import detect_model_config
+from rapid_mlx.model_auto_config import detect_model_config
 
-ALIASES_PATH = Path(__file__).parent.parent / "vllm_mlx" / "aliases.json"
+ALIASES_PATH = Path(__file__).parent.parent / "rapid_mlx" / "aliases.json"
 
 
 # ---- Schema sanity --------------------------------------------------------
@@ -237,8 +237,8 @@ def test_detect_model_config_alias_wins_over_regex_when_they_disagree() -> None:
     tool_call_parser to something the qwen3.5 regex would never
     return, and assert the alias's value reaches the caller.
     """
-    import vllm_mlx.model_aliases as ma
-    from vllm_mlx.model_aliases import AliasProfile
+    import rapid_mlx.model_aliases as ma
+    from rapid_mlx.model_aliases import AliasProfile
 
     real = ma._aliases["qwen3.5-4b-4bit"]
     forged = AliasProfile(
@@ -266,14 +266,14 @@ def test_legacy_string_value_still_loads(tmp_path) -> None:
     legacy = tmp_path / "aliases.json"
     legacy.write_text(json.dumps({"foo": "org/Foo-Model-7B"}))
 
-    import vllm_mlx.model_aliases as ma
+    import rapid_mlx.model_aliases as ma
 
     # Reset module cache and point loader at the legacy file
     with (
         patch.object(ma, "_aliases", None),
         patch.object(ma, "_hf_to_alias", None),
-        patch("vllm_mlx.model_aliases.os.path.join", return_value=str(legacy)),
-        patch("vllm_mlx.user_aliases.load_user_aliases", return_value={}),
+        patch("rapid_mlx.model_aliases.os.path.join", return_value=str(legacy)),
+        patch("rapid_mlx.user_aliases.load_user_aliases", return_value={}),
     ):
         profiles = ma.list_profiles()
 
@@ -291,12 +291,12 @@ def test_empty_hf_path_string_form_raises(tmp_path) -> None:
     bad = tmp_path / "aliases.json"
     bad.write_text(json.dumps({"foo": ""}))
 
-    import vllm_mlx.model_aliases as ma
+    import rapid_mlx.model_aliases as ma
 
     with (
         patch.object(ma, "_aliases", None),
         patch.object(ma, "_hf_to_alias", None),
-        patch("vllm_mlx.model_aliases.os.path.join", return_value=str(bad)),
+        patch("rapid_mlx.model_aliases.os.path.join", return_value=str(bad)),
         pytest.raises(ValueError, match="empty"),
     ):
         ma.list_profiles()
@@ -307,12 +307,12 @@ def test_empty_hf_path_dict_form_raises(tmp_path) -> None:
     bad = tmp_path / "aliases.json"
     bad.write_text(json.dumps({"foo": {"hf_path": ""}}))
 
-    import vllm_mlx.model_aliases as ma
+    import rapid_mlx.model_aliases as ma
 
     with (
         patch.object(ma, "_aliases", None),
         patch.object(ma, "_hf_to_alias", None),
-        patch("vllm_mlx.model_aliases.os.path.join", return_value=str(bad)),
+        patch("rapid_mlx.model_aliases.os.path.join", return_value=str(bad)),
         pytest.raises(ValueError, match="non-empty string"),
     ):
         ma.list_profiles()
@@ -324,12 +324,12 @@ def test_invalid_value_raises_with_alias_name(tmp_path) -> None:
     bad = tmp_path / "aliases.json"
     bad.write_text(json.dumps({"foo": 42}))
 
-    import vllm_mlx.model_aliases as ma
+    import rapid_mlx.model_aliases as ma
 
     with (
         patch.object(ma, "_aliases", None),
         patch.object(ma, "_hf_to_alias", None),
-        patch("vllm_mlx.model_aliases.os.path.join", return_value=str(bad)),
+        patch("rapid_mlx.model_aliases.os.path.join", return_value=str(bad)),
         pytest.raises(ValueError, match="foo"),
     ):
         ma.list_profiles()
@@ -381,12 +381,12 @@ def test_invalid_video_modes_fail_at_registry_load(tmp_path, profile, message) -
     bad = tmp_path / "aliases.json"
     bad.write_text(json.dumps({"bad-video": profile}))
 
-    import vllm_mlx.model_aliases as ma
+    import rapid_mlx.model_aliases as ma
 
     with (
         patch.object(ma, "_aliases", None),
         patch.object(ma, "_hf_to_alias", None),
-        patch("vllm_mlx.model_aliases.os.path.join", return_value=str(bad)),
+        patch("rapid_mlx.model_aliases.os.path.join", return_value=str(bad)),
         pytest.raises(ValueError, match=message),
     ):
         ma.list_profiles()
@@ -450,21 +450,16 @@ def test_per_alias_schema_allows_independent_overrides() -> None:
 
 # ---- Reverse-lookup behaviour with shared hf_paths -----------------------
 #
-# The original two tests in this section pinned the duplicate-hf_path
-# tie-break for ``(nemotron-30b, nemotron-nano)`` and
-# ``(deepseek-v4-flash, deepseek-v4-flash-8bit)``. After the explicit-quant
-# alias rename, those codename aliases are gone (see the PR description for
-# ``feat/explicit-alias-naming``) and aliases.json no longer has any pair
-# pointing at the same hf_path, so the tie-break is unreachable from the
-# current registry. The reverse-lookup *mechanism* is still exercised by
-# ``test_reverse_lookup_index_built_once_after_first_load`` below.
+# Shared hf_paths resolve to the first alias in aliases.json. The reverse
+# index is case-insensitive because Hugging Face repo ids are, while the
+# insertion-order tie-break remains deterministic.
 
 
 def test_reverse_lookup_index_built_once_after_first_load() -> None:
     """Cheap behavioural check that the reverse index is built once and
     reused — exercises the cache path. Not a perf benchmark; just
     asserts ``_hf_to_alias`` is populated."""
-    import vllm_mlx.model_aliases as ma
+    import rapid_mlx.model_aliases as ma
 
     # Trigger load
     ma.list_profiles()
@@ -472,4 +467,4 @@ def test_reverse_lookup_index_built_once_after_first_load() -> None:
     assert len(ma._hf_to_alias) <= len(ma._aliases)  # dedup possible
     # Every hf_path in aliases must be reachable via reverse lookup
     for profile in ma._aliases.values():
-        assert profile.hf_path in ma._hf_to_alias
+        assert profile.hf_path.lower() in ma._hf_to_alias

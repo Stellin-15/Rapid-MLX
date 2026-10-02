@@ -4,12 +4,11 @@
 Coverage for the four surfaces PR-A ships:
 
 1. ``detect_mtp_eligibility(..., has_external_sidecar=True)`` — Gemma 4
-   unified base checkpoint (no baked-in MTP head) stays NONE even when
-   the CLI has resolved a config ``model`` sidecar path. Qwen3.5 /
-   Qwen3.6 eligibility is unaffected (their MTP head is baked into the
-   target; a sidecar does not manufacture a missing head).
+   outer checkpoints become eligible only with an explicit assistant sidecar.
+   Native-MTP families are unaffected (a sidecar does not manufacture a
+   missing head in those targets).
 
-2. ``vllm_mlx.cli`` argparse — the legacy ``--mtp-sidecar`` flag is not
+2. ``rapid_mlx.cli`` argparse — the legacy ``--mtp-sidecar`` flag is not
    exposed; MTP sidecars come from ``--speculative-config`` only.
 
 3. ``SchedulerConfig.mtp_sidecar`` — round-trips as expected; default
@@ -41,15 +40,9 @@ pytestmark = pytest.mark.requires_mlx
 # ---------------------------------------------------------------------------
 
 
-def test_detect_sidecar_does_not_promote_gemma4_unified_missing_mtp_layers():
-    """Base Gemma 4 unified checkpoint + sidecar stays NONE.
-
-    Local July 2026 A/B validation of ``mlx-community/gemma-4-12B-it-4bit`` +
-    ``google/gemma-4-12B-it-assistant`` still diverges from the greedy
-    no-spec server output, so sidecar mode must not promote Gemma 4 into
-    MTP eligibility until a lossless implementation lands.
-    """
-    from vllm_mlx.spec_decode.mtp import (
+def test_detect_sidecar_promotes_gemma4_unified_missing_mtp_layers():
+    """Gemma 4 unified becomes eligible only with an explicit sidecar."""
+    from rapid_mlx.spec_decode.mtp import (
         MTPEligibility,
         detect_mtp_eligibility,
     )
@@ -57,18 +50,14 @@ def test_detect_sidecar_does_not_promote_gemma4_unified_missing_mtp_layers():
     config = {"model_type": "gemma4_unified"}  # no mtp_num_hidden_layers
     assert detect_mtp_eligibility(config) is MTPEligibility.NONE
     assert (
-        detect_mtp_eligibility(config, has_external_sidecar=True) is MTPEligibility.NONE
+        detect_mtp_eligibility(config, has_external_sidecar=True)
+        is MTPEligibility.CHAIN
     )
 
 
-def test_detect_sidecar_does_not_promote_gemma4_unified_zero_mtp_layers():
-    """Explicit ``mtp_num_hidden_layers: 0`` + sidecar stays NONE too.
-
-    Same shape as the base 12B checkpoint after someone hand-edited
-    the config to stamp a zero on it. Sidecar-mode must still fail
-    closed for Gemma 4 until lossless validation passes.
-    """
-    from vllm_mlx.spec_decode.mtp import (
+def test_detect_sidecar_promotes_gemma4_unified_zero_mtp_layers():
+    """The external assistant, not target metadata, supplies Gemma 4 MTP."""
+    from rapid_mlx.spec_decode.mtp import (
         MTPEligibility,
         detect_mtp_eligibility,
     )
@@ -76,7 +65,8 @@ def test_detect_sidecar_does_not_promote_gemma4_unified_zero_mtp_layers():
     config = {"model_type": "gemma4_unified", "mtp_num_hidden_layers": 0}
     assert detect_mtp_eligibility(config) is MTPEligibility.NONE
     assert (
-        detect_mtp_eligibility(config, has_external_sidecar=True) is MTPEligibility.NONE
+        detect_mtp_eligibility(config, has_external_sidecar=True)
+        is MTPEligibility.CHAIN
     )
 
 
@@ -90,7 +80,7 @@ def test_detect_sidecar_no_effect_on_qwen3_5_missing_mtp():
     CHAIN because the assistant-drafter path in ``gemma4_inject.py``
     doesn't know how to graft onto a Qwen3.5 target.
     """
-    from vllm_mlx.spec_decode.mtp import (
+    from rapid_mlx.spec_decode.mtp import (
         MTPEligibility,
         detect_mtp_eligibility,
     )
@@ -107,23 +97,35 @@ def test_detect_sidecar_no_effect_on_qwen3_5_missing_mtp():
     )
 
 
-def test_detect_sidecar_no_effect_on_gemma4_multimodal():
-    """Multimodal ``gemma4`` (Gemma4ForConditionalGeneration) — sidecar
-    does NOT promote to CHAIN.
-
-    ``gemma4_unified`` is the ONLY lineage on the sidecar-allowlist for
-    PR-A because that's the only one with a verified external assistant
-    drafter today (``google/gemma-4-*-it-assistant``). Multimodal
-    ``gemma4`` (26B-A4B / e2b / e4b) stays NONE regardless of the
-    sidecar flag — a future release can add it once the multimodal
-    drafter lineage lands.
-    """
-    from vllm_mlx.spec_decode.mtp import (
+def test_detect_sidecar_promotes_gemma4_multimodal_outer_wrapper():
+    """The public multimodal Gemma 4 wrapper delegates to its text target."""
+    from rapid_mlx.spec_decode.mtp import (
         MTPEligibility,
         detect_mtp_eligibility,
     )
 
     config = {"model_type": "gemma4", "mtp_num_hidden_layers": 0}
+    assert detect_mtp_eligibility(config) is MTPEligibility.NONE
+    assert (
+        detect_mtp_eligibility(config, has_external_sidecar=True)
+        is MTPEligibility.CHAIN
+    )
+
+
+def test_detect_sidecar_refuses_gemma4_shared_kv_target():
+    """Shortened producer-only cache layouts are not yet sidecar-safe."""
+    from rapid_mlx.spec_decode.mtp import (
+        MTPEligibility,
+        detect_mtp_eligibility,
+    )
+
+    config = {
+        "model_type": "gemma4",
+        "text_config": {
+            "num_hidden_layers": 35,
+            "num_kv_shared_layers": 20,
+        },
+    }
     assert (
         detect_mtp_eligibility(config, has_external_sidecar=True) is MTPEligibility.NONE
     )
@@ -134,7 +136,7 @@ def test_detect_sidecar_leaves_qwen3_5_with_mtp_layers_untouched():
     regardless of the sidecar flag. Sidecar flag is additive — it
     NEVER downgrades an already-eligible model.
     """
-    from vllm_mlx.spec_decode.mtp import (
+    from rapid_mlx.spec_decode.mtp import (
         MTPEligibility,
         detect_mtp_eligibility,
     )
@@ -159,7 +161,7 @@ def test_detect_sidecar_default_argument_matches_pre_0913_behaviour():
     rely on the None-argument case being identical to the old ``NONE``
     shape when MTP layers are missing.
     """
-    from vllm_mlx.spec_decode.mtp import (
+    from rapid_mlx.spec_decode.mtp import (
         MTPEligibility,
         detect_mtp_eligibility,
     )
@@ -180,7 +182,7 @@ def test_detect_sidecar_default_argument_matches_pre_0913_behaviour():
 
 
 def _serve_help_stdout() -> str:
-    """Run ``python -m vllm_mlx.cli serve --help`` and return stdout.
+    """Run ``python -m rapid_mlx.cli serve --help`` and return stdout.
 
     Mirrors ``tests/test_dflash_spec_decode.py::_serve_help_stdout`` —
     same pattern lets us pin the flag without importing the giant CLI
@@ -190,7 +192,7 @@ def _serve_help_stdout() -> str:
     import sys
 
     proc = subprocess.run(
-        [sys.executable, "-m", "vllm_mlx.cli", "serve", "--help"],
+        [sys.executable, "-m", "rapid_mlx.cli", "serve", "--help"],
         capture_output=True,
         text=True,
         timeout=60,
@@ -216,7 +218,7 @@ def test_scheduler_config_mtp_sidecar_default_none():
     """Default matches the argparse default so pre-0.9.13 callers who
     construct ``SchedulerConfig()`` positionally / with defaults keep
     the old (Qwen3.5-only) MTP behaviour."""
-    from vllm_mlx.scheduler import SchedulerConfig
+    from rapid_mlx.scheduler import SchedulerConfig
 
     cfg = SchedulerConfig()
     assert cfg.mtp_sidecar is None
@@ -227,7 +229,7 @@ def test_scheduler_config_mtp_sidecar_round_trip():
 
     Accepts str; ``None`` is the "no sidecar" sentinel.
     """
-    from vllm_mlx.scheduler import SchedulerConfig
+    from rapid_mlx.scheduler import SchedulerConfig
 
     cfg = SchedulerConfig(
         spec_decode="mtp",
@@ -243,7 +245,7 @@ def test_scheduler_config_mtp_sidecar_local_path_round_trip():
     Resolution (HF repo id vs local dir) is deferred to the family
     injector — ``SchedulerConfig`` stores the string as-is.
     """
-    from vllm_mlx.scheduler import SchedulerConfig
+    from rapid_mlx.scheduler import SchedulerConfig
 
     cfg = SchedulerConfig(
         spec_decode="mtp",
@@ -258,7 +260,7 @@ def test_scheduler_config_mtp_model_type_default_none():
     direct-SchedulerConfig callers keep the pre-round-E lenient
     behaviour in ``_start_llm``.
     """
-    from vllm_mlx.scheduler import SchedulerConfig
+    from rapid_mlx.scheduler import SchedulerConfig
 
     cfg = SchedulerConfig()
     assert cfg.mtp_model_type is None
@@ -272,7 +274,7 @@ def test_scheduler_config_mtp_model_type_round_trip():
     model-load-executor dispatch step does NOT re-read config.json
     (codex round-E fix for the "silent no-op" regression).
     """
-    from vllm_mlx.scheduler import SchedulerConfig
+    from rapid_mlx.scheduler import SchedulerConfig
 
     cfg = SchedulerConfig(
         spec_decode="mtp",
@@ -281,20 +283,21 @@ def test_scheduler_config_mtp_model_type_round_trip():
     assert cfg.mtp_model_type == "gemma4_unified"
 
 
-def test_config_vetted_mtp_support_allowlist_is_qwen_only():
+def test_config_vetted_mtp_support_allowlist_matches_runtime_families():
     """Alias-profile false is only bypassed for config-vetted Qwen MTP."""
 
-    from vllm_mlx.scheduler import _config_vetted_mtp_supports_spec_decode
+    from rapid_mlx.scheduler import _config_vetted_mtp_supports_spec_decode
 
     assert _config_vetted_mtp_supports_spec_decode("qwen3_5") is True
     assert _config_vetted_mtp_supports_spec_decode("qwen3_5_moe") is True
     assert _config_vetted_mtp_supports_spec_decode("qwen4_exp") is True
-    assert _config_vetted_mtp_supports_spec_decode("gemma4_unified") is False
+    assert _config_vetted_mtp_supports_spec_decode("gemma4") is True
+    assert _config_vetted_mtp_supports_spec_decode("gemma4_unified") is True
     assert _config_vetted_mtp_supports_spec_decode(None) is False
 
 
 def test_qwen4_native_mtp_defaults_to_one_and_bounds_explicit_chain():
-    from vllm_mlx.cli import _resolve_mtp_depth_for_model
+    from rapid_mlx.cli import _resolve_mtp_depth_for_model
 
     assert _resolve_mtp_depth_for_model("qwen4_exp", 3, explicit=False) == 1
     assert _resolve_mtp_depth_for_model("qwen3_5", 3, explicit=True) == 3
@@ -320,7 +323,7 @@ def test_run_dispatch_mtp_inject_forwards_sidecar_path(monkeypatch):
     * ``model_type`` is the string returned by ``_resolve_hf_model_type``.
     * ``mtp_sidecar`` is passed through as-is.
     """
-    from vllm_mlx.engine import batched as _batched
+    from rapid_mlx.engine import batched as _batched
 
     sentinel_model = object()
     captured: dict = {}
@@ -332,10 +335,10 @@ def test_run_dispatch_mtp_inject_forwards_sidecar_path(monkeypatch):
         return True
 
     # ``_run_dispatch_mtp_inject`` imports ``dispatch_mtp_inject`` from
-    # ``vllm_mlx.spec_decode.mtp`` (the ``__init__`` re-export). Patch
+    # ``rapid_mlx.spec_decode.mtp`` (the ``__init__`` re-export). Patch
     # THAT symbol so the internal import inside the function picks up
     # the fake.
-    import vllm_mlx.spec_decode.mtp as _mtp
+    import rapid_mlx.spec_decode.mtp as _mtp
 
     monkeypatch.setattr(_mtp, "dispatch_mtp_inject", _fake_dispatch_mtp_inject)
     # Force ``_resolve_hf_model_type`` to a deterministic value — we
@@ -372,8 +375,8 @@ def test_run_dispatch_mtp_inject_returns_unresolved_when_model_type_missing(
     on plain autoregressive decode. ``_DISPATCH_REJECTED`` — a distinct
     return — is the HARD-fail path.
     """
-    import vllm_mlx.spec_decode.mtp as _mtp
-    from vllm_mlx.engine import batched as _batched
+    import rapid_mlx.spec_decode.mtp as _mtp
+    from rapid_mlx.engine import batched as _batched
 
     called = {"n": 0}
 
@@ -413,8 +416,8 @@ def test_run_dispatch_mtp_inject_returns_rejected_when_injector_refuses(monkeypa
     wrong assistant model_type, etc.) that MUST not silently fall
     back to plain decode.
     """
-    import vllm_mlx.spec_decode.mtp as _mtp
-    from vllm_mlx.engine import batched as _batched
+    import rapid_mlx.spec_decode.mtp as _mtp
+    from rapid_mlx.engine import batched as _batched
 
     def _fake_dispatch_mtp_inject(*args, **kwargs):
         return False  # family injector rejected
@@ -448,8 +451,8 @@ def test_run_dispatch_mtp_inject_returns_no_inject_for_unregistered_model_type(
     own "unknown model_type" branch) and we'd lose the distinction
     from a family-injector-refused case.
     """
-    import vllm_mlx.spec_decode.mtp as _mtp
-    from vllm_mlx.engine import batched as _batched
+    import rapid_mlx.spec_decode.mtp as _mtp
+    from rapid_mlx.engine import batched as _batched
 
     called = {"n": 0}
 
@@ -488,8 +491,8 @@ def test_run_dispatch_mtp_inject_prefers_cli_provided_model_type(monkeypatch):
     the CLI has already vetted the model_type on the asyncio thread,
     so re-reading on the executor is both wasteful and racy.
     """
-    import vllm_mlx.spec_decode.mtp as _mtp
-    from vllm_mlx.engine import batched as _batched
+    import rapid_mlx.spec_decode.mtp as _mtp
+    from rapid_mlx.engine import batched as _batched
 
     captured: dict = {}
     resolve_calls = {"n": 0}
@@ -527,8 +530,8 @@ def test_run_dispatch_mtp_inject_falls_back_when_no_preferred_model_type(monkeyp
     reading ``config.json`` on the executor thread. This preserves
     pre-round-E behaviour for direct callers.
     """
-    import vllm_mlx.spec_decode.mtp as _mtp
-    from vllm_mlx.engine import batched as _batched
+    import rapid_mlx.spec_decode.mtp as _mtp
+    from rapid_mlx.engine import batched as _batched
 
     captured: dict = {}
 
@@ -556,8 +559,8 @@ def test_run_dispatch_mtp_inject_propagates_none_sidecar(monkeypatch):
     (``qwen3_5_inject``) then follows its own default (no random init;
     the baked-in MTP head on the target checkpoint is used).
     """
-    import vllm_mlx.spec_decode.mtp as _mtp
-    from vllm_mlx.engine import batched as _batched
+    import rapid_mlx.spec_decode.mtp as _mtp
+    from rapid_mlx.engine import batched as _batched
 
     captured: dict = {}
 
@@ -600,7 +603,7 @@ def _drive_start_llm_dispatch_gate(dispatch_result, cli_vetted_model_type=None):
     ``RuntimeError`` with the helper's message on the hard-fail
     path — matching what ``_start_llm`` actually does.
     """
-    from vllm_mlx.engine import batched as _batched
+    from rapid_mlx.engine import batched as _batched
 
     action, err_msg = _batched._decide_mtp_dispatch_action(
         dispatch_result,
@@ -616,7 +619,7 @@ def _drive_start_llm_dispatch_gate(dispatch_result, cli_vetted_model_type=None):
 def test_decide_mtp_dispatch_action_returns_attached_for_attached_result():
     """Codex round-F NIT regression guard: pin the happy-path return
     of the production predicate helper."""
-    from vllm_mlx.engine import batched as _batched
+    from rapid_mlx.engine import batched as _batched
 
     action, msg = _batched._decide_mtp_dispatch_action(
         _batched._DISPATCH_ATTACHED, cli_vetted_model_type=None
@@ -631,7 +634,7 @@ def test_decide_mtp_dispatch_action_carries_cli_vetted_model_type_into_error():
     what the dispatcher failed to attach. Pin this in the helper
     directly so a docstring-only refactor can't drop it.
     """
-    from vllm_mlx.engine import batched as _batched
+    from rapid_mlx.engine import batched as _batched
 
     action, msg = _batched._decide_mtp_dispatch_action(
         _batched._DISPATCH_UNRESOLVED,
@@ -651,7 +654,7 @@ def test_start_llm_raises_runtime_error_on_dispatch_rejected():
     model_type (round-E) — an active injector rejection is always a
     hard-fail.
     """
-    from vllm_mlx.engine import batched as _batched
+    from rapid_mlx.engine import batched as _batched
 
     for cli_vetted in (None, "gemma4_unified"):
         try:
@@ -682,7 +685,7 @@ def test_start_llm_continues_on_dispatch_unresolved_when_not_cli_vetted():
     This preserves the round-D fix for callers that don't set
     ``mtp_model_type``.
     """
-    from vllm_mlx.engine import batched as _batched
+    from rapid_mlx.engine import batched as _batched
 
     result = _drive_start_llm_dispatch_gate(
         _batched._DISPATCH_UNRESOLVED, cli_vetted_model_type=None
@@ -708,7 +711,7 @@ def test_start_llm_raises_on_dispatch_unresolved_when_cli_vetted():
     demanded: "unresolved / no-inject cases for explicit MTP" must
     NOT silently continue.
     """
-    from vllm_mlx.engine import batched as _batched
+    from rapid_mlx.engine import batched as _batched
 
     try:
         _drive_start_llm_dispatch_gate(
@@ -731,7 +734,7 @@ def test_start_llm_continues_on_dispatch_no_inject_when_not_cli_vetted():
     lineage" path. Continue on plain decode; the scheduler's install
     gate also skips.
     """
-    from vllm_mlx.engine import batched as _batched
+    from rapid_mlx.engine import batched as _batched
 
     result = _drive_start_llm_dispatch_gate(
         _batched._DISPATCH_NO_INJECT, cli_vetted_model_type=None
@@ -746,7 +749,7 @@ def test_start_llm_raises_on_dispatch_no_inject_when_cli_vetted():
     an environment issue. Hard-fail so the operator doesn't boot
     with MTP silently disabled.
     """
-    from vllm_mlx.engine import batched as _batched
+    from rapid_mlx.engine import batched as _batched
 
     try:
         _drive_start_llm_dispatch_gate(
@@ -816,8 +819,8 @@ def test_apply_mtp_dispatch_returns_attached_on_happy_path(monkeypatch):
     Replaces the earlier ``inspect.getsource()`` string check which
     could pass while runtime behavior drifted.
     """
-    from vllm_mlx.engine import batched as _batched
-    from vllm_mlx.scheduler import SchedulerConfig
+    from rapid_mlx.engine import batched as _batched
+    from rapid_mlx.scheduler import SchedulerConfig
 
     monkeypatch.setattr(
         _batched,
@@ -836,8 +839,8 @@ def test_apply_mtp_dispatch_returns_attached_on_happy_path(monkeypatch):
 
 def test_apply_mtp_dispatch_uses_loaded_snapshot_for_qwen4_native_head(monkeypatch):
     """Flash-Next reads mtp.* from the exact snapshot selected by load."""
-    from vllm_mlx.engine import batched as _batched
-    from vllm_mlx.scheduler import SchedulerConfig
+    from rapid_mlx.engine import batched as _batched
+    from rapid_mlx.scheduler import SchedulerConfig
 
     captured = {}
 
@@ -877,8 +880,8 @@ def test_apply_mtp_dispatch_raises_on_rejected(monkeypatch):
     :func:`_apply_mtp_dispatch` raises ``RuntimeError`` regardless of
     whether the CLI vetted the model_type.
     """
-    from vllm_mlx.engine import batched as _batched
-    from vllm_mlx.scheduler import SchedulerConfig
+    from rapid_mlx.engine import batched as _batched
+    from rapid_mlx.scheduler import SchedulerConfig
 
     monkeypatch.setattr(
         _batched,
@@ -913,8 +916,8 @@ def test_apply_mtp_dispatch_raises_when_cli_vetted_and_unresolved(monkeypatch):
     this is the exact "silent no-op" regression codex round-E
     demanded be closed.
     """
-    from vllm_mlx.engine import batched as _batched
-    from vllm_mlx.scheduler import SchedulerConfig
+    from rapid_mlx.engine import batched as _batched
+    from rapid_mlx.scheduler import SchedulerConfig
 
     monkeypatch.setattr(
         _batched,
@@ -945,8 +948,8 @@ def test_apply_mtp_dispatch_soft_skips_when_not_cli_vetted(monkeypatch):
     lenient behaviour — ``_DISPATCH_UNRESOLVED`` continues on plain
     decode instead of aborting boot.
     """
-    from vllm_mlx.engine import batched as _batched
-    from vllm_mlx.scheduler import SchedulerConfig
+    from rapid_mlx.engine import batched as _batched
+    from rapid_mlx.scheduler import SchedulerConfig
 
     monkeypatch.setattr(
         _batched,
@@ -979,8 +982,8 @@ def test_apply_mtp_dispatch_raises_runtime_error_on_timeout(monkeypatch):
     hook returning normally lets the ``RuntimeError`` fallback fire,
     which is what this test asserts on.
     """
-    from vllm_mlx.engine import batched as _batched
-    from vllm_mlx.scheduler import SchedulerConfig
+    from rapid_mlx.engine import batched as _batched
+    from rapid_mlx.scheduler import SchedulerConfig
 
     monkeypatch.setenv("RAPID_MLX_MTP_DISPATCH_TIMEOUT_SEC", "1.0")
     # Codex round-L BLOCKING #1: no more process-exit hook to patch —
@@ -1028,8 +1031,8 @@ def test_apply_mtp_dispatch_timeout_logs_critical_and_does_not_call_os_exit(
       3. Asserting the ``RuntimeError`` propagates as the sole
          failure signal.
     """
-    from vllm_mlx.engine import batched as _batched
-    from vllm_mlx.scheduler import SchedulerConfig
+    from rapid_mlx.engine import batched as _batched
+    from rapid_mlx.scheduler import SchedulerConfig
 
     monkeypatch.setenv("RAPID_MLX_MTP_DISPATCH_TIMEOUT_SEC", "1.0")
 
@@ -1088,7 +1091,7 @@ def test_log_mtp_dispatch_timeout_does_not_call_os_exit(monkeypatch):
     statement — it MUST NOT call ``os._exit`` (regression guard against
     the prior ``_process_exit_on_mtp_dispatch_timeout`` behavior).
     """
-    from vllm_mlx.engine import batched as _batched
+    from rapid_mlx.engine import batched as _batched
 
     exit_codes: list[int] = []
 
@@ -1121,8 +1124,8 @@ def test_apply_mtp_dispatch_timeout_does_not_shut_down_shared_executor(monkeypat
     their own way. Verify by tracking ``executor.shutdown`` calls
     and asserting the shared executor is left alone.
     """
-    from vllm_mlx.engine import batched as _batched
-    from vllm_mlx.scheduler import SchedulerConfig
+    from rapid_mlx.engine import batched as _batched
+    from rapid_mlx.scheduler import SchedulerConfig
 
     monkeypatch.setenv("RAPID_MLX_MTP_DISPATCH_TIMEOUT_SEC", "1.0")
 
@@ -1162,7 +1165,7 @@ def test_get_mtp_dispatch_timeout_sec_default(monkeypatch):
     ``del`` would leak the un-set state to the next test in the
     session.
     """
-    from vllm_mlx.engine import batched as _batched
+    from rapid_mlx.engine import batched as _batched
 
     monkeypatch.delenv("RAPID_MLX_MTP_DISPATCH_TIMEOUT_SEC", raising=False)
     assert _batched._get_mtp_dispatch_timeout_sec() == 600.0
@@ -1172,7 +1175,7 @@ def test_get_mtp_dispatch_timeout_sec_zero_disables(monkeypatch):
     """An explicit ``0`` in the env var disables the timeout — for
     corp networks where the bounded-wait would false-positive.
     """
-    from vllm_mlx.engine import batched as _batched
+    from rapid_mlx.engine import batched as _batched
 
     monkeypatch.setenv("RAPID_MLX_MTP_DISPATCH_TIMEOUT_SEC", "0")
     assert _batched._get_mtp_dispatch_timeout_sec() is None
@@ -1182,7 +1185,7 @@ def test_get_mtp_dispatch_timeout_sec_malformed_falls_back_to_default(monkeypatc
     """Bad env var values fall back to the default with a warning
     instead of crashing engine boot.
     """
-    from vllm_mlx.engine import batched as _batched
+    from rapid_mlx.engine import batched as _batched
 
     monkeypatch.setenv("RAPID_MLX_MTP_DISPATCH_TIMEOUT_SEC", "not-a-number")
     assert _batched._get_mtp_dispatch_timeout_sec() == 600.0
@@ -1209,9 +1212,9 @@ def test_start_llm_calls_apply_mtp_dispatch():
     import asyncio
     from types import SimpleNamespace
 
-    from vllm_mlx.engine import batched as _batched
-    from vllm_mlx.scheduler import SchedulerConfig
-    from vllm_mlx.utils import tokenizer as _tokenizer_mod
+    from rapid_mlx.engine import batched as _batched
+    from rapid_mlx.scheduler import SchedulerConfig
+    from rapid_mlx.utils import tokenizer as _tokenizer_mod
 
     # 1. Build a BatchedEngine WITHOUT running its __init__ (which
     #    would probe MLLM registries / do I/O). Setting only the
@@ -1431,8 +1434,8 @@ def test_install_mtp_vendored_uses_inner_language_model_surface(monkeypatch):
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
 
     seen: dict[str, object] = {}
 
@@ -1504,7 +1507,7 @@ def test_install_mtp_vendored_gate_fails_closed_on_missing_request_metadata(
     ``_step`` MUST fall through to ``_orig_step()`` — not enter the
     MTP construction path — because the gate now returns False.
     """
-    from vllm_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.scheduler import _install_mtp_vendored
 
     batch_gen, gb = _make_batch_gen_with_gb()
     gb.uids = [42]  # single uid — passes the B==1 gate
@@ -1563,7 +1566,7 @@ def test_install_mtp_vendored_gate_fails_closed_on_missing_request_metadata(
 def test_install_mtp_vendored_sampling_metadata_shapes_fail_closed(request_stub):
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.scheduler import _install_mtp_vendored
 
     batch_gen, gb = _make_batch_gen_with_gb()
     gb.uids = [43]
@@ -1587,7 +1590,7 @@ def test_install_mtp_vendored_missing_processor_history_fails_closed():
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.scheduler import _install_mtp_vendored
 
     penalty = lambda tokens, logits: logits
     request_stub = SimpleNamespace(
@@ -1633,7 +1636,7 @@ def test_install_mtp_vendored_initial_skip_log_is_deduplicated_on_uid_reuse(
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.scheduler import _install_mtp_vendored
 
     def seeded_request():
         return SimpleNamespace(
@@ -1678,8 +1681,8 @@ def test_install_mtp_vendored_fails_closed_on_batch_size_growth(monkeypatch):
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
 
     fake_gen_calls = {"constructed": 0, "closed": 0}
 
@@ -1744,7 +1747,7 @@ def test_install_mtp_vendored_fails_closed_on_batch_size_growth(monkeypatch):
 def test_mtp_running_limit_serializes_requests_without_changing_queue_capacity():
     from types import SimpleNamespace
 
-    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+    from rapid_mlx.scheduler import Scheduler, SchedulerConfig
 
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.config = SchedulerConfig(
@@ -1771,7 +1774,7 @@ def test_mtp_running_limit_serializes_requests_without_changing_queue_capacity()
 def test_mtp_running_limit_uses_only_attested_continuous_capacity():
     from types import SimpleNamespace
 
-    from vllm_mlx.scheduler import Scheduler
+    from rapid_mlx.scheduler import Scheduler
 
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.config = SimpleNamespace(
@@ -1823,7 +1826,7 @@ def test_mtp_running_limit_uses_only_attested_continuous_capacity():
 def test_mtp_fixed_membership_collects_initial_wave_then_freezes_admission():
     from types import SimpleNamespace
 
-    from vllm_mlx.scheduler import Scheduler
+    from rapid_mlx.scheduler import Scheduler
 
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.config = SimpleNamespace(
@@ -1873,7 +1876,7 @@ def test_mtp_fixed_membership_collects_initial_wave_then_freezes_admission():
 def test_mtp_running_limit_clamps_malformed_continuous_capacity_to_one():
     from types import SimpleNamespace
 
-    from vllm_mlx.scheduler import Scheduler
+    from rapid_mlx.scheduler import Scheduler
 
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.config = SimpleNamespace(
@@ -1912,8 +1915,8 @@ def test_mtp_install_gate_miss_restores_plain_batch_width_in_same_schedule_tick(
     """An unsupported MTP runtime must not serialize ordinary decoding."""
     from unittest.mock import MagicMock
 
-    from vllm_mlx.request import Request, SamplingParams
-    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+    from rapid_mlx.request import Request, SamplingParams
+    from rapid_mlx.scheduler import Scheduler, SchedulerConfig
 
     tokenizer = MagicMock()
     tokenizer.encode = lambda _text: [1]
@@ -1968,7 +1971,7 @@ def test_install_mtp_vendored_b_gt_1_soft_fallthrough_when_no_state():
     """
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.scheduler import _install_mtp_vendored
 
     batch_gen, gb = _make_batch_gen_with_gb()
     ok = _install_mtp_vendored(
@@ -2004,8 +2007,8 @@ def test_install_mtp_vendored_defers_new_admission_until_singleton_departs(
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
 
     class _FakeGen:
         def __iter__(self):
@@ -2099,8 +2102,8 @@ def test_install_mtp_vendored_reaps_request_state_on_departure(
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
 
     closed: list[int] = []
 
@@ -2173,8 +2176,8 @@ def test_install_mtp_vendored_reaps_plain_fallthrough_log_key_on_finish(
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
 
     def _unexpected_generator(*args, **kwargs):
         raise AssertionError("custom processor must keep request on plain decode")
@@ -2230,8 +2233,8 @@ def test_install_mtp_vendored_discards_finished_cache_after_partial_round(
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
 
     advanced_cache = [object()]
     closed: list[bool] = []
@@ -2295,7 +2298,7 @@ def test_install_mtp_vendored_preserves_plain_finished_cache():
     """Installing the wrapper must not disable ordinary prefix-cache reuse."""
     from types import SimpleNamespace
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.scheduler import _install_mtp_vendored
 
     plain_cache = [object()]
     response = SimpleNamespace(
@@ -2329,13 +2332,13 @@ def test_scheduler_text_stop_retires_mtp_state_before_next_request(monkeypatch):
 
     import mlx.core as mx
 
-    from vllm_mlx.request import Request, RequestStatus, SamplingParams
-    from vllm_mlx.scheduler import (
+    from rapid_mlx.request import Request, RequestStatus, SamplingParams
+    from rapid_mlx.scheduler import (
         Scheduler,
         SchedulerConfig,
         _install_mtp_vendored,
     )
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
 
     class _FakeGen:
         def __iter__(self):
@@ -2448,7 +2451,7 @@ def test_scheduler_text_stop_retires_mtp_state_before_next_request(monkeypatch):
 
 def test_install_mtp_vendored_partial_remove_reaps_only_departed_uid():
     """A failed multi-uid remove must retain state for members still live."""
-    from vllm_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.scheduler import _install_mtp_vendored
 
     batch_gen, gb = _make_batch_gen_with_gb()
     present = {7, 8}
@@ -2493,7 +2496,7 @@ def test_install_mtp_vendored_partial_remove_keeps_state_when_departure_unknown(
     finder_shape,
 ):
     """An unobservable partial removal cannot justify reaping live state."""
-    from vllm_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.scheduler import _install_mtp_vendored
 
     batch_gen, gb = _make_batch_gen_with_gb()
 
@@ -2531,7 +2534,7 @@ def test_scheduler_stop_retirement_preserves_only_committed_plain_cache(
     """Plain decode keeps committed cache; a missing cache stays absent."""
     from unittest.mock import MagicMock
 
-    from vllm_mlx.scheduler import Scheduler
+    from rapid_mlx.scheduler import Scheduler
 
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.spec_decode_runtime_method = None
@@ -2551,7 +2554,7 @@ def test_scheduler_stop_retirement_preserves_only_committed_plain_cache(
 
 
 def test_scheduler_stop_retirement_requires_live_batch_generator():
-    from vllm_mlx.scheduler import Scheduler
+    from rapid_mlx.scheduler import Scheduler
 
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.batch_generator = None
@@ -2561,8 +2564,8 @@ def test_scheduler_stop_retirement_requires_live_batch_generator():
 
 
 def test_scheduler_installs_continuous_router_before_vendored_fallback(monkeypatch):
-    import vllm_mlx.scheduler as scheduler_module
-    from vllm_mlx.request import SamplingParams
+    import rapid_mlx.scheduler as scheduler_module
+    from rapid_mlx.request import SamplingParams
 
     events = []
     batch_generator = object()
@@ -2584,7 +2587,7 @@ def test_scheduler_installs_continuous_router_before_vendored_fallback(monkeypat
         scheduler_module, "_install_dense_sampler_fastpath", lambda _bg: None
     )
     monkeypatch.setattr(
-        "vllm_mlx.singleton_cache_fastpath.install_singleton_cache_fastpath",
+        "rapid_mlx.singleton_cache_fastpath.install_singleton_cache_fastpath",
         lambda: None,
     )
 
@@ -2635,7 +2638,7 @@ def test_scheduler_continuous_mtp_headroom_uses_unified_process_pressure(
     resident,
     expected,
 ):
-    from vllm_mlx.scheduler import Scheduler
+    from rapid_mlx.scheduler import Scheduler
 
     scheduler = Scheduler.__new__(Scheduler)
     scheduler._resolve_metal_cap_bytes = lambda: cap
@@ -2648,8 +2651,8 @@ def test_scheduler_continuous_mtp_headroom_uses_unified_process_pressure(
 def test_scheduler_native_stop_promotes_continuous_mtp_detach_state():
     from unittest.mock import MagicMock
 
-    from vllm_mlx.request import Request, RequestStatus, SamplingParams
-    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+    from rapid_mlx.request import Request, RequestStatus, SamplingParams
+    from rapid_mlx.scheduler import Scheduler, SchedulerConfig
 
     tokenizer = MagicMock()
     tokenizer.encode = lambda _text: [1]
@@ -2706,8 +2709,8 @@ def test_scheduler_native_stop_promotes_continuous_mtp_detach_state():
 def test_scheduler_continuous_mtp_detach_failure_does_not_hide_terminal():
     from unittest.mock import MagicMock
 
-    from vllm_mlx.request import Request, RequestStatus, SamplingParams
-    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+    from rapid_mlx.request import Request, RequestStatus, SamplingParams
+    from rapid_mlx.scheduler import Scheduler, SchedulerConfig
 
     tokenizer = MagicMock()
     tokenizer.encode = lambda _text: [1]
@@ -2760,8 +2763,8 @@ def test_install_mtp_vendored_first_call_construction_failure_does_not_double_bo
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
 
     def _raising_generator(*args, **kwargs):
         raise RuntimeError("simulated generator construction failure")
@@ -2834,8 +2837,8 @@ def test_install_mtp_vendored_first_call_failure_disables_subsequent_calls(monke
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
 
     construction_attempts = {"n": 0}
 
@@ -2913,8 +2916,8 @@ def test_install_mtp_vendored_disabled_uid_cleared_on_uid_reuse(monkeypatch):
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
 
     class _RecoveringCtor:
         """First construction raises; subsequent calls yield a fake
@@ -3033,8 +3036,8 @@ def test_install_mtp_vendored_cleanup_does_not_clear_disabled_uids(monkeypatch):
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
 
     construction_attempts = {"n": 0}
 
@@ -3091,8 +3094,8 @@ def test_install_mtp_vendored_stop_iteration_latches_terminal_uid(monkeypatch):
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
 
     class _EmptyGen:
         """Yields nothing — first next() call raises StopIteration."""
@@ -3173,8 +3176,8 @@ def test_install_mtp_vendored_non_greedy_mid_stream_fails_closed(
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
 
     fake_gen_calls = {"closed": 0}
 
@@ -3238,8 +3241,8 @@ def test_install_mtp_vendored_logits_processors_mid_stream_fails_closed(
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
 
     fake_gen_calls = {"closed": 0}
 
@@ -3299,9 +3302,9 @@ def test_install_mtp_vendored_carries_seeded_rng_after_priming(monkeypatch):
 
     import mlx.core as mx
 
-    from vllm_mlx._seeded_sampler import make_seeded_sampler
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx._seeded_sampler import make_seeded_sampler
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
 
     seen = {}
 
@@ -3366,9 +3369,9 @@ def test_install_mtp_vendored_latches_prompt_lookup_and_complete_history(
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
-    from vllm_mlx.spec_decode.mtp.prompt_lookup import PromptLookupPolicy
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.spec_decode.mtp.prompt_lookup import PromptLookupPolicy
 
     seen: dict[str, object] = {}
 
@@ -3431,7 +3434,7 @@ def test_install_mtp_vendored_latches_prompt_lookup_and_complete_history(
         "drafted_by_depth": [1, 1],
         "accepted_by_depth": [1, 0],
     }
-    from vllm_mlx.spec_decode.mtp.accept_counter import (
+    from rapid_mlx.spec_decode.mtp.accept_counter import (
         reset_global_counter_for_tests,
     )
 
@@ -3441,7 +3444,7 @@ def test_install_mtp_vendored_latches_prompt_lookup_and_complete_history(
 def test_scheduler_stats_export_vendored_mtp_counters_by_value():
     from unittest.mock import MagicMock
 
-    from vllm_mlx.scheduler import Scheduler, SchedulerConfig
+    from rapid_mlx.scheduler import Scheduler, SchedulerConfig
 
     tokenizer = MagicMock()
     tokenizer.encode = lambda _text: [1]
@@ -3457,14 +3460,20 @@ def test_scheduler_stats_export_vendored_mtp_counters_by_value():
 
 
 def test_install_mtp_vendored_does_not_admit_sampled_prompt_lookup(monkeypatch):
-    """Non-greedy requests stay on ordinary MTP pending separate qualification."""
+    """Non-greedy requests stay on ordinary MTP pending separate qualification.
+
+    The family below declares ``enabled_by_default`` and nothing else, which
+    is the greedy-only qualification. Copying at temperature > 0 is a second
+    declaration (``enabled_under_sampling``) and this request must not get it
+    by accident -- see the sibling test for the qualified case.
+    """
     from types import SimpleNamespace
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
-    from vllm_mlx.spec_decode.mtp.prompt_lookup import PromptLookupPolicy
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.spec_decode.mtp.prompt_lookup import PromptLookupPolicy
 
     seen: dict[str, object] = {}
 
@@ -3514,6 +3523,245 @@ def test_install_mtp_vendored_does_not_admit_sampled_prompt_lookup(monkeypatch):
     assert seen["prompt_lookup_history"] is None
 
 
+def test_install_mtp_vendored_admits_sampled_prompt_lookup_once_qualified(
+    monkeypatch,
+):
+    """The served path is where a sampled family's qualification has to land.
+
+    Every desktop chat is this request: the app's persisted default
+    temperature is 0.7 and it always sends a value, so a served request is
+    non-greedy unless the user goes looking for the slider. Gating copying on
+    greedy alone therefore handed the whole speedup to API callers who omit
+    ``temperature`` and to nobody else.
+
+    Two things are asserted, and the second is the one that broke in
+    development: the wrapper must admit the request, AND the policy it hands
+    the generator must still carry ``enabled_under_sampling``.
+    ``_effective_prompt_lookup_policy`` rebuilds the policy to fold in the
+    operator's ``RAPID_MLX_*`` overrides, and a rebuild that forgets this
+    field leaves the generator re-deciding the gate against a default-off
+    copy -- which turns the whole feature off again on exactly this path,
+    with every unit test of the policy itself still green.
+    """
+    from types import SimpleNamespace
+
+    import mlx.core as mx
+
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.spec_decode.mtp.prompt_lookup import PromptLookupPolicy
+
+    seen: dict[str, object] = {}
+
+    class _FakeGen:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return (201, mx.array([0.0]), False)
+
+        def close(self):
+            pass
+
+    class _SampledQualifiedModel(_StubModel):
+        mtp_prompt_lookup_supported = True
+        mtp_prompt_lookup_policy = PromptLookupPolicy(
+            enabled_by_default=True, enabled_under_sampling=True
+        )
+
+    monkeypatch.delenv("RAPID_MLX_MTP_PROMPT_LOOKUP", raising=False)
+    monkeypatch.delenv("RAPID_MLX_MTP_PROMPT_LOOKUP_SAMPLED", raising=False)
+    monkeypatch.setattr(
+        _gen_mod,
+        "mtp_generate_step",
+        lambda *args, **kwargs: seen.update(kwargs) or _FakeGen(),
+    )
+    batch_gen, gb = _make_batch_gen_with_gb()
+    gb.uids = [33]
+    gb.tokens = [[101, 102]]
+    gb._next_tokens = mx.array([500], dtype=mx.uint32)
+    gb._next_logprobs = [mx.array([0.0])]
+    request_stub = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            temperature=0.7,
+            top_p=0.9,
+            top_k=0,
+            min_p=0.0,
+            seed=None,
+        ),
+    )
+
+    assert _install_mtp_vendored(
+        batch_gen,
+        model=_SampledQualifiedModel(),
+        requests={"req-33": request_stub},
+        uid_to_request_id={33: "req-33"},
+    )
+    gb._step()
+
+    assert seen["prompt_lookup_enabled"] is True
+    assert seen["prompt_lookup_history"] == [101, 102, 500]
+    assert seen["prompt_lookup_policy"].enabled_under_sampling is True
+
+
+def test_install_mtp_vendored_indexes_the_prompt_not_the_uncached_tail(
+    monkeypatch,
+):
+    """A prefix-cache hit must not empty out the copy index.
+
+    ``gb.tokens[0]`` is the batch row, and a reused prefix never passes
+    through the batch: on a hit the row begins at the unprocessed tail. The
+    copy index is the prompt, so reading the row silently indexes a stub
+    exactly when the prompt is long enough to be worth copying from -- on an
+    M4 Pro the same 236-token rename request proposed 12 copies cold and 0 on
+    the byte-identical next request, which for a chat is every turn after the
+    first.
+
+    The row here is shaped like that hit: two tokens of tail against a
+    six-token prompt the request still knows in full.
+    """
+    from types import SimpleNamespace
+
+    import mlx.core as mx
+
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.spec_decode.mtp.prompt_lookup import PromptLookupPolicy
+
+    seen: dict[str, object] = {}
+
+    class _FakeGen:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return (201, mx.array([0.0]), False)
+
+        def close(self):
+            pass
+
+    class _QualifiedModel(_StubModel):
+        mtp_prompt_lookup_supported = True
+        mtp_prompt_lookup_policy = PromptLookupPolicy(enabled_by_default=True)
+
+    monkeypatch.delenv("RAPID_MLX_MTP_PROMPT_LOOKUP", raising=False)
+    monkeypatch.setattr(
+        _gen_mod,
+        "mtp_generate_step",
+        lambda *args, **kwargs: seen.update(kwargs) or _FakeGen(),
+    )
+    batch_gen, gb = _make_batch_gen_with_gb()
+    gb.uids = [36]
+    # What mlx-lm exposes after the scheduler reused the first four tokens.
+    gb.tokens = [[105, 106]]
+    gb._next_tokens = mx.array([500], dtype=mx.uint32)
+    gb._next_logprobs = [mx.array([0.0])]
+    request_stub = SimpleNamespace(
+        sampling_params=SimpleNamespace(temperature=0.0),
+        prompt_token_ids=[101, 102, 103, 104, 105, 106],
+    )
+
+    assert _install_mtp_vendored(
+        batch_gen,
+        model=_QualifiedModel(),
+        requests={"req-36": request_stub},
+        uid_to_request_id={36: "req-36"},
+    )
+    gb._step()
+
+    assert seen["prompt_lookup_enabled"] is True
+    assert seen["prompt_lookup_history"] == [101, 102, 103, 104, 105, 106, 500]
+
+
+def test_install_mtp_vendored_sampled_prompt_lookup_honours_operator_off(
+    monkeypatch,
+):
+    """An operator can put sampled requests back on the old route alone.
+
+    The kill switch for copying as a whole
+    (``RAPID_MLX_MTP_PROMPT_LOOKUP=0``) takes greedy requests down with it,
+    which is the wrong instrument for someone bisecting a report that only
+    sampled chats look wrong. ``_SAMPLED=0`` leaves the greedy route exactly
+    as it was.
+    """
+    from types import SimpleNamespace
+
+    import mlx.core as mx
+
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.spec_decode.mtp.prompt_lookup import PromptLookupPolicy
+
+    seen: dict[str, object] = {}
+
+    class _FakeGen:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return (201, mx.array([0.0]), False)
+
+        def close(self):
+            pass
+
+    class _SampledQualifiedModel(_StubModel):
+        mtp_prompt_lookup_supported = True
+        mtp_prompt_lookup_policy = PromptLookupPolicy(
+            enabled_by_default=True, enabled_under_sampling=True
+        )
+
+    monkeypatch.setenv("RAPID_MLX_MTP_PROMPT_LOOKUP_SAMPLED", "0")
+    monkeypatch.setattr(
+        _gen_mod,
+        "mtp_generate_step",
+        lambda *args, **kwargs: seen.update(kwargs) or _FakeGen(),
+    )
+    batch_gen, gb = _make_batch_gen_with_gb()
+    gb.uids = [34]
+    gb.tokens = [[101, 102]]
+    gb._next_tokens = mx.array([500], dtype=mx.uint32)
+    gb._next_logprobs = [mx.array([0.0])]
+    sampled = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            temperature=0.7, top_p=0.9, top_k=0, min_p=0.0, seed=None
+        ),
+    )
+
+    assert _install_mtp_vendored(
+        batch_gen,
+        model=_SampledQualifiedModel(),
+        requests={"req-34": sampled},
+        uid_to_request_id={34: "req-34"},
+    )
+    gb._step()
+
+    assert seen["prompt_lookup_enabled"] is False
+    # Greedy on the same build is untouched: this knob is about one request
+    # class, not about copying.
+    greedy_seen: dict[str, object] = {}
+    monkeypatch.setattr(
+        _gen_mod,
+        "mtp_generate_step",
+        lambda *args, **kwargs: greedy_seen.update(kwargs) or _FakeGen(),
+    )
+    batch_gen2, gb2 = _make_batch_gen_with_gb()
+    gb2.uids = [35]
+    gb2.tokens = [[101, 102]]
+    gb2._next_tokens = mx.array([500], dtype=mx.uint32)
+    gb2._next_logprobs = [mx.array([0.0])]
+    greedy = SimpleNamespace(sampling_params=SimpleNamespace(temperature=0.0))
+
+    assert _install_mtp_vendored(
+        batch_gen2,
+        model=_SampledQualifiedModel(),
+        requests={"req-35": greedy},
+        uid_to_request_id={35: "req-35"},
+    )
+    gb2._step()
+
+    assert greedy_seen["prompt_lookup_enabled"] is True
+
+
 def test_install_mtp_vendored_passes_request_sampling_and_safe_penalty_context(
     monkeypatch,
 ):
@@ -3528,8 +3776,8 @@ def test_install_mtp_vendored_passes_request_sampling_and_safe_penalty_context(
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
 
     seen: dict[str, object] = {}
     penalty = lambda tokens, logits: logits
@@ -3596,8 +3844,8 @@ def test_install_mtp_vendored_uid_processor_source_rejects_custom_processor(
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
 
     generator_calls = {"count": 0}
 
@@ -3661,8 +3909,8 @@ def test_install_mtp_vendored_mid_stream_generator_failure_raises(monkeypatch):
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
 
     class _MidStreamFailingGen:
         def __init__(self):
@@ -3766,8 +4014,8 @@ def test_install_mtp_vendored_first_call_syncs_next_tokens(monkeypatch):
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
 
     class _CountingGen:
         def __init__(self):
@@ -3850,8 +4098,8 @@ def test_install_mtp_vendored_subsequent_syncs_next_tokens(monkeypatch):
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
 
     class _CountingGen:
         def __init__(self):
@@ -3930,8 +4178,8 @@ def test_install_mtp_vendored_next_tokens_shape_survives_stop_iteration(
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
 
     class _OneShotGen:
         """Yields nothing — first ``next()`` raises StopIteration."""
@@ -4005,8 +4253,8 @@ def test_apply_mtp_cli_model_type_reconciliation_promotes_eligibility_read():
     ``scheduler_config.mtp_model_type`` when the pre-SchedulerConfig
     best-effort read had returned ``None``.
     """
-    from vllm_mlx.cli import _apply_mtp_cli_model_type_reconciliation
-    from vllm_mlx.scheduler import SchedulerConfig
+    from rapid_mlx.cli import _apply_mtp_cli_model_type_reconciliation
+    from rapid_mlx.scheduler import SchedulerConfig
 
     # Simulate the production shape: first read failed →
     # scheduler_config.mtp_model_type is None. Eligibility gate's
@@ -4047,8 +4295,8 @@ def test_apply_mtp_cli_model_type_reconciliation_hard_fails_when_model_type_miss
     silent-skip bug the whole reconciliation was designed to
     prevent.
     """
-    from vllm_mlx.cli import _apply_mtp_cli_model_type_reconciliation
-    from vllm_mlx.scheduler import SchedulerConfig
+    from rapid_mlx.cli import _apply_mtp_cli_model_type_reconciliation
+    from rapid_mlx.scheduler import SchedulerConfig
 
     sc = SchedulerConfig(spec_decode="mtp", mtp_model_type=None)
 
@@ -4081,8 +4329,8 @@ def test_apply_mtp_cli_model_type_reconciliation_prefers_eligibility_on_disagree
     prefer the eligibility read — the eligibility gate is the
     source of truth for accept/reject decisions.
     """
-    from vllm_mlx.cli import _apply_mtp_cli_model_type_reconciliation
-    from vllm_mlx.scheduler import SchedulerConfig
+    from rapid_mlx.cli import _apply_mtp_cli_model_type_reconciliation
+    from rapid_mlx.scheduler import SchedulerConfig
 
     sc = SchedulerConfig(spec_decode="mtp", mtp_model_type="stale_value")
     hf_cfg_eligibility = {"model_type": "qwen3_5", "mtp_num_hidden_layers": 1}
@@ -4101,8 +4349,8 @@ def test_apply_mtp_cli_model_type_reconciliation_prefers_eligibility_on_disagree
 
 
 def test_apply_mtp_cli_reconciliation_caps_qwen4_default_depth():
-    from vllm_mlx.cli import _apply_mtp_cli_model_type_reconciliation
-    from vllm_mlx.scheduler import SchedulerConfig
+    from rapid_mlx.cli import _apply_mtp_cli_model_type_reconciliation
+    from rapid_mlx.scheduler import SchedulerConfig
 
     sc = SchedulerConfig(spec_decode="mtp", mtp_max_k=3)
     _apply_mtp_cli_model_type_reconciliation(
@@ -4118,8 +4366,8 @@ def test_apply_mtp_cli_reconciliation_caps_qwen4_default_depth():
 
 
 def test_apply_mtp_cli_reconciliation_accepts_explicit_qwen4_k2(monkeypatch):
-    from vllm_mlx.cli import _apply_mtp_cli_model_type_reconciliation
-    from vllm_mlx.scheduler import SchedulerConfig
+    from rapid_mlx.cli import _apply_mtp_cli_model_type_reconciliation
+    from rapid_mlx.scheduler import SchedulerConfig
 
     monkeypatch.delenv("RAPID_MLX_QSA_INDEXED_SPLITK", raising=False)
     sc = SchedulerConfig(spec_decode="mtp", mtp_max_k=2)
@@ -4141,8 +4389,8 @@ def test_apply_mtp_cli_reconciliation_accepts_explicit_qwen4_k2(monkeypatch):
 def test_apply_mtp_cli_reconciliation_preserves_qwen4_k2_kernel_opt_out(
     monkeypatch,
 ):
-    from vllm_mlx.cli import _apply_mtp_cli_model_type_reconciliation
-    from vllm_mlx.scheduler import SchedulerConfig
+    from rapid_mlx.cli import _apply_mtp_cli_model_type_reconciliation
+    from rapid_mlx.scheduler import SchedulerConfig
 
     monkeypatch.setenv("RAPID_MLX_QSA_INDEXED_SPLITK", "0")
     sc = SchedulerConfig(spec_decode="mtp", mtp_max_k=2)
@@ -4162,8 +4410,8 @@ def test_apply_mtp_cli_reconciliation_preserves_qwen4_k2_kernel_opt_out(
 
 
 def test_apply_mtp_cli_reconciliation_rejects_explicit_qwen4_k3(capsys):
-    from vllm_mlx.cli import _apply_mtp_cli_model_type_reconciliation
-    from vllm_mlx.scheduler import SchedulerConfig
+    from rapid_mlx.cli import _apply_mtp_cli_model_type_reconciliation
+    from rapid_mlx.scheduler import SchedulerConfig
 
     sc = SchedulerConfig(spec_decode="mtp", mtp_max_k=3)
     with pytest.raises(SystemExit, match="2"):
@@ -4210,8 +4458,8 @@ def test_install_mtp_vendored_uid_reuse_clears_stale_state(monkeypatch):
 
     import mlx.core as mx
 
-    from vllm_mlx.scheduler import _install_mtp_vendored
-    from vllm_mlx.spec_decode.mtp import generator as _gen_mod
+    from rapid_mlx.scheduler import _install_mtp_vendored
+    from rapid_mlx.spec_decode.mtp import generator as _gen_mod
 
     class _FakeGen:
         def __init__(self, tag):
@@ -4307,8 +4555,8 @@ def test_gather_kv_cache_dtype_inputs_reads_local_dir_config(tmp_path):
     """
     import json as _json
 
-    from vllm_mlx.cli import _gather_kv_cache_dtype_inputs
-    from vllm_mlx.spec_decode.mtp import MTPEligibility, detect_mtp_eligibility
+    from rapid_mlx.cli import _gather_kv_cache_dtype_inputs
+    from rapid_mlx.spec_decode.mtp import MTPEligibility, detect_mtp_eligibility
 
     (tmp_path / "config.json").write_text(
         _json.dumps(

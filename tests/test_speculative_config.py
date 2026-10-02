@@ -9,12 +9,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_mlx.spec_decode.config import (
+from rapid_mlx.spec_decode.config import (
     SpeculativeConfigError,
     parse_speculative_config,
     require_migrated_speculative_config,
 )
-from vllm_mlx.spec_decode.registry import get_spec_decoder, iter_spec_decoders
+from rapid_mlx.spec_decode.registry import get_spec_decoder, iter_spec_decoders
 
 
 def test_parse_speculative_config_accepts_vllm_common_keys() -> None:
@@ -65,6 +65,18 @@ def test_parse_dspark_speculative_config_accepts_native_depth() -> None:
     assert cfg.num_speculative_tokens == 5
 
 
+def test_parse_dspark_speculative_config_accepts_companion_model() -> None:
+    cfg = parse_speculative_config(
+        '{"method":"dspark","model":"LiquidAI/LFM2.5-VL-3B-DSpark",'
+        '"num_speculative_tokens":7}'
+    )
+
+    assert cfg is not None
+    assert cfg.method == "dspark"
+    assert cfg.model == "LiquidAI/LFM2.5-VL-3B-DSpark"
+    assert cfg.num_speculative_tokens == 7
+
+
 def test_parse_speculative_config_normalizes_registered_alias() -> None:
     cfg = parse_speculative_config('{"method":"ngram"}')
 
@@ -93,8 +105,10 @@ def test_parse_suffix_speculative_config_accepts_existing_knobs() -> None:
         ("[]", "JSON object"),
         ("{bad", "valid JSON"),
         ('{"model":"x"}', "requires string key 'method'"),
-        ('{"method":"mtp","num_speculative_tokens":0}', "positive integer"),
-        ('{"method":"mtp","num_speculative_tokens":true}', "positive integer"),
+        (
+            '{"method":"mtp","num_speculative_tokens":true}',
+            "non-negative integer",
+        ),
         ('{"method":"mtp","model":""}', "non-empty string"),
         ('{"method":"mtp","tree_budget":24}', "unsupported speculative-config"),
         ('{"method":"mtp","disable_auto_k":1}', "boolean"),
@@ -123,11 +137,77 @@ def test_parse_speculative_config_rejects_bad_payloads(raw: str, match: str) -> 
         parse_speculative_config(raw)
 
 
+def test_parse_mtp_accepts_fixed_zero_depth_validation_baseline() -> None:
+    cfg = parse_speculative_config(
+        '{"method":"mtp","model":"local/assistant",'
+        '"num_speculative_tokens":0,"disable_auto_k":true}'
+    )
+    assert cfg is not None
+    assert cfg.num_speculative_tokens == 0
+    assert cfg.disable_auto_k is True
+
+
+@pytest.mark.parametrize(
+    ("raw", "match"),
+    [
+        (
+            '{"method":"mtp","num_speculative_tokens":0}',
+            "requires disable_auto_k=true",
+        ),
+        (
+            '{"method":"mtp","num_speculative_tokens":0,"disable_auto_k":false}',
+            "requires disable_auto_k=true",
+        ),
+        (
+            '{"method":"mtp","num_speculative_tokens":0,'
+            '"disable_auto_k":true,"continuous_batching":true}',
+            "cannot use continuous_batching=true",
+        ),
+        (
+            '{"method":"mtp","num_speculative_tokens":-1,"disable_auto_k":true}',
+            "non-negative integer",
+        ),
+    ],
+)
+def test_parse_mtp_rejects_unsafe_zero_depth_modes(raw: str, match: str) -> None:
+    with pytest.raises(SpeculativeConfigError, match=match):
+        parse_speculative_config(raw)
+
+
 def test_require_migrated_speculative_config_accepts_mtp() -> None:
     cfg = parse_speculative_config('{"method":"mtp"}')
     assert cfg is not None
 
     require_migrated_speculative_config(cfg)
+
+
+def test_parse_native_mtp_backend() -> None:
+    cfg = parse_speculative_config(
+        '{"method":"mtp","backend":"native","num_speculative_tokens":2}'
+    )
+    assert cfg is not None
+    assert cfg.backend == "native"
+
+
+@pytest.mark.parametrize(
+    ("raw", "match"),
+    [
+        ('{"method":"mtp","backend":"standard"}', "backend must be 'native'"),
+        (
+            '{"method":"suffix","backend":"native"}',
+            "unsupported speculative-config key",
+        ),
+        (
+            '{"method":"mtp","backend":"native","continuous_batching":true}',
+            "serial",
+        ),
+    ],
+)
+def test_parse_native_mtp_backend_rejects_unsupported_modes(
+    raw: str, match: str
+) -> None:
+    with pytest.raises(SpeculativeConfigError, match=match):
+        parse_speculative_config(raw)
 
 
 def test_require_migrated_speculative_config_accepts_ddtree() -> None:
@@ -159,7 +239,7 @@ def test_require_migrated_speculative_config_accepts_suffix() -> None:
 
 
 def test_legacy_config_helpers_warn_and_return_configs() -> None:
-    from vllm_mlx.spec_decode.config import (
+    from rapid_mlx.spec_decode.config import (
         legacy_ddtree_config,
         legacy_dflash_config,
         legacy_mtp_config,
@@ -211,7 +291,7 @@ def test_spec_decoder_registry_lists_existing_backends() -> None:
 
 def test_serve_help_exposes_speculative_config() -> None:
     proc = subprocess.run(
-        [sys.executable, "-m", "vllm_mlx.cli", "serve", "--help"],
+        [sys.executable, "-m", "rapid_mlx.cli", "serve", "--help"],
         capture_output=True,
         text=True,
         timeout=30,
@@ -233,6 +313,7 @@ def _spec_config_args(**overrides):
         "mtp_sidecar": None,
         "mtp_max_k": None,
         "mtp_disable_auto_k": False,
+        "mtp_backend": None,
         "suffix_decoding": False,
         "suffix_max_draft": None,
         "suffix_max_suffix_len": None,
@@ -244,7 +325,7 @@ def _spec_config_args(**overrides):
 
 
 def test_speculative_config_mtp_normalizes_to_legacy_spec_decode() -> None:
-    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
 
     args = _spec_config_args(
         speculative_config=(
@@ -265,8 +346,60 @@ def test_speculative_config_mtp_normalizes_to_legacy_spec_decode() -> None:
     assert args._speculative_config.disable_auto_k is True
 
 
+def test_speculative_config_dspark_keeps_legacy_and_companion_defaults() -> None:
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
+
+    legacy = _spec_config_args(speculative_config='{"method":"dspark"}')
+    _normalize_speculative_config_or_exit(legacy)
+    assert legacy.spec_decode == "dspark"
+    assert legacy.dspark_num_speculative_tokens == 5
+
+    companion = _spec_config_args(
+        speculative_config=(
+            '{"method":"dspark","model":"LiquidAI/LFM2.5-VL-3B-DSpark"}'
+        ),
+        mllm=True,
+    )
+    _normalize_speculative_config_or_exit(companion)
+    assert companion.spec_decode == "dspark"
+    assert companion.dspark_num_speculative_tokens == 7
+
+    recommended = _spec_config_args(
+        model="LiquidAI/LFM2.5-VL-3B",
+        speculative_config='{"method":"dspark"}',
+        mllm=True,
+    )
+    _normalize_speculative_config_or_exit(recommended)
+    assert recommended._speculative_config.model == ("LiquidAI/LFM2.5-VL-3B-DSpark")
+    assert recommended.dspark_num_speculative_tokens == 7
+
+
+def test_speculative_config_rejects_mllm_with_capability_event(monkeypatch) -> None:
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.telemetry import inference
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        inference,
+        "emit_capability_rejected",
+        lambda value, *, model_type="other", **_context: calls.append(
+            (value, model_type)
+        ),
+    )
+    args = _spec_config_args(
+        speculative_config='{"method":"mtp"}',
+        mllm=True,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        _normalize_speculative_config_or_exit(args)
+
+    assert exc_info.value.code == 2
+    assert calls == [("speculative_decoding_unsupported", "vlm")]
+
+
 def test_speculative_config_mtp_populates_runtime_args() -> None:
-    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
 
     config_args = _spec_config_args(
         speculative_config=(
@@ -286,8 +419,49 @@ def test_speculative_config_mtp_populates_runtime_args() -> None:
     assert config_args.enable_ddtree is False
 
 
+def test_speculative_config_mtp_preserves_fixed_zero_depth(monkeypatch) -> None:
+    """CLI normalization must not replace explicit K=0 with a truthy default."""
+    from rapid_mlx import cli
+
+    # Exercise the regression shape: an alias whose omitted continuous setting
+    # would normally resolve to True must still keep the K=0 baseline serial.
+    monkeypatch.setattr(cli, "_alias_continuous_mtp_tier", lambda _model: "verified")
+
+    args = _spec_config_args(
+        model="qualified/model",
+        speculative_config=(
+            '{"method":"mtp","model":"local/assistant",'
+            '"num_speculative_tokens":0,"disable_auto_k":true}'
+        ),
+    )
+
+    cli._normalize_speculative_config_or_exit(args)
+
+    assert args.spec_decode == "mtp"
+    assert args.mtp_sidecar == "local/assistant"
+    assert args.mtp_max_k == 0
+    assert args.mtp_disable_auto_k is True
+    assert args.mtp_continuous_batching is False
+
+
+def test_speculative_config_native_mtp_populates_explicit_backend() -> None:
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
+
+    args = _spec_config_args(
+        model="qwen3.6-35b-4bit",
+        speculative_config='{"method":"mtp","backend":"native"}',
+    )
+
+    _normalize_speculative_config_or_exit(args)
+
+    assert args.spec_decode == "mtp"
+    assert args.mtp_backend == "native"
+    assert args.mtp_sidecar == "mlx-community/Qwen3.6-35B-A3B-MTP-4bit"
+    assert args.mtp_max_k == 2
+
+
 def test_speculative_config_mtp_without_token_count_keeps_legacy_one_token() -> None:
-    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
 
     args = _spec_config_args(speculative_config='{"method":"mtp"}')
 
@@ -303,7 +477,7 @@ def test_speculative_config_mtp_force_spec_decode_defaults_k_three() -> None:
     doesn't pin ``num_speculative_tokens``, MTP defaults to K=3 (auto-K
     controller's intended default) instead of the K=1 chain-of-1 that
     carries draft overhead with no net speedup."""
-    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
 
     args = _spec_config_args(
         speculative_config='{"method":"mtp"}', force_spec_decode=True
@@ -319,7 +493,7 @@ def test_speculative_config_mtp_force_spec_decode_defaults_k_three() -> None:
 def test_speculative_config_mtp_explicit_tokens_win_over_force_default() -> None:
     """An explicit ``num_speculative_tokens`` always wins, even under
     ``--force-spec-decode`` — the K=3 default only fills the unset case."""
-    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
 
     args = _spec_config_args(
         speculative_config='{"method":"mtp","num_speculative_tokens":2}',
@@ -349,7 +523,7 @@ def test_speculative_config_rejects_explicit_max_k_flag_combo(
     is rejected exactly like ``5``. This nails the codex claim that a
     default-valued flag slips past the guard and gets silently rewritten to 3;
     it does not — it exits 2, and ``mtp_max_k`` is never mutated to 3."""
-    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
 
     args = _spec_config_args(
         speculative_config='{"method":"mtp"}',
@@ -366,8 +540,8 @@ def test_speculative_config_rejects_explicit_max_k_flag_combo(
 
 
 def test_speculative_config_parse_none_cleanly_disables(monkeypatch) -> None:
-    from vllm_mlx.cli import _normalize_speculative_config_or_exit
-    from vllm_mlx.spec_decode import config as config_mod
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.spec_decode import config as config_mod
 
     monkeypatch.setattr(config_mod, "parse_speculative_config", lambda _raw: None)
     args = _spec_config_args(speculative_config='{"method":"mtp"}')
@@ -381,7 +555,7 @@ def test_speculative_config_parse_none_cleanly_disables(monkeypatch) -> None:
 
 
 def test_no_speculative_config_fills_suffix_runtime_defaults() -> None:
-    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
 
     args = _spec_config_args()
 
@@ -396,7 +570,7 @@ def test_no_speculative_config_fills_suffix_runtime_defaults() -> None:
 
 
 def test_no_speculative_config_preserves_programmatic_runtime_fields() -> None:
-    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
 
     args = _spec_config_args(
         enable_dflash=True,
@@ -423,7 +597,7 @@ def test_no_speculative_config_preserves_programmatic_runtime_fields() -> None:
 def test_hidden_legacy_aliases_normalize_to_speculative_config(
     overrides, method
 ) -> None:
-    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
 
     args = _spec_config_args(**overrides)
 
@@ -434,7 +608,7 @@ def test_hidden_legacy_aliases_normalize_to_speculative_config(
 
 
 def test_hidden_legacy_enable_mtp_preserves_compat_marker() -> None:
-    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
 
     args = _spec_config_args(enable_mtp=True, mtp_max_k=2)
 
@@ -448,7 +622,7 @@ def test_hidden_legacy_enable_mtp_preserves_compat_marker() -> None:
 
 
 def test_hidden_legacy_aliases_reject_multiple_methods(capsys) -> None:
-    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
 
     args = _spec_config_args(enable_dflash=True, suffix_decoding=True)
 
@@ -462,7 +636,7 @@ def test_hidden_legacy_aliases_reject_multiple_methods(capsys) -> None:
 def test_hidden_legacy_mtp_optimistic_rejects_enable_mtp(capsys) -> None:
     """PR #1050 hard-reject: ``--enable-mtp --mtp-optimistic`` is no longer
     accepted (previously silently ignored under the vendored installer)."""
-    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
 
     args = _spec_config_args(enable_mtp=True, mtp_optimistic=True)
 
@@ -477,7 +651,7 @@ def test_hidden_legacy_mtp_optimistic_rejects_enable_mtp(capsys) -> None:
 
 def test_hidden_legacy_mtp_optimistic_rejects_migrated_mtp(capsys) -> None:
     """PR #1050 hard-reject: ``--spec-decode=mtp --mtp-optimistic`` fails."""
-    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
 
     args = _spec_config_args(spec_decode="mtp", mtp_optimistic=True)
 
@@ -491,7 +665,7 @@ def test_hidden_legacy_mtp_optimistic_rejects_migrated_mtp(capsys) -> None:
 
 
 def test_hidden_legacy_mtp_token_count_aliases_reject_conflict(capsys) -> None:
-    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
 
     args = _spec_config_args(enable_mtp=True, mtp_max_k=2, mtp_num_draft_tokens=3)
 
@@ -521,7 +695,7 @@ def test_hidden_legacy_mtp_token_count_aliases_reject_conflict(capsys) -> None:
 def test_hidden_legacy_tuning_knobs_require_method_selector(
     overrides, knob, capsys
 ) -> None:
-    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
 
     args = _spec_config_args(**overrides)
 
@@ -557,7 +731,7 @@ def test_hidden_legacy_tuning_knobs_require_method_selector(
 def test_speculative_config_rejects_legacy_alias_conflicts(
     overrides, conflict, capsys
 ) -> None:
-    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
 
     args = _spec_config_args(speculative_config='{"method":"mtp"}', **overrides)
 
@@ -593,7 +767,7 @@ def test_speculative_config_rejects_legacy_alias_conflicts(
 def test_no_spec_decode_rejects_programmatic_runtime_fields(
     overrides, conflict, capsys
 ) -> None:
-    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
 
     args = _spec_config_args(no_spec_decode=True, **overrides)
 
@@ -607,7 +781,7 @@ def test_no_spec_decode_rejects_programmatic_runtime_fields(
 
 
 def test_speculative_config_malformed_reports_clean_error(capsys) -> None:
-    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
 
     args = _spec_config_args(speculative_config="")
 
@@ -621,7 +795,7 @@ def test_speculative_config_malformed_reports_clean_error(capsys) -> None:
 
 
 def test_speculative_config_rejects_no_spec_decode(capsys) -> None:
-    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
 
     args = _spec_config_args(
         speculative_config='{"method":"mtp"}',
@@ -638,7 +812,7 @@ def test_speculative_config_rejects_no_spec_decode(capsys) -> None:
 
 
 def test_speculative_config_suffix_normalizes_to_legacy_suffix_args() -> None:
-    from vllm_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
 
     args = _spec_config_args(
         speculative_config=(

@@ -12,10 +12,11 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
-from vllm_mlx.model_aliases import resolve_profile
-from vllm_mlx.runtime import video_lane
-from vllm_mlx.runtime.video_lane import VideoEngine, VideoRuntimeError
-from vllm_mlx.video import ltx25
+from rapid_mlx.model_aliases import resolve_profile
+from rapid_mlx.runtime import video_lane
+from rapid_mlx.runtime.optional_runtime import OptionalRuntimeMissing
+from rapid_mlx.runtime.video_lane import VideoEngine, VideoRuntimeError
+from rapid_mlx.video import ltx25
 
 
 def test_ltx25_alias_routes_to_video_lane() -> None:
@@ -28,7 +29,7 @@ def test_ltx25_alias_routes_to_video_lane() -> None:
 
 
 def test_ltx25_capabilities_match_distilled_controls() -> None:
-    from vllm_mlx.routes.video import _video_capabilities
+    from rapid_mlx.routes.video import _video_capabilities
 
     capabilities = _video_capabilities(
         SimpleNamespace(model_name="MrMofer/ltx-2.5-mlx-q8", video_family="ltx-2.5")
@@ -193,10 +194,10 @@ def test_ltx25_runtime_preflight_fails_before_download(
     )
     monkeypatch.setattr(video_lane.shutil, "which", lambda name: "/usr/bin/uv")
 
-    with pytest.raises(SystemExit, match="2"):
+    with pytest.raises(OptionalRuntimeMissing) as exc:
         video_lane.require_video_runtime_or_exit("MrMofer/ltx-2.5-mlx-q8")
 
-    error = capsys.readouterr().err
+    error = exc.value.format_user_message()
     assert ltx25.LTX25_RUNTIME_COMMIT in error
     assert "video generation guide" in error
 
@@ -209,10 +210,10 @@ def test_ltx25_runtime_preflight_requires_uv(
     monkeypatch.setattr(video_lane, "_resolve_ffmpeg", lambda: "/usr/bin/ffmpeg")
     monkeypatch.setattr(video_lane.shutil, "which", lambda name: None)
 
-    with pytest.raises(SystemExit, match="2"):
+    with pytest.raises(OptionalRuntimeMissing) as exc:
         video_lane.require_video_runtime_or_exit("MrMofer/ltx-2.5-mlx-q8")
 
-    error = capsys.readouterr().err
+    error = exc.value.format_user_message()
     assert "uv (`brew install uv`)" in error
     # The runtime itself resolved, so the clone/checkout walkthrough is noise.
     assert "git clone" not in error
@@ -228,12 +229,12 @@ def test_ltx25_missing_runtime_prints_setup_walkthrough(
     )
     monkeypatch.setattr(video_lane.shutil, "which", lambda name: "/usr/bin/uv")
 
-    with pytest.raises(SystemExit, match="2"):
+    with pytest.raises(OptionalRuntimeMissing) as exc:
         # A path-qualified name passes _is_ltx25_name; the walkthrough must
         # not interpolate this user-controlled string into shell commands.
         video_lane.require_video_runtime_or_exit("$(uname)/ltx-2.5-mlx-q8")
 
-    error = capsys.readouterr().err
+    error = exc.value.format_user_message()
     assert "docs/guides/video-generation.md" in error
     # Conditional clone (gated on a real Git checkout, not a bare
     # directory) + unconditional fetch: the same block repairs an
@@ -274,10 +275,10 @@ def test_ltx25_provisioning_failure_surfaces_cause_not_clone_steps(
     monkeypatch.setattr(video_lane, "_resolve_ffmpeg", lambda: "/usr/bin/ffmpeg")
     monkeypatch.setattr(video_lane.shutil, "which", lambda name: "/usr/bin/uv")
 
-    with pytest.raises(SystemExit, match="2"):
+    with pytest.raises(OptionalRuntimeMissing) as exc:
         video_lane.require_video_runtime_or_exit("MrMofer/ltx-2.5-mlx-q8")
 
-    error = capsys.readouterr().err
+    error = exc.value.format_user_message()
     assert "a provisioned pinned LTX-2.5 runtime" in error
     # The underlying failure reason is the actionable part.
     assert "`uv sync --frozen` failed with exit code 2" in error
@@ -341,7 +342,7 @@ def test_ltx25_provisioning_detail_sanitizes_stderr(
 
 
 def test_ltx25_sanitize_redacts_percent_encoded_userinfo() -> None:
-    from vllm_mlx.video.ltx25 import _sanitize_diagnostic
+    from rapid_mlx.video.ltx25 import _sanitize_diagnostic
 
     out = _sanitize_diagnostic(
         "failed to fetch https://build%40corp:s3cret@index.example/simple/"
@@ -352,7 +353,7 @@ def test_ltx25_sanitize_redacts_percent_encoded_userinfo() -> None:
 
 
 def test_ltx25_sanitize_redacts_query_tokens_and_bearer() -> None:
-    from vllm_mlx.video.ltx25 import _sanitize_diagnostic
+    from rapid_mlx.video.ltx25 import _sanitize_diagnostic
 
     out = _sanitize_diagnostic(
         "fetch https://index.example/simple?token=s3cret&x=1 failed; "
@@ -369,7 +370,7 @@ def test_ltx25_sanitize_redacts_signed_url_params() -> None:
     suffixes (codex on #2166): AWS presigned ``X-Amz-Signature``, Azure
     SAS ``sig``/``sas``, generic ``auth``/``jwt`` must all redact, since
     uv stderr can echo the full index URL query string."""
-    from vllm_mlx.video.ltx25 import _sanitize_diagnostic
+    from rapid_mlx.video.ltx25 import _sanitize_diagnostic
 
     out = _sanitize_diagnostic(
         "GET https://bucket.s3.example/wheel.whl"
@@ -388,7 +389,7 @@ def test_ltx25_sanitize_redacts_signed_url_params() -> None:
 
 
 def test_ltx25_sanitize_redacts_quoted_credential_values() -> None:
-    from vllm_mlx.video.ltx25 import _sanitize_diagnostic
+    from rapid_mlx.video.ltx25 import _sanitize_diagnostic
 
     out = _sanitize_diagnostic(
         "config error: token=\"quoted-s3cret\" password='single-s3cret' left"
@@ -399,7 +400,7 @@ def test_ltx25_sanitize_redacts_quoted_credential_values() -> None:
 
 
 def test_ltx25_sanitize_redacts_prefixed_credential_names() -> None:
-    from vllm_mlx.video.ltx25 import _sanitize_diagnostic
+    from rapid_mlx.video.ltx25 import _sanitize_diagnostic
 
     out = _sanitize_diagnostic(
         "access_token=at-s3cret client_secret=cs-s3cret "
@@ -412,7 +413,7 @@ def test_ltx25_sanitize_redacts_prefixed_credential_names() -> None:
 
 
 def test_ltx25_sanitize_redacts_basic_auth_header() -> None:
-    from vllm_mlx.video.ltx25 import _sanitize_diagnostic
+    from rapid_mlx.video.ltx25 import _sanitize_diagnostic
 
     out = _sanitize_diagnostic(
         "request failed; Authorization: Basic dXNlcjpwYXNz and "
@@ -424,7 +425,7 @@ def test_ltx25_sanitize_redacts_basic_auth_header() -> None:
 
 
 def test_ltx25_oserror_detail_is_sanitized_and_bounded() -> None:
-    from vllm_mlx.video.ltx25 import _provisioning_failure_detail
+    from rapid_mlx.video.ltx25 import _provisioning_failure_detail
 
     exc = OSError(
         "\x1b[31mdisk full\x1b[0m at https://user:tok3n@mirror.example/x " + "p" * 500
@@ -676,7 +677,7 @@ def test_ltx25_generation_uses_cache_without_rechecking_checkout(
 def test_serve_routes_ltx25_model_to_specific_preflight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm_mlx import cli
+    from rapid_mlx import cli
 
     class PreflightReachedError(RuntimeError):
         pass
@@ -740,8 +741,10 @@ def test_ltx25_engine_invokes_pinned_runtime_contract(
 
     command, run_kwargs = calls[0]
     child_environment = run_kwargs.pop("env")
+    readiness_fds = run_kwargs.pop("pass_fds")
     assert "PYTHONHOME" not in child_environment
     assert "PYTHONPATH" not in child_environment
+    assert child_environment[ltx25._READINESS_FD_ENV] == str(readiness_fds[0])
     assert command[:2] == [str(runtime_cache / ".venv/bin/python"), "-c"]
     assert command[2] == ltx25._STDIN_PROMPT_RUNNER
     assert command[3:5] == ["generate", "--model"]
@@ -1007,6 +1010,47 @@ def test_ltx25_unexpected_communication_error_terminates_process(
     assert engine._process is None
 
 
+def test_ltx25_spawn_failure_closes_readiness_pipe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ltx25, "embedded_ltx25_interpreter", lambda: "/python")
+    opened: list[int] = []
+    closed: list[int] = []
+    original_pipe = ltx25.os.pipe
+    original_close = ltx25.os.close
+
+    def tracked_pipe() -> tuple[int, int]:
+        descriptors = original_pipe()
+        opened.extend(descriptors)
+        return descriptors
+
+    def tracked_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        original_close(descriptor)
+
+    monkeypatch.setattr(ltx25.os, "pipe", tracked_pipe)
+    monkeypatch.setattr(ltx25.os, "close", tracked_close)
+    monkeypatch.setattr(
+        ltx25.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("spawn failed")),
+    )
+
+    with pytest.raises(ltx25.LTX25BackendError, match="isolated runtime"):
+        ltx25.LTX25VideoEngine("ltx-2.5-mlx-q8").generate(
+            prompt="x",
+            output_path=tmp_path / "output.mp4",
+            width=64,
+            height=64,
+            num_frames=5,
+            fps=24,
+            seed=1,
+            image=None,
+        )
+
+    assert set(opened).issubset(closed)
+
+
 def test_ltx25_invalid_timeout_does_not_spawn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1155,7 +1199,7 @@ def test_ltx25_distilled_rejects_cfg_controls() -> None:
 async def test_ltx25_route_rejects_unsupported_cfg_before_queueing(
     monkeypatch: pytest.MonkeyPatch, unsupported: dict[str, object]
 ) -> None:
-    from vllm_mlx.routes import video
+    from rapid_mlx.routes import video
 
     engine = SimpleNamespace(
         model_name="MrMofer/ltx-2.5-mlx-q8", video_family="ltx-2.5"

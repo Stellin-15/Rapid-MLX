@@ -789,7 +789,7 @@ final class DownloadManager {
         DownloadManager.applyXetConcurrencyCaps(env: &env)
         DownloadManager.applyDownloadSource(source, env: &env)
         DownloadManager.applyModelsFolderOverride(env: &env)
-        return env
+        return EngineProcessEnvironment.sidecar(env)
     }
 
     /// Issue #503: point a background ``rapid-mlx pull`` at the user's
@@ -843,7 +843,7 @@ final class DownloadManager {
     ///
     /// Numbers tuned to defaults from the 2026-06-16 research report
     /// (`docs/research/download-ux-2026-06-16.md`). Mirror this in
-    /// `vllm_mlx/cli.py` so terminal users get the same caps.
+    /// `rapid_mlx/cli.py` so terminal users get the same caps.
     nonisolated static func applyXetConcurrencyCaps(env: inout [String: String]) {
         // FIXED bypasses the adaptive controller entirely (it
         // aliases initial/min/max). A user who explicitly set any

@@ -43,20 +43,21 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from vllm_mlx.api.models import (
+from rapid_mlx.api.models import (
     _VALID_REASONING_EFFORTS,
     OPENAI_REASONING_EFFORT_TO_MAX_TOKENS,
     ChatCompletionRequest,
 )
-from vllm_mlx.api.responses_models import ResponsesRequest
-from vllm_mlx.config import reset_config
-from vllm_mlx.engine.base import GenerationOutput
-from vllm_mlx.middleware.exception_handlers import install_exception_handlers
-from vllm_mlx.service.helpers import (
+from rapid_mlx.api.responses_models import ResponsesRequest
+from rapid_mlx.config import reset_config
+from rapid_mlx.engine.base import GenerationOutput
+from rapid_mlx.middleware.exception_handlers import install_exception_handlers
+from rapid_mlx.service.helpers import (
+    maybe_apply_default_reasoning_effort,
     maybe_apply_reasoning_effort,
     served_chat_template,
 )
-from vllm_mlx.utils.chat_template import (
+from rapid_mlx.utils.chat_template import (
     REASONING_EFFORT_LADDER,
     detect_native_reasoning_effort_levels,
     map_reasoning_effort_to_native,
@@ -99,6 +100,15 @@ QWEN38_TEMPLATE = """\
 HY3_TEMPLATE_CLAUSE = (
     "{%- if not reasoning_effort is defined or reasoning_effort not in "
     "['high', 'low', 'no_think'] %}{%- set reasoning_effort = 'no_think' %}{%- endif %}"
+)
+
+# GLM-5.3 shape (#3714): a *coercion* rather than a validation block — the
+# accepted set is the ``in`` list of a conditional expression whose fallback
+# is the default level.
+GLM53_TEMPLATE_CLAUSE = (
+    "{%- set effective_reasoning_effort = reasoning_effort if reasoning_effort "
+    "is defined and reasoning_effort in ['low', 'high'] else 'max' -%}"
+    "{{- '<|system|>Reasoning Effort: ' + effective_reasoning_effort | capitalize }}"
 )
 
 # GPT-OSS / Harmony shape: interpolates the value, never validates it.
@@ -193,6 +203,232 @@ class TestDetectNativeLevels:
             "{{ raise_exception('x') }}{% endif %}"
         )
         assert detect_native_reasoning_effort_levels(clause) == ("low", "high")
+
+
+class TestCoercionDetection:
+    """#3714 GLM-5.3 does not validate ``reasoning_effort``; it coerces it:
+    ``{% set y = x if x in [...] else 'max' %}``. The ``in`` list is the
+    accepted vocabulary (the fallback constant is what the template renders
+    for anything else, so every listed level is one the template honours)."""
+
+    def test_glm53_coercion_publishes_the_in_list_plus_fallback(self):
+        """The fallback is what the template renders for anything else, so
+        it is selectable too — and it is GLM's strongest level."""
+        assert detect_native_reasoning_effort_levels(GLM53_TEMPLATE_CLAUSE) == (
+            "low",
+            "high",
+            "max",
+        )
+
+    @pytest.mark.parametrize(
+        ("effort", "native"),
+        [
+            ("minimal", "low"),
+            ("low", "low"),
+            ("medium", "high"),
+            ("high", "high"),
+            ("xhigh", "max"),
+        ],
+    )
+    def test_glm53_mapping_ranks_max_as_the_xhigh_tier(self, effort, native):
+        """Codex r2: ``xhigh`` used to leave the template at ``Max`` (cap
+        path); mapping it down to ``high`` would have weakened the
+        strongest client knob. ``max`` ranks as ``xhigh``."""
+        levels = detect_native_reasoning_effort_levels(GLM53_TEMPLATE_CLAUSE)
+        assert map_reasoning_effort_to_native(effort, levels) == native
+
+    def test_glm53_xhigh_renders_max_end_to_end(self):
+        jinja2 = pytest.importorskip("jinja2")
+        req = _request(reasoning_effort="xhigh")
+        assert (
+            maybe_apply_reasoning_effort(req, chat_template=GLM53_TEMPLATE_CLAUSE)
+            is True
+        )
+        assert req.chat_template_kwargs == {"reasoning_effort": "max"}
+        assert req.reasoning_max_tokens is None
+        tpl = jinja2.Environment().from_string(GLM53_TEMPLATE_CLAUSE)
+        assert tpl.render(**req.chat_template_kwargs).endswith("Reasoning Effort: Max")
+
+    def test_glm53_render_honours_mapped_level(self):
+        jinja2 = pytest.importorskip("jinja2")
+        tpl = jinja2.Environment().from_string(GLM53_TEMPLATE_CLAUSE)
+        assert tpl.render(reasoning_effort="low").endswith("Reasoning Effort: Low")
+        assert tpl.render().endswith("Reasoning Effort: Max")
+
+    def test_presence_guard_is_optional(self):
+        clause = (
+            "{%- set eff = reasoning_effort if reasoning_effort in ['low', 'high'] "
+            "else 'max' -%}{{ eff }}"
+        )
+        assert detect_native_reasoning_effort_levels(clause) == ("low", "high", "max")
+
+    def test_non_constant_fallback_is_not_a_coercion(self):
+        clause = (
+            "{%- set eff = reasoning_effort if reasoning_effort in ['low', 'high'] "
+            "else other -%}{{ eff }}"
+        )
+        assert detect_native_reasoning_effort_levels(clause) is None
+
+    def test_unrelated_conjunct_is_a_branch_not_a_vocabulary(self):
+        clause = (
+            "{%- set eff = reasoning_effort if tools and reasoning_effort in "
+            "['low', 'high'] else 'max' -%}{{ eff }}"
+        )
+        assert detect_native_reasoning_effort_levels(clause) is None
+
+    @pytest.mark.parametrize(
+        "guard",
+        [
+            "reasoning_effort",
+            "not reasoning_effort is undefined",
+            "reasoning_effort is not none",
+        ],
+    )
+    def test_presence_guard_spellings_keep_the_vocabulary(self, guard):
+        """Bare-name / ``not ... is undefined`` / ``is not none`` guards
+        never keep a valid level out of the accepting arm."""
+        clause = (
+            "{%- set eff = reasoning_effort if " + guard + " and reasoning_effort in "
+            "['low', 'high'] else 'max' -%}{{ eff }}"
+        )
+        assert detect_native_reasoning_effort_levels(clause) == ("low", "high", "max")
+
+    def test_two_membership_tests_are_not_a_vocabulary(self):
+        clause = (
+            "{%- set eff = reasoning_effort if reasoning_effort in ['low'] and "
+            "reasoning_effort in ['high'] else 'max' -%}{{ eff }}"
+        )
+        assert detect_native_reasoning_effort_levels(clause) is None
+
+    def test_read_only_inside_a_nested_macro_is_dead(self):
+        """Same as the top-level macro case, but the macro sits under a
+        branch: the walk must skip the macro's loads while scanning the
+        enclosing statement."""
+        clause = (
+            "{%- set eff = reasoning_effort if reasoning_effort in ['low', 'high'] "
+            "else 'max' -%}{%- if tools -%}{%- macro show() -%}{{ eff }}"
+            "{%- endmacro -%}{%- endif -%}"
+        )
+        assert detect_native_reasoning_effort_levels(clause) is None
+
+    def test_non_literal_level_list_is_not_a_vocabulary(self):
+        clause = (
+            "{%- set eff = reasoning_effort if reasoning_effort in allowed "
+            "else 'max' -%}{{ eff }}"
+        )
+        assert detect_native_reasoning_effort_levels(clause) is None
+
+    def test_positive_branch_without_fallback_is_not_a_coercion(self):
+        clause = "{%- set eff = reasoning_effort if reasoning_effort in ['low'] -%}"
+        assert detect_native_reasoning_effort_levels(clause) is None
+
+    def test_dead_coercion_publishes_nothing(self):
+        """Codex r1: a coerced target the template never reads does not
+        influence the render, so it declares no vocabulary."""
+        clause = (
+            "{%- set unused = reasoning_effort if reasoning_effort in "
+            "['low', 'high'] else 'max' -%}hello"
+        )
+        assert detect_native_reasoning_effort_levels(clause) is None
+
+    def test_read_only_before_the_coercion_is_dead(self):
+        """Codex r2: a load that precedes the assignment cannot see it."""
+        clause = (
+            "{{ eff }}\n{%- set eff = reasoning_effort if reasoning_effort in "
+            "['low', 'high'] else 'max' -%}"
+        )
+        assert detect_native_reasoning_effort_levels(clause) is None
+
+    def test_overwritten_before_read_is_dead(self):
+        clause = (
+            "{%- set eff = reasoning_effort if reasoning_effort in ['low', 'high'] "
+            "else 'max' -%}{%- set eff = 'z' -%}{{ eff }}"
+        )
+        assert detect_native_reasoning_effort_levels(clause) is None
+
+    def test_overwrite_that_reads_the_target_keeps_it_live(self):
+        clause = (
+            "{%- set eff = reasoning_effort if reasoning_effort in ['low', 'high'] "
+            "else 'max' -%}{%- set eff = eff ~ '!' -%}{{ eff }}"
+        )
+        assert detect_native_reasoning_effort_levels(clause) == ("low", "high", "max")
+
+    def test_read_only_inside_a_macro_is_dead(self):
+        """A macro body runs only if called; the walk does not prove calls,
+        so a macro-only read is conservatively not a live read."""
+        clause = (
+            "{%- set eff = reasoning_effort if reasoning_effort in ['low', 'high'] "
+            "else 'max' -%}{% macro m() %}{{ eff }}{% endmacro %}"
+        )
+        assert detect_native_reasoning_effort_levels(clause) is None
+
+    def test_read_inside_a_later_branch_is_live(self):
+        clause = (
+            "{%- set eff = reasoning_effort if reasoning_effort in ['low', 'high'] "
+            "else 'max' -%}{% if tools %}{{ eff }}{% endif %}"
+        )
+        assert detect_native_reasoning_effort_levels(clause) == ("low", "high", "max")
+
+    def test_same_line_read_before_the_coercion_is_dead(self):
+        """Codex r3: Jinja nodes carry only a line number; a load on the
+        assignment's own line may precede it and is not evidence."""
+        clause = (
+            "{{ eff }}{%- set eff = reasoning_effort if reasoning_effort in "
+            "['low', 'high'] else 'max' -%}"
+        )
+        assert detect_native_reasoning_effort_levels(clause) is None
+
+    def test_copy_into_a_dead_variable_is_dead(self):
+        clause = (
+            "{%- set eff = reasoning_effort if reasoning_effort in ['low', 'high'] "
+            "else 'max' -%}\n{%- set dead_copy = eff -%}hello"
+        )
+        assert detect_native_reasoning_effort_levels(clause) is None
+
+    def test_copy_that_is_rendered_keeps_it_live(self):
+        clause = (
+            "{%- set eff = reasoning_effort if reasoning_effort in ['low', 'high'] "
+            "else 'max' -%}{%- set c = eff -%}{{ c }}"
+        )
+        assert detect_native_reasoning_effort_levels(clause) == ("low", "high", "max")
+
+    def test_copy_rebound_before_render_is_dead(self):
+        clause = (
+            "{%- set eff = reasoning_effort if reasoning_effort in ['low', 'high'] "
+            "else 'max' -%}{%- set c = eff -%}{%- set c = 1 -%}{{ c }}"
+        )
+        assert detect_native_reasoning_effort_levels(clause) is None
+
+    def test_minified_coercion_inside_thinking_guard_rendered_after_it(self):
+        """Codex r4: liveness is structural (enclosing lists' tails), so a
+        single-line minified template is analysed like its multi-line twin."""
+        clause = (
+            "{% if enable_thinking is undefined or enable_thinking is true %}"
+            "{% set eff = reasoning_effort if reasoning_effort is defined and "
+            "reasoning_effort in ['low', 'high'] else 'max' %}{% endif %}{{ eff }}"
+        )
+        assert detect_native_reasoning_effort_levels(clause) == ("low", "high", "max")
+        assert (
+            detect_native_reasoning_effort_levels(
+                clause.replace("{% endif %}{{ eff }}", "{% endif %}hello")
+            )
+            is None
+        )
+
+    def test_coercion_read_only_by_its_own_assignment_is_dead(self):
+        clause = (
+            "{%- set eff = reasoning_effort if reasoning_effort in ['low', 'high'] "
+            "else 'max' -%}{%- set other = 'x' -%}{{ other }}"
+        )
+        assert detect_native_reasoning_effort_levels(clause) is None
+
+    def test_rebound_variable_is_not_the_client_value(self):
+        clause = (
+            "{%- set reasoning_effort = 'max' -%}"
+            "{%- set eff = reasoning_effort if reasoning_effort in ['low', 'high'] "
+            "else 'max' -%}"
+        )
+        assert detect_native_reasoning_effort_levels(clause) is None
 
 
 class TestDetectionRequiresAValidationBlock:
@@ -597,7 +833,7 @@ class TestDetectionRequiresAValidationBlock:
         assert detect_native_reasoning_effort_levels(clause) is None
 
     def test_without_jinja2_detection_publishes_nothing(self, monkeypatch):
-        from vllm_mlx.utils import chat_template as module
+        from rapid_mlx.utils import chat_template as module
 
         monkeypatch.setattr(module, "_jinja_nodes", lambda: (None, None))
         module._template_parser.cache_clear()
@@ -999,7 +1235,7 @@ class TestXhighSchema:
         assert "xhigh" in _VALID_REASONING_EFFORTS
 
     def test_xhigh_cap_tier_matches_anthropic(self):
-        from vllm_mlx.api.anthropic_models import (
+        from rapid_mlx.api.anthropic_models import (
             ANTHROPIC_EFFORT_TO_REASONING_MAX_TOKENS,
         )
 
@@ -1101,7 +1337,7 @@ class _RouteEngine:
 
 @pytest.fixture
 def _rate_limiter_state():
-    from vllm_mlx.middleware.auth import rate_limiter
+    from rapid_mlx.middleware.auth import rate_limiter
 
     saved_enabled = rate_limiter.enabled
     saved_rpm = rate_limiter.requests_per_minute
@@ -1129,7 +1365,7 @@ def _chat_cap_probe():
         return None
 
     with patch(
-        "vllm_mlx.routes.chat._build_reasoning_budget_processor", side_effect=_probe
+        "rapid_mlx.routes.chat._build_reasoning_budget_processor", side_effect=_probe
     ):
         yield seen
 
@@ -1138,7 +1374,7 @@ def _chat_cap_probe():
 def _responses_cap_probe():
     """Record the ``reasoning_max_tokens`` the responses route hands its
     post-hoc finalizer (the generic cap is enforced post-hoc on this surface)."""
-    import vllm_mlx.routes.responses as responses_mod
+    import rapid_mlx.routes.responses as responses_mod
 
     seen: list = []
     original = responses_mod._finalize_content_and_reasoning
@@ -1148,17 +1384,19 @@ def _responses_cap_probe():
         return original(*args, **kwargs)
 
     with patch(
-        "vllm_mlx.routes.responses._finalize_content_and_reasoning",
+        "rapid_mlx.routes.responses._finalize_content_and_reasoning",
         side_effect=_probe,
     ):
         yield seen
 
 
-def _client(engine: _RouteEngine, *, surface: str) -> TestClient:
+def _client(
+    engine: _RouteEngine, *, surface: str, default_reasoning_effort: str | None = None
+) -> TestClient:
     if surface == "chat":
-        from vllm_mlx.routes.chat import router
+        from rapid_mlx.routes.chat import router
     else:
-        from vllm_mlx.routes.responses import router
+        from rapid_mlx.routes.responses import router
 
     cfg = reset_config()
     cfg.engine = engine
@@ -1166,6 +1404,7 @@ def _client(engine: _RouteEngine, *, surface: str) -> TestClient:
     cfg.model_registry = None
     cfg.no_thinking = False
     cfg.reasoning_parser_name = "qwen3"
+    cfg.default_reasoning_effort = default_reasoning_effort
 
     app = FastAPI()
     install_exception_handlers(app)
@@ -1359,6 +1598,240 @@ class TestResponsesRouteNativeLevel:
             engine.kwargs.get("chat_template_kwargs") or {}
         )
         assert _responses_cap_probe == [2048]
+
+
+class TestServerDefaultReasoningEffort:
+    """#3714 ``serve --default-reasoning-effort``: fills ``reasoning_effort``
+    on requests that carry no reasoning knob, then travels the same
+    translation as a client value. GLM-5.3's template defaults to ``Max``;
+    the pool node serves it with ``low`` so "say hello" is not a
+    ``max_tokens``-long think."""
+
+    # --- helper contract ---------------------------------------------------
+
+    def test_unset_default_is_a_noop(self):
+        req = _request()
+        assert maybe_apply_default_reasoning_effort(req, default_effort=None) is False
+        assert req.reasoning_effort is None
+
+    def test_fills_reasoning_effort_when_client_sent_nothing(self):
+        req = _request()
+        assert maybe_apply_default_reasoning_effort(req, default_effort="low") is True
+        assert req.reasoning_effort == "low"
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"reasoning_effort": "high"},
+            {"reasoning_max_tokens": 1024},
+            {"reasoning": {"effort": "high"}},
+            {"enable_thinking": False},
+            {"enable_thinking": True},
+            {"chat_template_kwargs": {"enable_thinking": False}},
+            {"chat_template_kwargs": {"enable_thinking": "false"}},
+            {"chat_template_kwargs": {"reasoning_effort": "high"}},
+        ],
+        ids=[
+            "reasoning_effort",
+            "reasoning_max_tokens",
+            "responses-reasoning.effort",
+            "enable_thinking=false",
+            "enable_thinking=true",
+            "ctk.enable_thinking=false",
+            "ctk.enable_thinking=str-false",
+            "ctk.reasoning_effort",
+        ],
+    )
+    def test_any_client_reasoning_knob_wins(self, overrides):
+        req = _request(**overrides)
+        before = req.reasoning_effort
+        assert maybe_apply_default_reasoning_effort(req, default_effort="low") is False
+        assert req.reasoning_effort == before
+
+    def test_extra_signals_source_counts_as_client_intent(self):
+        """The Responses adapter keeps ``reasoning`` on the original request;
+        the route passes it as a secondary source, same as the casual gate."""
+        req = _request()
+        native = SimpleNamespace(reasoning={"effort": "medium"})
+        assert (
+            maybe_apply_default_reasoning_effort(
+                req, default_effort="low", extra_signals=native
+            )
+            is False
+        )
+        assert req.reasoning_effort is None
+
+    def test_responses_summary_only_reasoning_dict_is_not_intent(self):
+        req = _request()
+        native = SimpleNamespace(reasoning={"summary": "auto"})
+        assert (
+            maybe_apply_default_reasoning_effort(
+                req, default_effort="low", extra_signals=native
+            )
+            is True
+        )
+        assert req.reasoning_effort == "low"
+
+    def test_default_then_translates_like_a_client_value(self):
+        """Back to back with ``maybe_apply_reasoning_effort`` the default
+        lands as the GLM template's native ``low`` (no cap layered on)."""
+        req = _request()
+        maybe_apply_default_reasoning_effort(req, default_effort="low")
+        assert (
+            maybe_apply_reasoning_effort(req, chat_template=GLM53_TEMPLATE_CLAUSE)
+            is True
+        )
+        assert req.chat_template_kwargs == {"reasoning_effort": "low"}
+        assert req.reasoning_max_tokens is None
+
+    def test_default_none_switches_thinking_off(self):
+        req = _request()
+        maybe_apply_default_reasoning_effort(req, default_effort="none")
+        assert maybe_apply_reasoning_effort(req, chat_template=QWEN38_TEMPLATE) is True
+        assert req.chat_template_kwargs == {"enable_thinking": False}
+
+    # --- /v1/chat/completions ----------------------------------------------
+
+    def test_chat_route_renders_glm_low_for_a_bare_request(
+        self, _rate_limiter_state, _chat_cap_probe
+    ):
+        engine = _RouteEngine(GLM53_TEMPLATE_CLAUSE)
+        resp = _client(engine, surface="chat", default_reasoning_effort="low").post(
+            "/v1/chat/completions", json=_chat_body()
+        )
+        assert resp.status_code == 200, resp.text
+        assert engine.kwargs.get("chat_template_kwargs") == {"reasoning_effort": "low"}
+        assert _chat_cap_probe == [None]
+
+    def test_chat_route_client_effort_beats_server_default(
+        self, _rate_limiter_state, _chat_cap_probe
+    ):
+        engine = _RouteEngine(GLM53_TEMPLATE_CLAUSE)
+        resp = _client(engine, surface="chat", default_reasoning_effort="low").post(
+            "/v1/chat/completions", json=_chat_body(reasoning_effort="high")
+        )
+        assert resp.status_code == 200, resp.text
+        assert engine.kwargs.get("chat_template_kwargs") == {"reasoning_effort": "high"}
+
+    def test_chat_route_without_default_keeps_template_default(
+        self, _rate_limiter_state, _chat_cap_probe
+    ):
+        engine = _RouteEngine(GLM53_TEMPLATE_CLAUSE)
+        resp = _client(engine, surface="chat").post(
+            "/v1/chat/completions", json=_chat_body()
+        )
+        assert resp.status_code == 200, resp.text
+        assert "reasoning_effort" not in (
+            engine.kwargs.get("chat_template_kwargs") or {}
+        )
+
+    def test_chat_route_default_on_cap_template_sets_the_tier(
+        self, _rate_limiter_state, _chat_cap_probe
+    ):
+        engine = _RouteEngine(ENABLE_THINKING_ONLY_TEMPLATE)
+        resp = _client(engine, surface="chat", default_reasoning_effort="low").post(
+            "/v1/chat/completions", json=_chat_body()
+        )
+        assert resp.status_code == 200, resp.text
+        assert _chat_cap_probe == [OPENAI_REASONING_EFFORT_TO_MAX_TOKENS["low"]]
+
+    # --- /v1/responses ------------------------------------------------------
+
+    def test_responses_route_renders_glm_low_for_a_bare_request(
+        self, _rate_limiter_state, _responses_cap_probe
+    ):
+        engine = _RouteEngine(GLM53_TEMPLATE_CLAUSE)
+        resp = _client(
+            engine, surface="responses", default_reasoning_effort="low"
+        ).post("/v1/responses", json=_responses_body())
+        assert resp.status_code == 200, resp.text
+        assert engine.kwargs.get("chat_template_kwargs") == {"reasoning_effort": "low"}
+        assert _responses_cap_probe == [None]
+
+    def test_responses_strict_schema_sees_the_default_as_reasoning_intent(
+        self, _rate_limiter_state, _responses_cap_probe
+    ):
+        """Codex r1: the strict-schema gate injects ``enable_thinking=False``
+        for a request with no reasoning knob. The server default must be
+        filled BEFORE that gate so it behaves like a client value there too
+        (the gate steps aside for client intent), not be mistaken for a
+        client thinking preference afterwards."""
+
+        class _JsonEngine(_RouteEngine):
+            async def chat(self, messages=None, **kwargs):
+                out = await super().chat(messages=messages, **kwargs)
+                out.text = out.new_text = '{"answer": 1}'
+                return out
+
+        engine = _JsonEngine(GLM53_TEMPLATE_CLAUSE)
+        resp = _client(
+            engine, surface="responses", default_reasoning_effort="low"
+        ).post(
+            "/v1/responses",
+            json=_responses_body(
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "answer",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {"answer": {"type": "integer"}},
+                            "required": ["answer"],
+                            "additionalProperties": False,
+                        },
+                    }
+                }
+            ),
+        )
+        assert resp.status_code == 200, resp.text
+        assert engine.kwargs.get("chat_template_kwargs") == {"reasoning_effort": "low"}
+
+    def test_responses_route_nested_effort_beats_server_default(
+        self, _rate_limiter_state, _responses_cap_probe
+    ):
+        engine = _RouteEngine(GLM53_TEMPLATE_CLAUSE)
+        resp = _client(
+            engine, surface="responses", default_reasoning_effort="low"
+        ).post("/v1/responses", json=_responses_body(reasoning={"effort": "high"}))
+        assert resp.status_code == 200, resp.text
+        assert engine.kwargs.get("chat_template_kwargs") == {"reasoning_effort": "high"}
+
+
+class TestServeDefaultReasoningEffortFlag:
+    """#3714 ``serve --default-reasoning-effort`` is parsed against the
+    OpenAI closed set and reaches ``ServerConfig`` through the same global
+    ``serve_command`` writes."""
+
+    @pytest.fixture
+    def parser(self):
+        cli = pytest.importorskip("rapid_mlx.cli")
+        return cli.build_parser()
+
+    @pytest.mark.parametrize("effort", list(_VALID_REASONING_EFFORTS))
+    def test_every_openai_value_parses(self, parser, effort):
+        args = parser.parse_args(["serve", "m", "--default-reasoning-effort", effort])
+        assert args.default_reasoning_effort == effort
+
+    def test_unset_is_none(self, parser):
+        assert parser.parse_args(["serve", "m"]).default_reasoning_effort is None
+
+    def test_foreign_value_is_rejected(self, parser):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["serve", "m", "--default-reasoning-effort", "max"])
+
+    def test_server_global_reaches_config(self):
+        import rapid_mlx.server as server
+
+        saved = server._default_reasoning_effort
+        try:
+            server._default_reasoning_effort = "low"
+            reset_config()
+            server._sync_config()
+            assert server.get_config().default_reasoning_effort == "low"
+        finally:
+            server._default_reasoning_effort = saved
+            reset_config()
 
 
 class TestStreamingRoutesNativeLevel:

@@ -1,3 +1,5 @@
+import configparser
+import fnmatch
 from pathlib import Path
 
 import yaml
@@ -36,12 +38,14 @@ def test_changed_lines_gate_unions_linux_and_apple_coverage() -> None:
     apple = jobs["test-apple-silicon"]
     gate = jobs["changed-lines-coverage"]
 
-    assert "coverage-linux-${{ matrix.python-version }}.data" in text
+    assert (
+        "coverage-linux-${{ matrix.python-version }}-${{ matrix.shard }}.data" in text
+    )
     assert "coverage-apple.data" in text
-    assert "--cov=vllm_mlx" in apple["steps"][-2]["run"]
+    assert "--cov=rapid_mlx" in apple["steps"][-2]["run"]
     assert set(gate["needs"]) == {
         "changes",
-        "test-matrix",
+        "linux-coverage",
         "test-apple-silicon",
     }
 
@@ -52,6 +56,7 @@ def test_changed_lines_gate_unions_linux_and_apple_coverage() -> None:
     assert "--fail-under 100" in gate_run
 
     aggregate_needs = set(jobs["tests"]["needs"])
+    assert "linux-coverage" in aggregate_needs
     assert "changed-lines-coverage" in aggregate_needs
     aggregate_run = next(
         step["run"]
@@ -59,6 +64,7 @@ def test_changed_lines_gate_unions_linux_and_apple_coverage() -> None:
         if step.get("name") == "Check test results"
     )
     assert "needs.changed-lines-coverage.result" in aggregate_run
+    assert "needs.linux-coverage.result" in aggregate_run
 
     # Non-engine PRs return before inspecting the intentionally skipped union
     # job, preserving the path-aware required-check facade.
@@ -129,6 +135,21 @@ def test_linux_coverage_lane_declares_complete_ci_linux_discovery_surface() -> N
     )
 
 
+def test_linux_shard_planner_failure_cannot_fall_back_to_full_suite() -> None:
+    _, workflow = _workflow()
+    run = next(
+        step
+        for step in workflow["jobs"]["test-matrix"]["steps"]
+        if step.get("name") == "Run unit tests (no MLX required)"
+    )["run"]
+
+    assert run.startswith("set -euo pipefail\n")
+    assert "mapfile -t ordinary_ignores < <(" not in run
+    assert "mapfile -t headless_ignores < <(" not in run
+    assert '--shard-count 3 > "$ordinary_plan"' in run
+    assert '--shard-count 3 > "$headless_plan"' in run
+
+
 def test_apple_coverage_roster_contains_only_tracked_tests() -> None:
     _, workflow = _workflow()
     apple_run = workflow["jobs"]["test-apple-silicon"]["steps"][-2]["run"]
@@ -144,13 +165,25 @@ def test_apple_coverage_roster_contains_only_tracked_tests() -> None:
 
 
 def test_qwen4_fused_gdn_coverage_runs_on_apple_silicon() -> None:
-    """Qwen4 Metal fast paths must contribute to the changed-lines union."""
+    """Qwen-family Metal fast paths must contribute to changed-lines coverage."""
     _, workflow = _workflow()
     apple_run = workflow["jobs"]["test-apple-silicon"]["steps"][-2]["run"]
 
     assert "tests/test_qwen4_fused_gdn_decode.py" in apple_run
+    assert "tests/test_qwen35_moe_router.py" in apple_run
+    assert "tests/test_qwen35_fused_gdn_decode.py" in apple_run
     assert "tests/test_qsa_block_sparse.py" in apple_run
     assert "tests/test_qsa_indexed_splitk.py" in apple_run
+    assert "tests/test_qsa_stage1.py" in apple_run
+
+
+def test_qwen36_dual_lane_coverage_runs_on_apple_silicon() -> None:
+    """Qwen3.6 routing and disconnect ownership must reach the MLX lane."""
+    _, workflow = _workflow()
+    apple_run = workflow["jobs"]["test-apple-silicon"]["steps"][-2]["run"]
+
+    assert "tests/test_qwen36_native_text_cache.py" in apple_run
+    assert "tests/test_disconnect_counter_prod_shape.py" in apple_run
 
 
 def test_mla_absorbed_verify_coverage_runs_on_apple_silicon() -> None:
@@ -159,6 +192,18 @@ def test_mla_absorbed_verify_coverage_runs_on_apple_silicon() -> None:
     apple_run = workflow["jobs"]["test-apple-silicon"]["steps"][-2]["run"]
 
     assert "tests/test_mla_absorbed_verify.py" in apple_run
+
+
+def test_deepseek_v41_product_coverage_runs_on_apple_silicon() -> None:
+    """The installed MLX-only V4.1 runtime must contribute to the union."""
+    _, workflow = _workflow()
+    apple_run = workflow["jobs"]["test-apple-silicon"]["steps"][-2]["run"]
+
+    assert "tests/test_deepseek_v41_artifacts.py" in apple_run
+    assert "tests/test_deepseek_v41_affine_route_qmv.py" in apple_run
+    assert "tests/test_deepseek_v41_dspark.py" in apple_run
+    assert "tests/test_deepseek_v41_hyper_connections.py" in apple_run
+    assert "tests/test_deepseek_v41_native_load.py" in apple_run
 
 
 def test_hidream_runtime_coverage_runs_on_apple_silicon() -> None:
@@ -192,11 +237,20 @@ def test_bonsai_runtime_coverage_runs_on_apple_silicon() -> None:
     assert 'pip install -e ".[vision,image]"' in install
 
 
+def test_vendored_mllm_namespace_coverage_runs_on_apple_silicon() -> None:
+    """MLX-bound namespace branches must contribute to the coverage union."""
+    _, workflow = _workflow()
+    apple_run = workflow["jobs"]["test-apple-silicon"]["steps"][-2]["run"]
+
+    assert "tests/test_mllm_cache_namespace_compat.py" in apple_run
+    assert "tests/test_mlx_vlm_vendored_generate.py" in apple_run
+    assert "tests/test_mlx_vlm_vendored_speculative.py" in apple_run
+
+
 def test_coverage_data_is_commit_bound_and_fail_closed() -> None:
-    text, workflow = _workflow()
+    _, workflow = _workflow()
     jobs = workflow["jobs"]
 
-    assert text.count("coverage-${{ github.sha }}") == 4
     for job_name in ("test-matrix", "test-apple-silicon"):
         upload = next(
             step
@@ -204,11 +258,59 @@ def test_coverage_data_is_commit_bound_and_fail_closed() -> None:
             if step.get("name", "").startswith("Upload ")
             and "coverage data" in step.get("name", "").lower()
         )
+        assert "${{ github.sha }}" in upload["with"]["name"]
         assert upload["with"]["if-no-files-found"] == "error"
         assert upload["with"]["retention-days"] == 1
+
+    combined_upload = next(
+        step
+        for step in jobs["linux-coverage"]["steps"]
+        if step.get("name") == "Upload combined Linux coverage data"
+    )
+    assert combined_upload["with"]["name"] == "linux-coverage-${{ github.sha }}"
+    assert combined_upload["with"]["if-no-files-found"] == "error"
+    assert combined_upload["with"]["retention-days"] == 1
+    assert str(jobs["linux-coverage"]["steps"][0]["uses"]).startswith(
+        "actions/checkout@"
+    )
 
 
 def test_coverage_paths_are_portable_across_runner_operating_systems() -> None:
     config = (WORKFLOW.parents[2] / ".coveragerc").read_text()
     assert "relative_files = True" in config
-    assert "source = vllm_mlx" in config
+    assert "source = rapid_mlx" in config
+
+
+def test_vendored_mllm_coverage_omit_is_file_scoped() -> None:
+    """Only pinned copies with source contracts may bypass patch coverage."""
+    parser = configparser.ConfigParser()
+    parser.read(WORKFLOW.parents[2] / ".coveragerc")
+    omit_patterns = parser.get("run", "omit").splitlines()
+    vendored_prefix = "rapid_mlx/models/mlx_vlm_vendored/"
+
+    assert [entry for entry in omit_patterns if entry.startswith(vendored_prefix)] == [
+        f"{vendored_prefix}cache.py",
+        f"{vendored_prefix}apc.py",
+        f"{vendored_prefix}inputs.py",
+        f"{vendored_prefix}generate/ar.py",
+        f"{vendored_prefix}generate/common.py",
+        f"{vendored_prefix}generate/types.py",
+        f"{vendored_prefix}sample_utils.py",
+        f"{vendored_prefix}fp8.py",
+        f"{vendored_prefix}models/base.py",
+        f"{vendored_prefix}models/linear.py",
+        f"{vendored_prefix}quant_utils.py",
+        f"{vendored_prefix}speculative/cache_state.py",
+        f"{vendored_prefix}speculative/common.py",
+        f"{vendored_prefix}speculative/ddtree.py",
+        f"{vendored_prefix}speculative/dflash.py",
+        f"{vendored_prefix}speculative/mtp.py",
+        f"{vendored_prefix}speculative/utils.py",
+    ]
+    for guarded_path in (
+        "rapid_mlx/models/mlx_vlm_vendored/future_module.py",
+        "rapid_mlx/mllm_cache_compat.py",
+    ):
+        assert not any(
+            fnmatch.fnmatchcase(guarded_path, pattern) for pattern in omit_patterns
+        )

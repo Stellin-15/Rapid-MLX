@@ -24,10 +24,10 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-import vllm_mlx.server as server_module
-from vllm_mlx.mcp.config import validate_config
+import rapid_mlx.server as server_module
+from rapid_mlx.mcp.config import validate_config
 
-# An allowlisted command (``vllm_mlx/mcp/security.py``) with a shape the
+# An allowlisted command (``rapid_mlx/mcp/security.py``) with a shape the
 # validator accepts.
 _GOOD = {"transport": "stdio", "command": "npx", "args": ["-y", "some-server"]}
 # ``sh`` is not on the allowlist — the validator rejects this outright, which
@@ -44,7 +44,7 @@ def _stub_command_path_lookup(monkeypatch):
     "good" entry too and the tests would pass for the wrong reason.
     """
     monkeypatch.setattr(
-        "vllm_mlx.mcp.security.shutil.which", lambda cmd: f"/usr/bin/{cmd}"
+        "rapid_mlx.mcp.security.shutil.which", lambda cmd: f"/usr/bin/{cmd}"
     )
 
 
@@ -52,7 +52,7 @@ def _stub_command_path_lookup(monkeypatch):
 def _reset_mcp_globals():
     """Leave the module-level MCP state as we found it.
 
-    ``vllm_mlx.server`` keeps the manager in module globals, so a test that
+    ``rapid_mlx.server`` keeps the manager in module globals, so a test that
     installs one would otherwise leak into every later test in the session.
     """
     saved = (
@@ -151,7 +151,7 @@ def test_rejected_entry_is_listed_with_its_reason(client, tmp_path, monkeypatch)
     async def _no_connect(self):
         return False
 
-    monkeypatch.setattr("vllm_mlx.mcp.client.MCPClient.connect", _no_connect)
+    monkeypatch.setattr("rapid_mlx.mcp.client.MCPClient.connect", _no_connect)
 
     asyncio.run(server_module.init_mcp(_write(tmp_path, {"good": _GOOD, "bad": _BAD})))
 
@@ -187,7 +187,7 @@ def test_reload_picks_up_a_newly_added_server(client, tmp_path, monkeypatch):
     async def _no_connect(self):
         return False
 
-    monkeypatch.setattr("vllm_mlx.mcp.client.MCPClient.connect", _no_connect)
+    monkeypatch.setattr("rapid_mlx.mcp.client.MCPClient.connect", _no_connect)
 
     path = _write(tmp_path, {"one": _GOOD})
     asyncio.run(server_module.init_mcp(path))
@@ -208,7 +208,7 @@ def test_reload_picks_up_a_removed_server(client, tmp_path, monkeypatch):
     async def _no_connect(self):
         return False
 
-    monkeypatch.setattr("vllm_mlx.mcp.client.MCPClient.connect", _no_connect)
+    monkeypatch.setattr("rapid_mlx.mcp.client.MCPClient.connect", _no_connect)
 
     asyncio.run(server_module.init_mcp(_write(tmp_path, {"one": _GOOD, "two": _GOOD})))
     (tmp_path / "mcp.json").write_text(json.dumps({"mcpServers": {"one": _GOOD}}))
@@ -244,8 +244,8 @@ def test_connection_error_carries_the_child_stderr():
     the user nothing they can act on. The cause is on the child's stderr,
     which the SDK would otherwise route to ours and lose.
     """
-    from vllm_mlx.mcp.client import MCPClient
-    from vllm_mlx.mcp.types import MCPServerConfig
+    from rapid_mlx.mcp.client import MCPClient
+    from rapid_mlx.mcp.types import MCPServerConfig
 
     cfg = MCPServerConfig(
         name="broken",
@@ -277,8 +277,8 @@ def test_connection_error_carries_the_child_stderr():
 
 
 def test_connection_error_does_not_repeat_itself():
-    from vllm_mlx.mcp.client import MCPClient
-    from vllm_mlx.mcp.types import MCPServerConfig
+    from rapid_mlx.mcp.client import MCPClient
+    from rapid_mlx.mcp.types import MCPServerConfig
 
     cfg = MCPServerConfig(
         name="broken",
@@ -326,7 +326,7 @@ class _RecordingManager:
         return (server, tool) if sep else (None, full_name)
 
     async def execute_tool(self, full_name, arguments, timeout=None):
-        from vllm_mlx.mcp.types import MCPToolResult
+        from rapid_mlx.mcp.types import MCPToolResult
 
         self.executed.append(full_name)
         return MCPToolResult(
@@ -336,7 +336,7 @@ class _RecordingManager:
 
 @pytest.fixture
 def _restore_sandbox():
-    from vllm_mlx.mcp.security import get_sandbox, set_sandbox
+    from rapid_mlx.mcp.security import get_sandbox, set_sandbox
 
     saved = get_sandbox()
     yield
@@ -344,7 +344,7 @@ def _restore_sandbox():
 
 
 def test_execute_route_blocks_high_risk_tool_by_default(client, _restore_sandbox):
-    from vllm_mlx.mcp.security import ToolSandbox, set_sandbox
+    from rapid_mlx.mcp.security import ToolSandbox, set_sandbox
 
     set_sandbox(ToolSandbox())  # default-deny high-risk, empty allowlist
     manager = _RecordingManager()
@@ -363,7 +363,7 @@ def test_execute_route_blocks_high_risk_tool_by_default(client, _restore_sandbox
 
 
 def test_execute_route_runs_a_benign_tool(client, _restore_sandbox):
-    from vllm_mlx.mcp.security import ToolSandbox, set_sandbox
+    from rapid_mlx.mcp.security import ToolSandbox, set_sandbox
 
     set_sandbox(ToolSandbox())
     manager = _RecordingManager()
@@ -380,7 +380,7 @@ def test_execute_route_runs_a_benign_tool(client, _restore_sandbox):
 
 
 def test_execute_route_honors_the_high_risk_allowlist(client, _restore_sandbox):
-    from vllm_mlx.mcp.security import ToolSandbox, set_sandbox
+    from rapid_mlx.mcp.security import ToolSandbox, set_sandbox
 
     # The user opted this exact namespaced tool in; the route must let it run.
     set_sandbox(ToolSandbox(allowed_high_risk_tools={"fs__shell_exec"}))
@@ -406,8 +406,8 @@ def test_disconnect_closes_the_captured_stderr_file():
     """Each reload disconnects every client; a leaked temp fd per cycle adds up."""
     import tempfile
 
-    from vllm_mlx.mcp.client import MCPClient, MCPServerState
-    from vllm_mlx.mcp.types import MCPServerConfig
+    from rapid_mlx.mcp.client import MCPClient, MCPServerState
+    from rapid_mlx.mcp.types import MCPServerConfig
 
     cfg = MCPServerConfig(
         name="s",
@@ -433,8 +433,8 @@ def test_failed_connect_closes_the_captured_stderr_file(monkeypatch):
     """
     import tempfile
 
-    from vllm_mlx.mcp.client import MCPClient, MCPServerState
-    from vllm_mlx.mcp.types import MCPServerConfig
+    from rapid_mlx.mcp.client import MCPClient, MCPServerState
+    from rapid_mlx.mcp.types import MCPServerConfig
 
     cfg = MCPServerConfig(
         name="s",
@@ -457,3 +457,52 @@ def test_failed_connect_closes_the_captured_stderr_file(monkeypatch):
     assert client_obj._state == MCPServerState.ERROR
     assert client_obj._stderr_file is None
     assert handle.closed
+
+
+@pytest.mark.asyncio
+async def test_manager_resolution_refresh_and_reconnect_paths():
+    from types import SimpleNamespace
+
+    from rapid_mlx.mcp.manager import MCPClientManager
+    from rapid_mlx.mcp.types import MCPTool
+
+    events = []
+
+    class Client:
+        def __init__(self, name, connected=True):
+            self.name = name
+            self.is_connected = connected
+            self.tools = [MCPTool(name, "tool", "tool", {"type": "object"})]
+
+        async def refresh_tools(self):
+            events.append((self.name, "refresh"))
+
+        async def disconnect(self):
+            events.append((self.name, "disconnect"))
+
+        async def connect(self):
+            events.append((self.name, "connect"))
+
+    manager = object.__new__(MCPClientManager)
+    manager.config = SimpleNamespace(default_timeout=30.0)
+    manager._lock = asyncio.Lock()
+    manager._clients = {
+        "one": Client("one"),
+        "two": Client("two", connected=False),
+    }
+
+    assert manager.resolve_tool_target("one__tool") == ("one", "tool")
+    assert manager.resolve_tool_target("tool") == ("one", "tool")
+    await manager.refresh_tools()
+    assert events == [("one", "refresh")]
+
+    await manager.reconnect("one")
+    await manager.reconnect()
+    assert events[1:] == [
+        ("one", "disconnect"),
+        ("one", "connect"),
+        ("one", "disconnect"),
+        ("one", "connect"),
+        ("two", "disconnect"),
+        ("two", "connect"),
+    ]

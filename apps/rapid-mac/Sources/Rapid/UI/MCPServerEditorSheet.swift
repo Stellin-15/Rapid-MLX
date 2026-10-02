@@ -9,7 +9,7 @@ import SwiftUI
 /// server" is a bad afternoon.
 ///
 /// The engine still gets the final say on the command itself
-/// (`vllm_mlx/mcp/security.py` allowlists what may be spawned). We don't
+/// (`rapid_mlx/mcp/security.py` allowlists what may be spawned). We don't
 /// duplicate that list here: it moves independently of the app, and a
 /// client-side copy that drifts would either block something valid or promise
 /// something that then fails at connect. The rejection reason comes back on
@@ -64,7 +64,13 @@ struct MCPServerEditorSheet: View {
             env: transport == .stdio ? Self.parseEnv(envText) : [:],
             url: transport == .sse ? url.trimmingCharacters(in: .whitespaces) : nil,
             enabled: enabled,
-            timeout: original?.timeout ?? 30
+            timeout: original?.timeout ?? 30,
+            // Policy is authored by the engine config today. Preserve it
+            // exactly when a user edits an unrelated connector field in the
+            // GUI; silently dropping it would turn safe reads into approval
+            // prompts and mislabel local writes on the next reload.
+            agentReadOnlyTools: original?.agentReadOnlyTools ?? [],
+            agentLocalChangeTools: original?.agentLocalChangeTools ?? []
         )
     }
 

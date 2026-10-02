@@ -47,8 +47,8 @@ class TestResponseFormatValidation:
         ``{}``. Wrapped by ``except Exception: raise
         HTTPException(detail=str(e))`` and the raw error string
         surfaced in the response body."""
-        from vllm_mlx.api.models import ResponseFormat
-        from vllm_mlx.service.helpers import _validate_response_format
+        from rapid_mlx.api.models import ResponseFormat
+        from rapid_mlx.service.helpers import _validate_response_format
 
         with pytest.raises(HTTPException) as ei:
             _validate_response_format(ResponseFormat(type="json_schema"))
@@ -67,7 +67,7 @@ class TestResponseFormatValidation:
         through and ``extract_json_schema_for_guided`` still bailed at
         ``if not schema: return None`` — request proceeded with no
         constraint. Now → 400 naming the missing inner member."""
-        from vllm_mlx.service.helpers import _validate_response_format
+        from rapid_mlx.service.helpers import _validate_response_format
 
         with pytest.raises(HTTPException) as ei:
             _validate_response_format(
@@ -80,7 +80,7 @@ class TestResponseFormatValidation:
     def test_json_schema_type_with_empty_schema_member_raises_400(self):
         """Same shape as above but with ``schema:{}`` — an empty inner
         schema is functionally equivalent to no schema at all."""
-        from vllm_mlx.service.helpers import _validate_response_format
+        from rapid_mlx.service.helpers import _validate_response_format
 
         with pytest.raises(HTTPException) as ei:
             _validate_response_format(
@@ -100,7 +100,7 @@ class TestResponseFormatValidation:
         ``json_schema_spec.get("schema", {})`` returned ``{}`` so the
         function fell out at ``if not schema: return None`` and the
         request proceeded with no structure enforcement."""
-        from vllm_mlx.service.helpers import _validate_response_format
+        from rapid_mlx.service.helpers import _validate_response_format
 
         with pytest.raises(HTTPException) as ei:
             _validate_response_format({"type": "json_schema", "json_schema": {}})
@@ -113,7 +113,7 @@ class TestResponseFormatValidation:
         for any non-listed type) and the request was treated as
         unconstrained text — the client received plain prose with no
         signal that their format choice was unsupported."""
-        from vllm_mlx.service.helpers import _validate_response_format
+        from rapid_mlx.service.helpers import _validate_response_format
 
         with pytest.raises(HTTPException) as ei:
             _validate_response_format({"type": "xml"})
@@ -126,7 +126,7 @@ class TestResponseFormatValidation:
         """``type:""`` is a common client-side bug (env var unset →
         empty string default). Used to silent-200 via the same path
         as ``xml``."""
-        from vllm_mlx.service.helpers import _validate_response_format
+        from rapid_mlx.service.helpers import _validate_response_format
 
         with pytest.raises(HTTPException) as ei:
             _validate_response_format({"type": ""})
@@ -137,7 +137,7 @@ class TestResponseFormatValidation:
         """``response_format={}`` — no ``type`` key at all. Used to
         silent-200 because ``rf_dict.get("type", "text")`` returned
         ``"text"`` and the route proceeded as unconstrained generation."""
-        from vllm_mlx.service.helpers import _validate_response_format
+        from rapid_mlx.service.helpers import _validate_response_format
 
         with pytest.raises(HTTPException) as ei:
             _validate_response_format({})
@@ -148,8 +148,8 @@ class TestResponseFormatValidation:
         """``type:"text"`` is the documented default and is the
         explicit value Pydantic assigns when no ``type`` is provided
         to the typed path — must not raise."""
-        from vllm_mlx.api.models import ResponseFormat
-        from vllm_mlx.service.helpers import _validate_response_format
+        from rapid_mlx.api.models import ResponseFormat
+        from rapid_mlx.service.helpers import _validate_response_format
 
         # Both shapes — dict and Pydantic — must pass.
         _validate_response_format(ResponseFormat(type="text"))
@@ -157,8 +157,8 @@ class TestResponseFormatValidation:
 
     def test_valid_json_object_passes(self):
         """The OpenAI ``json_object`` JSON-mode shorthand."""
-        from vllm_mlx.api.models import ResponseFormat
-        from vllm_mlx.service.helpers import _validate_response_format
+        from rapid_mlx.api.models import ResponseFormat
+        from rapid_mlx.service.helpers import _validate_response_format
 
         _validate_response_format(ResponseFormat(type="json_object"))
         _validate_response_format({"type": "json_object"})
@@ -166,7 +166,7 @@ class TestResponseFormatValidation:
     def test_valid_json_schema_with_spec_passes(self):
         """A fully-specified ``json_schema`` request must still work —
         the gate only fires on missing/empty inner ``json_schema``."""
-        from vllm_mlx.service.helpers import _validate_response_format
+        from rapid_mlx.service.helpers import _validate_response_format
 
         _validate_response_format(
             {
@@ -181,7 +181,7 @@ class TestResponseFormatValidation:
     def test_none_response_format_passes(self):
         """``response_format`` is optional — ``None`` is the default
         and must remain a no-op."""
-        from vllm_mlx.service.helpers import _validate_response_format
+        from rapid_mlx.service.helpers import _validate_response_format
 
         _validate_response_format(None)
 
@@ -202,7 +202,7 @@ class TestImageUrlTypeValidation:
     def test_int_url_rejected_at_schema_layer(self):
         """The F-066 repro: ``image_url.url=123``. Pydantic v2 raises
         ValidationError (HTTP 422 at the FastAPI route layer)."""
-        from vllm_mlx.api.models import ChatCompletionRequest
+        from rapid_mlx.api.models import ChatCompletionRequest
 
         with pytest.raises(ValidationError) as ei:
             ChatCompletionRequest(
@@ -226,7 +226,7 @@ class TestImageUrlTypeValidation:
         types a buggy client could send. All share the same
         ``.startswith`` hazard at the parser layer — caught at the
         schema instead."""
-        from vllm_mlx.api.models import ChatCompletionRequest
+        from rapid_mlx.api.models import ChatCompletionRequest
 
         with pytest.raises(ValidationError) as ei:
             ChatCompletionRequest(
@@ -249,7 +249,7 @@ class TestImageUrlTypeValidation:
         """Sister field — ``video_url.url`` has the same parser
         hazard (``process_video_input`` calls ``is_base64_video`` →
         ``startswith``)."""
-        from vllm_mlx.api.models import ChatCompletionRequest
+        from rapid_mlx.api.models import ChatCompletionRequest
 
         with pytest.raises(ValidationError) as ei:
             ChatCompletionRequest(
@@ -265,7 +265,7 @@ class TestImageUrlTypeValidation:
 
     def test_audio_url_int_rejected(self):
         """Sister field — ``audio_url.url`` shares the same shape."""
-        from vllm_mlx.api.models import ChatCompletionRequest
+        from rapid_mlx.api.models import ChatCompletionRequest
 
         with pytest.raises(ValidationError) as ei:
             ChatCompletionRequest(
@@ -282,7 +282,7 @@ class TestImageUrlTypeValidation:
     def test_valid_string_url_dict_accepted(self):
         """A well-typed dict-shape ``image_url`` must still parse —
         the validator only rejects non-string ``url``."""
-        from vllm_mlx.api.models import ChatCompletionRequest
+        from rapid_mlx.api.models import ChatCompletionRequest
 
         req = ChatCompletionRequest(
             model="x",
@@ -325,7 +325,7 @@ class TestImageUrlTypeValidation:
         """
         from pydantic import ValidationError
 
-        from vllm_mlx.api.models import ChatCompletionRequest
+        from rapid_mlx.api.models import ChatCompletionRequest
 
         with pytest.raises(ValidationError) as ei:
             ChatCompletionRequest(
@@ -349,7 +349,7 @@ class TestImageUrlTypeValidation:
     def test_valid_text_content_unaffected(self):
         """The validator only runs on dict items with multimodal
         fields — a pure-text content list must not be affected."""
-        from vllm_mlx.api.models import ChatCompletionRequest
+        from rapid_mlx.api.models import ChatCompletionRequest
 
         req = ChatCompletionRequest(
             model="x",
@@ -379,7 +379,7 @@ class TestProcessImageInputDefenseInDepth:
     """
 
     def test_int_image_raises_clean_value_error(self):
-        from vllm_mlx.models.mllm import process_image_input
+        from rapid_mlx.models.mllm import process_image_input
 
         with pytest.raises(ValueError) as ei:
             process_image_input(123)  # type: ignore[arg-type]
@@ -395,7 +395,7 @@ class TestProcessImageInputDefenseInDepth:
         type guard catches the non-string and raises. The error
         message names the post-unwrap type (``int``), not ``dict``,
         which is the load-bearing test (codex r2 BLOCKING)."""
-        from vllm_mlx.models.mllm import process_image_input
+        from rapid_mlx.models.mllm import process_image_input
 
         with pytest.raises(ValueError) as ei:
             process_image_input({"url": 123})  # type: ignore[arg-type]
@@ -409,7 +409,7 @@ class TestProcessImageInputDefenseInDepth:
         The downstream call hits ``Path.exists()`` and raises
         ``Cannot process image`` because the path is fake — that's
         downstream behavior, not the type guard rejecting the dict."""
-        from vllm_mlx.models.mllm import process_image_input
+        from rapid_mlx.models.mllm import process_image_input
 
         # Pick a path that's <4096 chars and definitely doesn't exist
         # — proves we got past the type guard into the body of the
@@ -427,7 +427,7 @@ class TestProcessImageInputDefenseInDepth:
         """The function also handles the nested ``{"url": {"url":
         "..."}}`` shape (line ~527-528). Pin that the unwrap still
         works through both levels."""
-        from vllm_mlx.models.mllm import process_image_input
+        from rapid_mlx.models.mllm import process_image_input
 
         with pytest.raises(ValueError) as ei:
             process_image_input({"url": {"url": "/nonexistent/__nested_test__.png"}})
@@ -435,3 +435,230 @@ class TestProcessImageInputDefenseInDepth:
         # error, not be caught by the type guard.
         assert "Cannot process image" in str(ei.value)
         assert "must be a string" not in str(ei.value)
+
+
+# ---------------------------------------------------------------------------
+# #3564: faithful engine-abort classification. Same family as the leaks above
+# — the engine sanitises the raw failure text (it can hold model paths, prompt
+# fragments, Metal internals), so instead of forwarding ``str(exc)`` we
+# categorise it into a stable, client-safe ``error.code`` that the Desktop GUI
+# maps to a curated failure card. These pin the classifier and the HTTP mapper.
+# ---------------------------------------------------------------------------
+
+
+class TestEngineAbortClassification:
+    """``classify_engine_abort`` turns an arbitrary engine-loop exception into
+    one of a small closed set of category slugs, inspecting the raw text ONLY
+    inside the trust boundary."""
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Metal command buffer failed: out of memory",
+            # The real Metal command-buffer status is one collapsed token.
+            "kIOGPUCommandBufferCallbackErrorOutOfMemory",
+            "[METAL] Insufficient Memory for buffer",
+            "failed to allocate 12.3 GB",
+            "unable to allocate wired memory",
+            "MTL::Buffer attempting to allocate 9663676416 bytes",
+            "process exceeded maximum allowed buffer size",
+            "metal::malloc returned null",
+            "system under memory pressure; killing worker",
+            "jetsam: killed for exceeding memory limit",
+        ],
+    )
+    def test_memory_signals_classify_as_insufficient_memory(self, message):
+        from rapid_mlx.request import (
+            ENGINE_ABORT_CODE_INSUFFICIENT_MEMORY,
+            classify_engine_abort,
+        )
+
+        assert (
+            classify_engine_abort(RuntimeError(message))
+            == ENGINE_ABORT_CODE_INSUFFICIENT_MEMORY
+        )
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Metal command buffer execution failed",
+            "engine step raised unexpectedly",
+            "assertion failed in decode kernel",
+            "connection reset by peer",
+        ],
+    )
+    def test_non_memory_failures_classify_as_engine_aborted(self, message):
+        from rapid_mlx.request import (
+            ENGINE_ABORT_CODE_ENGINE_ABORTED,
+            classify_engine_abort,
+        )
+
+        assert (
+            classify_engine_abort(RuntimeError(message))
+            == ENGINE_ABORT_CODE_ENGINE_ABORTED
+        )
+
+    def test_exception_type_name_participates_in_classification(self):
+        """The classifier folds ``type(exc).__name__`` into the inspected
+        text, so an OOM signalled only by the exception *class* still
+        classifies as memory (some Metal wrappers carry an empty message)."""
+        from rapid_mlx.request import (
+            ENGINE_ABORT_CODE_INSUFFICIENT_MEMORY,
+            classify_engine_abort,
+        )
+
+        class OutOfMemoryError(RuntimeError):
+            pass
+
+        assert (
+            classify_engine_abort(OutOfMemoryError())
+            == ENGINE_ABORT_CODE_INSUFFICIENT_MEMORY
+        )
+
+    def test_canonical_memory_exceptions_classify_by_type_and_errno(self):
+        """Load-time OOM often surfaces as a bare ``MemoryError`` (host RAM
+        exhausted materialising weights) or a POSIX ``OSError(ENOMEM)`` (an
+        mmap/allocation failure) -- NEITHER of which carries allocation-failure
+        wording to match on. They must still classify as memory (right card +
+        ``Retry-After``), so the classifier recognises them by type/errno."""
+        import errno
+
+        from rapid_mlx.request import (
+            ENGINE_ABORT_CODE_INSUFFICIENT_MEMORY,
+            classify_engine_abort,
+        )
+
+        assert (
+            classify_engine_abort(MemoryError())
+            == ENGINE_ABORT_CODE_INSUFFICIENT_MEMORY
+        )
+        assert (
+            classify_engine_abort(OSError(errno.ENOMEM, "Cannot allocate memory"))
+            == ENGINE_ABORT_CODE_INSUFFICIENT_MEMORY
+        )
+        # The ENOMEM strerror also matches by text when it is wrapped and the
+        # errno itself is no longer reachable (e.g. a re-raised RuntimeError).
+        assert (
+            classify_engine_abort(RuntimeError("mmap failed: Cannot allocate memory"))
+            == ENGINE_ABORT_CODE_INSUFFICIENT_MEMORY
+        )
+
+    def test_non_enomem_oserror_is_not_memory(self):
+        """A non-``ENOMEM`` ``OSError`` (a missing/corrupt weight file) is a
+        load failure, NOT a memory shortfall -- it must not be mislabelled OOM
+        just because it is an ``OSError``."""
+        import errno
+
+        from rapid_mlx.request import (
+            ENGINE_ABORT_CODE_ENGINE_ABORTED,
+            classify_engine_abort,
+        )
+
+        assert (
+            classify_engine_abort(FileNotFoundError(errno.ENOENT, "No such file"))
+            == ENGINE_ABORT_CODE_ENGINE_ABORTED
+        )
+
+    def test_every_code_is_a_member_of_the_closed_set(self):
+        from rapid_mlx.request import ENGINE_ABORT_CODES, classify_engine_abort
+
+        for exc in (RuntimeError("out of memory"), RuntimeError("boom")):
+            assert classify_engine_abort(exc) in ENGINE_ABORT_CODES
+
+
+class TestInferenceAbortedHttpException:
+    """``_inference_aborted_http_exception`` builds the structured 503 the GUI
+    reads. It trusts a pre-classified ``error_kind`` when present (the MLLM
+    lane sets it) and otherwise re-derives the code from the message (the
+    batched/text lane leaves ``error_kind=None``). The user-facing message is
+    a fixed safe string per code — never ``str(exc)``."""
+
+    def test_preclassified_insufficient_memory_takes_the_fast_path(self):
+        from rapid_mlx.request import InferenceAbortedError
+        from rapid_mlx.routes.chat import _inference_aborted_http_exception
+
+        exc = InferenceAbortedError(
+            "MLLM inference was interrupted by a transient engine error; "
+            "retry the request",
+            error_kind="insufficient_memory",
+        )
+        http = _inference_aborted_http_exception(exc)
+
+        assert http.status_code == 503
+        err = http.detail["error"]
+        assert err["code"] == "insufficient_memory"
+        assert err["type"] == "server_error"
+        assert err["param"] is None
+        assert "memory" in err["message"].lower()
+        # The sanitised engine text must not survive into the client message.
+        assert "interrupted by a transient engine error" not in err["message"]
+
+    def test_preclassified_engine_aborted_maps_to_transient_message(self):
+        from rapid_mlx.request import InferenceAbortedError
+        from rapid_mlx.routes.chat import _inference_aborted_http_exception
+
+        http = _inference_aborted_http_exception(
+            InferenceAbortedError("boom", error_kind="engine_aborted")
+        )
+
+        assert http.status_code == 503
+        err = http.detail["error"]
+        assert err["code"] == "engine_aborted"
+        assert "try again" in err["message"].lower()
+
+    def test_unclassified_oom_message_is_reclassified_from_text(self):
+        """The batched/text lane raises ``InferenceAbortedError`` with
+        ``error_kind=None`` and the raw (already-sanitised) text. The mapper
+        must re-derive the memory category from that text."""
+        from rapid_mlx.request import InferenceAbortedError
+        from rapid_mlx.routes.chat import _inference_aborted_http_exception
+
+        http = _inference_aborted_http_exception(
+            InferenceAbortedError("Metal buffer: out of memory")
+        )
+
+        assert http.detail["error"]["code"] == "insufficient_memory"
+
+    def test_lifecycle_cancellation_maps_to_model_replacement(self):
+        """A ``lifecycle`` cancellation (the primary model was replaced under a
+        running request) is NOT an engine fault. The mapper must surface the
+        same ``model_replacement`` envelope the post-commit SSE frame emits, so
+        the pre-commit HTTP 503 and the mid-stream frame agree for the same
+        event (#3564) — never a misleading transient-crash "please try again"."""
+        from rapid_mlx.request import InferenceAbortedError
+        from rapid_mlx.routes.chat import _inference_aborted_http_exception
+
+        http = _inference_aborted_http_exception(
+            InferenceAbortedError("engine step crashed", error_kind="lifecycle")
+        )
+
+        err = http.detail["error"]
+        assert err["code"] == "model_replacement"
+        assert "model replacement" in err["message"].lower()
+        # The raw abort text must not survive into the client message.
+        assert "engine step crashed" not in err["message"]
+
+    def test_unknown_non_lifecycle_error_kind_falls_back_to_message(self):
+        """A non-code, non-lifecycle ``error_kind`` is not a client code, so the
+        mapper ignores it and classifies from the (sanitised) text — here, a
+        generic transient failure."""
+        from rapid_mlx.request import InferenceAbortedError
+        from rapid_mlx.routes.chat import _inference_aborted_http_exception
+
+        http = _inference_aborted_http_exception(
+            InferenceAbortedError("engine step crashed", error_kind="repetition")
+        )
+
+        assert http.detail["error"]["code"] == "engine_aborted"
+
+    def test_non_inference_aborted_exception_is_still_mapped(self):
+        """The mapper accepts any ``BaseException`` (the batched lane may pass
+        the raw error), reading ``error_kind`` defensively via ``getattr``."""
+        from rapid_mlx.routes.chat import _inference_aborted_http_exception
+
+        http = _inference_aborted_http_exception(
+            RuntimeError("could not allocate KV cache: out of memory")
+        )
+
+        assert http.status_code == 503
+        assert http.detail["error"]["code"] == "insufficient_memory"

@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-from vllm_mlx.cli import (
+from rapid_mlx.cli import (
     _available_models_json_payload,
     _cached_models_json_payload,
     models_command,
@@ -44,8 +44,13 @@ def test_available_payload_shape() -> None:
         "is_moe",
         "supports_spec_decode",
         "supports_native_mtp",
+        "native_mtp_draft_model",
         "mtp_draft_model",
         "mtp_speculative_tokens",
+        "tensorfold_mtp",
+        "tensorfold_target_revision",
+        "tensorfold_runtime_revision",
+        "tensorfold_backend",
         "modality",
         "video_modes",
         "min_memory_gb",
@@ -57,6 +62,7 @@ def test_available_payload_shape() -> None:
     assert isinstance(entry["is_hybrid"], bool)
     assert isinstance(entry["is_moe"], bool)
     assert isinstance(entry["supports_native_mtp"], bool)
+    assert isinstance(entry["tensorfold_mtp"], bool)
     assert isinstance(entry["is_builtin"], bool)
     assert isinstance(entry["is_text_only"], bool)
     assert entry["size_bytes"] is None or isinstance(entry["size_bytes"], int)
@@ -90,6 +96,15 @@ def test_available_sections_are_split_by_modality() -> None:
     assert all(e["modality"] == "video-gen" for e in payload["video"])
     assert all(e["modality"] == "image-gen" for e in payload["image"])
     assert all(e["modality"] == "audio" for e in payload["audio"])
+
+
+def test_glm_tensorfold_profile_exposes_exact_desktop_contract() -> None:
+    rows = {row["alias"]: row for row in _available_models_json_payload()["text"]}
+    row = rows["glm5.3-flash-tensorfold"]
+    assert row["tensorfold_mtp"] is True
+    assert row["tensorfold_backend"] == "tensorfold"
+    assert len(row["tensorfold_target_revision"]) == 40
+    assert len(row["tensorfold_runtime_revision"]) == 40
 
 
 def test_image_entries_expose_runtime_default_steps() -> None:
@@ -153,8 +168,8 @@ def test_cached_payload_shape() -> None:
 
 
 def test_cached_payload_reports_every_complete_alias_subfolder(monkeypatch) -> None:
-    import vllm_mlx.cli as cli
-    import vllm_mlx.model_aliases as aliases
+    import rapid_mlx.cli as cli
+    import rapid_mlx.model_aliases as aliases
 
     profiles = {
         "nested-4bit": SimpleNamespace(hf_path="org/multi-quant", subfolder="4bit"),
@@ -188,7 +203,7 @@ def test_cached_subfolder_size_accepts_one_complete_unreferenced_snapshot(
 ) -> None:
     import huggingface_hub.constants as hub_constants
 
-    import vllm_mlx.cli as cli
+    import rapid_mlx.cli as cli
 
     monkeypatch.setattr(hub_constants, "HF_HUB_CACHE", str(tmp_path))
     repo_root = tmp_path / "models--org--multi-quant"
@@ -214,7 +229,7 @@ def test_cached_subfolder_size_fails_closed_for_invalid_current_snapshots(
 
     import huggingface_hub.constants as hub_constants
 
-    import vllm_mlx.cli as cli
+    import rapid_mlx.cli as cli
 
     monkeypatch.setattr(hub_constants, "HF_HUB_CACHE", str(tmp_path))
     repo_root = tmp_path / "models--org--multi-quant"
@@ -248,8 +263,8 @@ def test_cached_subfolder_size_fails_closed_for_invalid_current_snapshots(
 def test_cached_payload_reconciles_root_duplicates_external_and_unknown(
     monkeypatch,
 ) -> None:
-    import vllm_mlx.cli as cli
-    import vllm_mlx.model_aliases as aliases
+    import rapid_mlx.cli as cli
+    import rapid_mlx.model_aliases as aliases
 
     profiles = {
         "root-a": SimpleNamespace(hf_path="org/root", subfolder=None),
@@ -299,7 +314,7 @@ def test_command_emits_single_valid_json_cached(capfd) -> None:
 
 
 def test_atomic_shadow_failure_preserves_legacy_discovery(monkeypatch) -> None:
-    import vllm_mlx.audio.registry as audio_registry
+    import rapid_mlx.audio.registry as audio_registry
 
     def broken_audio_registry():
         raise ValueError("simulated optional registry failure")

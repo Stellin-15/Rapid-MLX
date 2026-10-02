@@ -44,6 +44,8 @@ final class ServerModelProfileTests {
           "is_moe": false,
           "tool_call_parser": "hermes",
           "reasoning_parser": "qwen3",
+          "personal_intelligence_profile": "qwen3.5-4b",
+          "personal_intelligence_qualification": "qwen3.5-4b-q4-v1",
           "capabilities": ["text", "vision", "tools"],
           "serving_lane": "vision",
           "serving_lane_reason": "vision_hybrid_runtime_supported",
@@ -68,6 +70,8 @@ final class ServerModelProfileTests {
         #expect(profile.isMoe == false)
         #expect(profile.toolCallParser == "hermes")
         #expect(profile.reasoningParser == "qwen3")
+        #expect(profile.personalIntelligenceProfile == "qwen3.5-4b")
+        #expect(profile.personalIntelligenceQualification == "qwen3.5-4b-q4-v1")
         #expect(profile.capabilities == ["text", "vision", "tools"])
         #expect(profile.servingLane == "vision")
         #expect(profile.servingLaneReason == "vision_hybrid_runtime_supported")
@@ -102,6 +106,7 @@ final class ServerModelProfileTests {
         #expect(profile.recommendedSampling == nil)
         #expect(profile.isHybrid == nil)
         #expect(profile.toolCallParser == nil)
+        #expect(profile.personalIntelligenceProfile == nil)
         #expect(profile.capabilities == nil)
         #expect(profile.servingLane == nil)
         #expect(profile.servingLaneReason == nil)
@@ -143,6 +148,28 @@ final class ServerModelProfileTests {
         )
         #expect(availability?.state == .ready)
         #expect(availability?.help().isEmpty == false)
+    }
+
+    @Test("An active runtime that rejects tools names the ordinary-mode remedy")
+    func speculativeStatusReportsUnsupportedTools() throws {
+        let json = #"{"id":"qwen3.8-27b-tensorfold","fallback_model":"qwen3.8-27b-4bit","min_memory_gb":48,"speculative_decoding":{"configured":true,"method":"dflash","runtime_state":"active","request_fallback_features":[],"backend":"tensorfold","unsupported_features":["tools","media","grammar"]}}"#
+        let profile = try JSONDecoder().decode(
+            ServerModelProfile.self, from: Data(json.utf8)
+        )
+        #expect(profile.speculativeDecoding?.backend == "tensorfold")
+        #expect(profile.fallbackModel == "qwen3.8-27b-4bit")
+        #expect(profile.minMemoryGB == 48)
+        #expect(profile.speculativeDecoding?.unsupportedFeatures == [
+            "tools", "media", "grammar",
+        ])
+
+        let availability = SpeculativeDecodingAvailability.resolve(
+            profile: profile,
+            sendsTools: true
+        )
+        #expect(availability?.state == .unsupportedTools)
+        #expect(availability?.label().contains("limits tools") == true)
+        #expect(availability?.help().contains("Settings → Performance") == true)
     }
 
     @Test("A method that supports tools stays ready when tools are sent")
@@ -523,6 +550,49 @@ final class ServerModelProfileTests {
         let applied = s.applyServerProfile(profile)
         #expect(!applied, "user's manual override must win — server profile skipped")
         #expect(s.temperature == 0.42, "user's value must survive the call")
+    }
+
+    @Test("Explicit persisted repetition default survives GLM profile hydration to the request boundary")
+    func explicitRepetitionDefaultSurvivesProfileLifecycle() {
+        let profile = ServerModelProfile(
+            id: "glm5.3-flash-tensorfold",
+            recommendedSampling: [
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "repetition_penalty": 1.0
+            ]
+        )
+
+        let explicitDefaults = freshDefaults()
+        explicitDefaults.set(
+            SamplingConfig.repetitionPenaltyDefault,
+            forKey: "rapid.sampling.v0.repetitionPenalty"
+        )
+        let explicit = SamplingConfig(defaults: explicitDefaults)
+        #expect(!explicit.repetitionPenaltyIsImplicitDefault)
+        #expect(!explicit.applyServerProfile(profile))
+
+        let explicitResolved = explicit.resolved(toolsEnabled: false)
+        let explicitRequest = ChatStreamClient.Request(
+            alias: profile.id,
+            messages: [],
+            repetitionPenalty: explicitResolved.repetitionPenalty,
+            repetitionPenaltyIsImplicitDefault:
+                explicitResolved.repetitionPenaltyIsImplicitDefault
+        )
+        #expect(explicitRequest.wireRepetitionPenalty == 1.1)
+
+        let untouched = SamplingConfig(defaults: freshDefaults())
+        #expect(untouched.applyServerProfile(profile))
+        let untouchedResolved = untouched.resolved(toolsEnabled: false)
+        let untouchedRequest = ChatStreamClient.Request(
+            alias: profile.id,
+            messages: [],
+            repetitionPenalty: untouchedResolved.repetitionPenalty,
+            repetitionPenaltyIsImplicitDefault:
+                untouchedResolved.repetitionPenaltyIsImplicitDefault
+        )
+        #expect(untouchedRequest.wireRepetitionPenalty == 1.0)
     }
 
     @Test("Profile with no recommended_sampling block reports false + does not flip isAtDefaults")

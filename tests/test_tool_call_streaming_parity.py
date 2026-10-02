@@ -33,9 +33,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from vllm_mlx.api.tool_calling import parse_tool_calls
-from vllm_mlx.service.postprocessor import StreamingPostProcessor
-from vllm_mlx.tool_parsers import ToolParserManager
+from rapid_mlx.api.tool_calling import parse_tool_calls
+from rapid_mlx.service.postprocessor import StreamingPostProcessor
+from rapid_mlx.tool_parsers import ToolParserManager
 
 
 def _make_cfg_for_parser(parser_name: str) -> MagicMock:
@@ -316,6 +316,11 @@ _PARITY_COVERAGE_EXEMPT: dict[str, str] = {
     "ui-tars": "alias of ui_tars (kebab-case spelling)",
     "uitars": "alias of ui_tars (no-separator spelling)",
     "liquid": "alias of lfm",
+    "k2_horizon": (
+        "IFM extraction requires the request's declared tool schema; dedicated "
+        "character-boundary stream/non-stream contracts live in "
+        "test_k2_horizon_parsers.py"
+    ),
     "auto": "router, not a wire-format parser",
     "generic": "router, not a wire-format parser",
 }

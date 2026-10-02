@@ -78,7 +78,7 @@ class TestExtractMlxBounds:
         }
 
     def test_ignores_non_mlx_and_prefix_lookalikes(self):
-        text = _pp("mlx-audio>=0.2.9,<0.4.4", "transformers<5.13", "mlxfoo==1.0")
+        text = _pp("mlx-audio>=0.5.3,<0.6", "transformers<5.13", "mlxfoo==1.0")
         bounds = guard.extract_mlx_bounds(text)
         assert bounds["mlx"] == set()
         assert bounds["mlx-lm"] == set()
@@ -141,8 +141,9 @@ def test_desktop_sidecar_uses_validated_mlx_vlm_bound():
 
     desktop_spec = matches[0]
     # Both surfaces deliberately pin one validated version. A range here caused
-    # fresh pip installs to backtrack to 0.6.3 while Desktop stayed on 0.6.17.
-    assert desktop_spec.specifier == Requirement("mlx-vlm==0.6.17").specifier
+    # fresh pip installs to backtrack to 0.6.3 while Desktop stayed on its
+    # validated exact pin.
+    assert desktop_spec.specifier == Requirement("mlx-vlm==0.7.2").specifier
     assert vision_specs[0].specifier == desktop_spec.specifier
 
 
@@ -170,9 +171,9 @@ def test_image_extra_tracks_mlx_032_compatible_mflux_line():
     assert Version("0.32.1") in core_specs[0].specifier
     assert Version("0.32.0") not in core_specs[0].specifier
     assert Version("0.33.0") not in core_specs[0].specifier
-    assert Version("0.19.0") in image_specs[0].specifier
+    assert Version("0.20.0") in image_specs[0].specifier
     assert Version("0.18.1") not in image_specs[0].specifier
-    assert Version("0.20.0") not in image_specs[0].specifier
+    assert Version("0.21.0") not in image_specs[0].specifier
 
 
 class TestStrictMode:

@@ -9,9 +9,9 @@ Three findings:
   in the upsample interpolation produces ``noise_amp`` shape
   ``(1, 36600, 1)`` while ``sine_waves`` is ``(1, 36900, 9)`` —
   ``noise = noise_amp * mx.random.normal(sine_waves.shape)`` then
-  raises ``[broadcast_shapes] ... cannot be broadcast``. ``mlx-audio
-  ==0.4.3`` does NOT have the regression. Fix pins the dep to
-  ``<0.4.4``. The catch-all also now logs the FULL traceback at
+  raises ``[broadcast_shapes] ... cannot be broadcast``. The original
+  fix pinned below 0.4.4; the current supported line starts at 0.5.3,
+  where the regression is fixed. The catch-all also logs the FULL traceback at
   ``exception`` level so future incidents are diagnosable from the
   operator log (the pre-fix log had only the leaf message).
 
@@ -20,7 +20,7 @@ Three findings:
   route declared ``input: str = ""`` as a bare query parameter, so
   JSON bodies were silently dropped AND there was nowhere to attach a
   validation constraint. Fix binds a Pydantic
-  :class:`vllm_mlx.api.models.AudioSpeechRequest` body model with
+  :class:`rapid_mlx.api.models.AudioSpeechRequest` body model with
   ``input: str = Field(..., min_length=1)`` and a non-blank validator.
   The envelope handler (registered for ``/v1/audio/speech``) emits a
   400 ``invalid_request_error`` with ``param="input"``.
@@ -44,7 +44,7 @@ import wave
 
 import pytest
 
-# ``vllm_mlx.routes.audio`` transitively imports ``mlx.core`` via the
+# ``rapid_mlx.routes.audio`` transitively imports ``mlx.core`` via the
 # engine wiring. Linux CI runners (``pr_validate``'s validate job) don't
 # install mlx, so a bare import raises ``ModuleNotFoundError`` and 13
 # unrelated tests look like regressions. ``importorskip`` short-circuits
@@ -135,9 +135,9 @@ def _mount_audio_app() -> tuple[TestClient, callable]:
     Pydantic validation error into the OpenAI envelope shape — without
     them the test would see the default FastAPI 422.
     """
-    from vllm_mlx.config import get_config
-    from vllm_mlx.middleware.exception_handlers import install_exception_handlers
-    from vllm_mlx.routes import audio as audio_route
+    from rapid_mlx.config import get_config
+    from rapid_mlx.middleware.exception_handlers import install_exception_handlers
+    from rapid_mlx.routes import audio as audio_route
 
     app = FastAPI()
     app.include_router(audio_route.router)
@@ -167,7 +167,7 @@ class TestSTTShortWhisperAlias:
         repo so a bare ``model="whisper"`` request from drop-in OpenAI
         SDK code lands on the supported variant.
         """
-        from vllm_mlx.routes.audio import STT_MODEL_ALIASES, _resolve_stt_model
+        from rapid_mlx.routes.audio import STT_MODEL_ALIASES, _resolve_stt_model
 
         # The mapping must exist…
         assert "whisper" in STT_MODEL_ALIASES, (
@@ -186,7 +186,7 @@ class TestSTTShortWhisperAlias:
     def test_whisper_1_legacy_alias_resolves(self):
         """OpenAI's legacy ``whisper-1`` placeholder maps to the same
         Whisper variant so legacy SDKs don't 404."""
-        from vllm_mlx.routes.audio import STT_MODEL_ALIASES, _resolve_stt_model
+        from rapid_mlx.routes.audio import STT_MODEL_ALIASES, _resolve_stt_model
 
         assert "whisper-1" in STT_MODEL_ALIASES, (
             "Legacy ``whisper-1`` placeholder must be accepted; some "
@@ -201,8 +201,8 @@ class TestSTTShortWhisperAlias:
         fix the route reaches the engine (we stub the engine so we
         observe the resolved model name).
         """
-        from vllm_mlx.audio import stt as stt_mod
-        from vllm_mlx.routes import audio as audio_route
+        from rapid_mlx.audio import stt as stt_mod
+        from rapid_mlx.routes import audio as audio_route
 
         observed: list[str] = []
 
@@ -255,8 +255,8 @@ class TestSTTShortWhisperAlias:
         identically. Codex r6 NIT requires the model to remain a
         Whisper engine; ``whisper`` → whisper-large-v3 satisfies that.
         """
-        from vllm_mlx.audio import stt as stt_mod
-        from vllm_mlx.routes import audio as audio_route
+        from rapid_mlx.audio import stt as stt_mod
+        from rapid_mlx.routes import audio as audio_route
 
         observed: list[str] = []
 
@@ -399,9 +399,9 @@ class TestSpeechBodyHonored:
     body so a non-empty ``input`` was still ``""`` at the engine."""
 
     def test_json_body_input_reaches_engine(self, monkeypatch):
-        from vllm_mlx.audio import tts as tts_mod
-        from vllm_mlx.audio.probe import require_kokoro_runtime  # noqa: F401
-        from vllm_mlx.routes import audio as audio_route
+        from rapid_mlx.audio import tts as tts_mod
+        from rapid_mlx.audio.probe import require_kokoro_runtime  # noqa: F401
+        from rapid_mlx.routes import audio as audio_route
 
         observed: list[str] = []
 
@@ -427,7 +427,7 @@ class TestSpeechBodyHonored:
 
         monkeypatch.setattr(tts_mod, "TTSEngine", _NoopEngine)
         # Skip the misaki gate — we're not testing that path here.
-        from vllm_mlx.audio import probe as probe_mod
+        from rapid_mlx.audio import probe as probe_mod
 
         monkeypatch.setattr(probe_mod, "require_kokoro_runtime", lambda *a, **k: None)
         _install_fake_mlx_audio(monkeypatch)
@@ -475,8 +475,8 @@ class TestSpeechCatchAllShape:
     def test_engine_failure_emits_openai_envelope(self, monkeypatch, caplog):
         import logging
 
-        from vllm_mlx.audio import tts as tts_mod
-        from vllm_mlx.routes import audio as audio_route
+        from rapid_mlx.audio import tts as tts_mod
+        from rapid_mlx.routes import audio as audio_route
 
         class _BoomEngine:
             def __init__(self, model_name: str):
@@ -497,7 +497,7 @@ class TestSpeechCatchAllShape:
                 return b""
 
         monkeypatch.setattr(tts_mod, "TTSEngine", _BoomEngine)
-        from vllm_mlx.audio import probe as probe_mod
+        from rapid_mlx.audio import probe as probe_mod
 
         monkeypatch.setattr(probe_mod, "require_kokoro_runtime", lambda *a, **k: None)
         _install_fake_mlx_audio(monkeypatch)
@@ -543,19 +543,18 @@ class TestSpeechCatchAllShape:
 
 
 # ---------------------------------------------------------------------------
-# R7-H3 — pyproject pins mlx-audio<0.4.4
+# R7-H3 — pyproject excludes the broken mlx-audio line
 # ---------------------------------------------------------------------------
 
 
 class TestMlxAudioVersionPin:
-    """The R7-H3 fix is upstream — mlx-audio 0.4.4 broke
-    ``istftnet.SineGen``. Pin the dep below 0.4.4 in pyproject.toml so
-    a fresh ``pip install rapid-mlx[audio]`` doesn't pull the broken
-    release. The test parses pyproject.toml verbatim so a future
-    contributor that loosens the bound trips CI.
+    """The supported line contains both the Kokoro and Silero fixes.
+
+    The test parses pyproject.toml verbatim so a future contributor cannot
+    silently re-admit the broken 0.4.x releases or an unqualified new major.
     """
 
-    def test_mlx_audio_upper_bound_pins_below_0_4_4(self):
+    def test_mlx_audio_pin_starts_at_qualified_0_5_3_line(self):
         from pathlib import Path
 
         try:
@@ -572,13 +571,19 @@ class TestMlxAudioVersionPin:
             f"Expected exactly one mlx-audio pin, found {mlx_audio_specs}"
         )
         spec = mlx_audio_specs[0]
-        # Both the floor AND the upper-bound matter. The floor is
-        # historical; the upper-bound is the R7-H3 fix.
-        assert "<0.4.4" in spec, (
-            f"R7-H3 regression: mlx-audio must be pinned ``<0.4.4`` to "
-            f"avoid the istftnet SineGen broadcast_shapes regression. "
-            f"Current pin: {spec!r}"
+        assert ">=0.5.3" in spec and "<0.6" in spec, (
+            "mlx-audio must retain the qualified 0.5.3 minor line for the "
+            f"Kokoro and Silero fixes; current pin: {spec!r}"
         )
+
+    def test_installed_audio_runtime_contains_silero_vad(self):
+        import importlib.util
+
+        if importlib.util.find_spec("mlx_audio") is None:
+            pytest.skip("audio extra is not installed in this test lane")
+        assert (
+            importlib.util.find_spec("mlx_audio.vad.models.silero_vad") is not None
+        ), "the supported mlx-audio runtime must include the Silero VAD architecture"
 
 
 # ---------------------------------------------------------------------------
@@ -595,7 +600,7 @@ class TestTTSAliasResolver:
     """
 
     def test_tts_alias_map_includes_canonical_engines(self):
-        from vllm_mlx.routes.audio import TTS_MODEL_ALIASES
+        from rapid_mlx.routes.audio import TTS_MODEL_ALIASES
 
         for alias in ("kokoro", "chatterbox", "vibevoice", "voxcpm"):
             assert alias in TTS_MODEL_ALIASES, (
@@ -606,7 +611,7 @@ class TestTTSAliasResolver:
             )
 
     def test_tts_default_alias_resolves(self):
-        from vllm_mlx.routes.audio import _resolve_tts_model
+        from rapid_mlx.routes.audio import _resolve_tts_model
 
         # ``None``, ``""``, and ``"default"`` all map to the default
         # alias's HF path — drop-in OpenAI SDK compatibility (R-03).
@@ -620,7 +625,7 @@ class TestTTSAliasResolver:
     def test_tts_pass_through_for_full_hf_path(self):
         """A HuggingFace-shaped id passes through verbatim so callers
         can opt in to repos not in the alias map."""
-        from vllm_mlx.routes.audio import _resolve_tts_model
+        from rapid_mlx.routes.audio import _resolve_tts_model
 
         hf_path = "mlx-community/Kokoro-82M-bf16"
         assert _resolve_tts_model(hf_path) == hf_path

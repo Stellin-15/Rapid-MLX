@@ -9,20 +9,38 @@ validation / dispatch / transport contract rather than the diffusion pipeline.
 import base64
 import io
 import types
+from collections import namedtuple
 
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from vllm_mlx.api.models import ImageGenerationRequest
-from vllm_mlx.image.engine import (
+from rapid_mlx.api.models import ImageGenerationRequest
+from rapid_mlx.image.engine import (
     ImageGenerationCancelled,
     ImageGenerationEngine,
     ImageRuntimeError,
 )
-from vllm_mlx.runtime.image_lane import ImageEngine
+from rapid_mlx.runtime.image_lane import ImageEngine
+from rapid_mlx.runtime.optional_runtime import OptionalRuntimeMissing
 
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def test_image_runtime_probe_and_guard_report_unsupported_python(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from rapid_mlx.runtime import image_lane
+
+    version_info = namedtuple("version_info", "major minor")
+    monkeypatch.setattr(image_lane.sys, "version_info", version_info(3, 10))
+
+    issue = image_lane.image_runtime_issue("flux2-klein-4b")
+    assert issue is not None
+    assert "Python 3.11 or newer (current: 3.10)" in issue
+    with pytest.raises(OptionalRuntimeMissing) as exc:
+        image_lane.require_image_runtime_or_exit("flux2-klein-4b")
+    assert "Python 3.11 or newer" in exc.value.format_user_message()
 
 
 class _FakeGeneratedImage:
@@ -90,6 +108,21 @@ def test_unknown_family_raises():
 
 
 @pytest.mark.parametrize(
+    "hf_path",
+    [
+        "Qwen/Qwen-Image-2.0",
+        "Qwen/Qwen-Image-2.2",
+        "acme/Qwen-Image-Edit-2.1",
+        "acme/Qwen-Image-Edit-v2.1",
+        "acme/Qwen-Image-2.1-Edit",
+    ],
+)
+def test_unsupported_qwen_image_2_is_rejected_before_1x_dispatch(hf_path):
+    with pytest.raises(ImageRuntimeError, match=r"Qwen-Image 2.x.*not supported"):
+        ImageGenerationEngine(hf_path)
+
+
+@pytest.mark.parametrize(
     "hf_path,family",
     [
         # ``<n>bit`` convention — the repos the fast-tab aliases point at
@@ -136,7 +169,7 @@ def test_warm_cache_hands_mflux_a_local_directory(monkeypatch):
     """
     engine = ImageGenerationEngine("Runpod/FLUX.2-klein-4B-mflux-4bit")
     monkeypatch.setattr(
-        "vllm_mlx._download_gate.mflux_local_snapshot",
+        "rapid_mlx._download_gate.mflux_local_snapshot",
         lambda repo: "/cache/snapshots/abc",
     )
 
@@ -148,7 +181,7 @@ def test_unresolvable_cache_still_hands_mflux_the_repo_id(monkeypatch):
     repo = "filipstrand/Z-Image-Turbo-mflux-4bit"
     engine = ImageGenerationEngine(repo)
     monkeypatch.setattr(
-        "vllm_mlx._download_gate.mflux_local_snapshot", lambda repo: None
+        "rapid_mlx._download_gate.mflux_local_snapshot", lambda repo: None
     )
 
     assert engine._model_path_for_mflux() == repo
@@ -165,7 +198,7 @@ def test_canonical_repo_still_defers_to_model_config(monkeypatch):
     def _unexpected(repo):  # pragma: no cover — must never be consulted
         raise AssertionError("canonical repos must not probe the mflux cache")
 
-    monkeypatch.setattr("vllm_mlx._download_gate.mflux_local_snapshot", _unexpected)
+    monkeypatch.setattr("rapid_mlx._download_gate.mflux_local_snapshot", _unexpected)
 
     assert engine._model_path_for_mflux() is None
 
@@ -203,7 +236,7 @@ def _seed_mflux_cache(tmp_path, monkeypatch, *, omit=None):
     multi-gigabyte shard absent.
     """
     repo_root = tmp_path / "hf-cache" / "models--Runpod--FLUX.2-klein-4B-mflux-4bit"
-    from vllm_mlx._download_gate import IMAGE_MODEL_REVISIONS
+    from rapid_mlx._download_gate import IMAGE_MODEL_REVISIONS
 
     pinned_sha = IMAGE_MODEL_REVISIONS[_MFLUX_REPO]
     snap = repo_root / "snapshots" / pinned_sha
@@ -310,7 +343,7 @@ def test_flux2_switches_between_generation_and_edit_variants(monkeypatch):
     monkeypatch.setattr(engine, "_build_model", lambda: generation)
     monkeypatch.setattr(engine, "_build_edit_model", lambda: editing)
     monkeypatch.setattr(
-        "vllm_mlx.image.engine._release_allocator_cache", lambda: releases.append(True)
+        "rapid_mlx.image.engine._release_allocator_cache", lambda: releases.append(True)
     )
 
     engine.generate(prompt="a fox", seed=1)
@@ -367,7 +400,7 @@ def test_txt2img_family_honors_requested_dimensions():
 
 
 def test_progress_reporter_tracks_step_then_cancels():
-    from vllm_mlx.image.engine import ImageGenerationCancelled
+    from rapid_mlx.image.engine import ImageGenerationCancelled
 
     engine = ImageGenerationEngine("Runpod/FLUX.2-klein-4B-mflux-4bit")
     engine._progress.update(total=4)
@@ -401,7 +434,7 @@ def test_progress_snapshot_shape():
 def test_mflux_reporter_records_denoise_only_timing(monkeypatch):
     engine = ImageGenerationEngine("Runpod/FLUX.2-klein-4B-mflux-4bit")
     ticks = iter((10.0, 21.2))
-    monkeypatch.setattr("vllm_mlx.image.engine.time.perf_counter", lambda: next(ticks))
+    monkeypatch.setattr("rapid_mlx.image.engine.time.perf_counter", lambda: next(ticks))
 
     class _Cfg:
         num_inference_steps = 4
@@ -567,6 +600,12 @@ def test_image_adapter_residency_without_mode_preserves_family_default(monkeypat
 def test_image_adapter_delegates_atomic_performance_methods(monkeypatch):
     engine = ImageEngine("Runpod/FLUX.2-klein-4B-mflux-4bit")
     expected = {"denoise_seconds": 8.0, "denoise_steps": 4}
+    loaded_modes = []
+    monkeypatch.setattr(
+        engine._engine,
+        "_ensure_loaded",
+        lambda *, for_edit=None: loaded_modes.append(for_edit),
+    )
     monkeypatch.setattr(engine._engine, "performance_snapshot", lambda: expected)
     monkeypatch.setattr(
         engine._engine,
@@ -576,6 +615,7 @@ def test_image_adapter_delegates_atomic_performance_methods(monkeypatch):
 
     assert engine.performance_snapshot() == expected
     assert engine.generate_with_performance(prompt="a fox") == (b"png", expected)
+    assert loaded_modes == [False]
 
 
 # --------------------------------------------------------------------------- #
@@ -653,19 +693,19 @@ def _png_upload_bytes():
 
 def _patch_engine(monkeypatch, engine):
     monkeypatch.setattr(
-        "vllm_mlx.config.get_config", lambda: types.SimpleNamespace(engine=engine)
+        "rapid_mlx.config.get_config", lambda: types.SimpleNamespace(engine=engine)
     )
 
 
 @pytest.fixture
 def client():
-    from vllm_mlx.server import app
+    from rapid_mlx.server import app
 
     return TestClient(app)
 
 
 def test_route_409_when_no_image_model(client, monkeypatch):
-    from vllm_mlx.model_aliases import resolve_profile
+    from rapid_mlx.model_aliases import resolve_profile
 
     recovery_alias = "flux2-klein-4b"
     _patch_engine(monkeypatch, None)
@@ -697,9 +737,16 @@ def test_route_400_url_response_format(client, monkeypatch):
 
 
 def test_route_happy_path_returns_b64(client, monkeypatch):
+    from rapid_mlx.telemetry import inference
+
+    emit_calls = []
+    monkeypatch.setattr(
+        inference, "emit_completed_request", lambda **kwargs: emit_calls.append(kwargs)
+    )
     _patch_engine(monkeypatch, _FakeImageEngine())
     resp = client.post(
         "/v1/images/generations",
+        headers={"user-agent": "openai-python/1.2", "x-rapid-client": "rapid-desktop"},
         json={"prompt": "a red fox", "size": "512x512", "seed": 42},
     )
     assert resp.status_code == 200
@@ -707,13 +754,22 @@ def test_route_happy_path_returns_b64(client, monkeypatch):
     assert "created" in body and len(body["data"]) == 1
     raw = base64.b64decode(body["data"][0]["b64_json"])
     assert raw.startswith(_PNG_MAGIC)
+    assert emit_calls == [
+        {
+            "model": "<custom>",
+            "endpoint": "/v1/images/generations",
+            "caller_agent": "openai-python/1.2",
+            "caller_client": "rapid-desktop",
+            "result": "ok",
+        }
+    ]
 
 
 def test_route_logs_measured_klein_step_throughput(client, monkeypatch, caplog):
     engine = _FakeImageEngine(performance={"denoise_seconds": 11.2, "denoise_steps": 4})
     _patch_engine(monkeypatch, engine)
 
-    with caplog.at_level("INFO", logger="vllm_mlx.routes.images"):
+    with caplog.at_level("INFO", logger="rapid_mlx.routes.images"):
         resp = client.post(
             "/v1/images/generations",
             json={
@@ -761,7 +817,7 @@ def test_route_ignores_legacy_performance_snapshot_failure(client, monkeypatch, 
     monkeypatch.setattr(engine, "performance_snapshot", _broken_snapshot)
     _patch_engine(monkeypatch, engine)
 
-    with caplog.at_level("INFO", logger="vllm_mlx.routes.images"):
+    with caplog.at_level("INFO", logger="rapid_mlx.routes.images"):
         resp = client.post("/v1/images/generations", json={"prompt": "a fox"})
 
     assert resp.status_code == 200
@@ -781,7 +837,7 @@ def test_route_does_not_extrapolate_tflops_to_other_models(client, monkeypatch, 
     )
     _patch_engine(monkeypatch, engine)
 
-    with caplog.at_level("INFO", logger="vllm_mlx.routes.images"):
+    with caplog.at_level("INFO", logger="rapid_mlx.routes.images"):
         resp = client.post(
             "/v1/images/generations",
             json={"prompt": "a fox", "size": "1024x1024"},
@@ -801,7 +857,7 @@ def test_route_does_not_extrapolate_tflops_to_other_sizes(client, monkeypatch, c
     engine = _FakeImageEngine(performance={"denoise_seconds": 8.0, "denoise_steps": 4})
     _patch_engine(monkeypatch, engine)
 
-    with caplog.at_level("INFO", logger="vllm_mlx.routes.images"):
+    with caplog.at_level("INFO", logger="rapid_mlx.routes.images"):
         resp = client.post(
             "/v1/images/generations",
             json={"prompt": "a fox", "size": "768x768", "steps": 4},
@@ -823,7 +879,7 @@ def test_route_keeps_successful_image_when_performance_logging_fails(
     engine = _FakeImageEngine(performance={"denoise_seconds": 4.0, "denoise_steps": 4})
     _patch_engine(monkeypatch, engine)
     monkeypatch.setattr(
-        "vllm_mlx.routes.images._log_image_performance",
+        "rapid_mlx.routes.images._log_image_performance",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("telemetry")),
     )
 
@@ -840,7 +896,7 @@ def test_route_rejects_invalid_denoise_timing(client, monkeypatch, caplog, bad_s
     )
     _patch_engine(monkeypatch, engine)
 
-    with caplog.at_level("INFO", logger="vllm_mlx.routes.images"):
+    with caplog.at_level("INFO", logger="rapid_mlx.routes.images"):
         resp = client.post("/v1/images/generations", json={"prompt": "a fox"})
 
     assert resp.status_code == 200
@@ -854,7 +910,7 @@ def test_route_rejects_invalid_denoise_timing(client, monkeypatch, caplog, bad_s
 
 
 def test_route_selects_resident_image_engine_by_model(client, monkeypatch):
-    from vllm_mlx.runtime.model_registry import ModelEntry, ModelRegistry
+    from rapid_mlx.runtime.model_registry import ModelEntry, ModelRegistry
 
     chat = types.SimpleNamespace(is_image_gen=False)
     image = _FakeImageEngine()
@@ -862,7 +918,7 @@ def test_route_selects_resident_image_engine_by_model(client, monkeypatch):
     registry.add(ModelEntry(chat, "chat", "repo/chat"), is_default=True)
     registry.add(ModelEntry(image, "image", "repo/image"))
     monkeypatch.setattr(
-        "vllm_mlx.config.get_config",
+        "rapid_mlx.config.get_config",
         lambda: types.SimpleNamespace(
             engine=chat,
             model_registry=registry,
@@ -896,7 +952,7 @@ def test_route_logs_each_completed_image_in_multi_image_request(
     engine = _FakeImageEngine(performance={"denoise_seconds": 4.0, "denoise_steps": 4})
     _patch_engine(monkeypatch, engine)
 
-    with caplog.at_level("INFO", logger="vllm_mlx.routes.images"):
+    with caplog.at_level("INFO", logger="rapid_mlx.routes.images"):
         resp = client.post(
             "/v1/images/generations",
             json={"prompt": "three foxes", "n": 3, "seed": 100},
@@ -1144,7 +1200,7 @@ def test_edit_rejects_non_image_bytes(client, monkeypatch):
 
 
 def test_edit_cancel_returns_cancelled_envelope(client, monkeypatch):
-    from vllm_mlx.image.engine import ImageGenerationCancelled
+    from rapid_mlx.image.engine import ImageGenerationCancelled
 
     class _CancelEngine:
         is_image_gen = True
@@ -1206,7 +1262,11 @@ def test_generations_uses_engine_default_steps(client, monkeypatch, default_step
     assert engine.steps_seen == [default_steps]
 
 
-def test_image_alias_skips_the_mllm_routing_preflight(monkeypatch):
+@pytest.mark.parametrize(
+    "model_ref",
+    ["z-image-turbo", "MLX-COMMUNITY/qwen-image-2.1-mflux-q4"],
+)
+def test_image_alias_skips_the_mllm_routing_preflight(monkeypatch, model_ref):
     """An image-gen alias must not run the MLLM-vs-text routing preflight.
 
     ``_ensure_routing_config`` materializes a checkpoint ``config.json`` so
@@ -1220,8 +1280,8 @@ def test_image_alias_skips_the_mllm_routing_preflight(monkeypatch):
     straight to ImageEngine and never asks the question, so the preflight
     must be skipped rather than merely tolerated.
     """
-    from vllm_mlx import server
-    from vllm_mlx.runtime import image_lane
+    from rapid_mlx import server
+    from rapid_mlx.runtime import image_lane
 
     def _unmaterializable(name):
         raise RuntimeError(
@@ -1241,7 +1301,7 @@ def test_image_alias_skips_the_mllm_routing_preflight(monkeypatch):
         image_lane, "require_image_runtime_or_exit", lambda *_a, **_kw: None
     )
     monkeypatch.setattr(
-        "vllm_mlx.utils.generation_config.load_generation_config_sampling",
+        "rapid_mlx.utils.generation_config.load_generation_config_sampling",
         lambda *_a, **_kw: {},
     )
 
@@ -1251,8 +1311,13 @@ def test_image_alias_skips_the_mllm_routing_preflight(monkeypatch):
         for attr in ("_engine", "_model_name", "_model_alias")
     }
     try:
-        server.load_model("z-image-turbo")
-        assert built.get("model_name") == "filipstrand/Z-Image-Turbo-mflux-4bit", (
+        server.load_model(model_ref)
+        expected = (
+            "filipstrand/Z-Image-Turbo-mflux-4bit"
+            if model_ref == "z-image-turbo"
+            else "mlx-community/Qwen-Image-2.1-mflux-q4"
+        )
+        assert built.get("model_name") == expected, (
             "the image alias never reached ImageEngine — the MLLM routing "
             "preflight ran and killed a lane that has no MLLM question"
         )

@@ -17,7 +17,7 @@ import Testing
 /// vs. the cold-relaunch shape:
 ///
 /// ```
-/// .../Resources/rapid-mlx/python/bin/python3.12 -u -s -m vllm_mlx.cli \
+/// .../Resources/rapid-mlx/python/bin/python3.12 -u -s -m rapid_mlx.cli \
 ///     serve <alias> --host 127.0.0.1 --port 8000
 /// # RAPID_MLX_API_KEY supplied via env
 /// ```
@@ -133,7 +133,13 @@ struct SpawnArgumentsTests {
             forAlias: "qwen3.5-9b-4bit",
             speculativePreset: verified,
             existing: []
-        ) == verified.launchFlags)
+        ) == verified.launchFlags + ["--text-only"])
+        #expect(ServerManager.desktopCapabilityFlags(
+            forAlias: "qwen3.6-35b-4bit",
+            supportsImageInput: true,
+            speculativePreset: verified,
+            existing: []
+        ) == verified.launchFlags + ["--text-only"])
         #expect(ServerManager.desktopCapabilityFlags(
             forAlias: "qwen3.5-9b-8bit",
             speculativePreset: unqualified,
@@ -151,6 +157,25 @@ struct SpawnArgumentsTests {
             defaultPreset: unqualified,
             userOverrides: verified.launchFlags
         ))
+        #expect(ServerManager.speculativeTextLaneFlags(
+            requested: true,
+            existing: ["--mllm"] + verified.launchFlags
+        ) == verified.launchFlags + ["--text-only"])
+        #expect(ServerManager.speculativeTextLaneFlags(
+            requested: false,
+            existing: ["--mllm"]
+        ) == ["--mllm"])
+        #expect(ServerManager.speculativeTextLaneFlags(
+            requested: false,
+            supportsImageInput: true,
+            existing: ["--text-only", "--no-spec-decode"]
+        ) == ["--no-spec-decode", "--mllm"])
+        #expect(ServerManager.speculativeTextLaneFlags(
+            requested: false,
+            supportsImageInput: true,
+            userOverrides: ["--text-only", "--no-spec-decode"],
+            existing: ["--text-only", "--no-spec-decode"]
+        ) == ["--text-only", "--no-spec-decode"])
 
         let compressedOverrides = ServerManager.speculativeSafePerformanceOverrides(
             defaultPreset: verified,
@@ -364,7 +389,7 @@ struct SpawnArgumentsTests {
     @Test("serve argv pins --cors-origins so the bundled sidecar can't default to wildcard")
     func argvCarriesCorsOrigins() {
         // Issue #306: without ``--cors-origins`` the sidecar defaults
-        // to ``["*"]`` (vllm_mlx/cli.py:899). Combined with #303
+        // to ``["*"]`` (rapid_mlx/cli.py:899). Combined with #303
         // (bearer env not yet enforced as 401) a wildcard CORS policy
         // would let any drive-by webpage on https://evil.example POST
         // to ``http://127.0.0.1:PORT/v1/chat/completions`` once the

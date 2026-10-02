@@ -111,7 +111,10 @@ LTX25_RUNTIME_SHA256="fa9a66a0c78721c3dce51d0f1dadcabad060682410303be748e529a846
 # the committed baseline had drifted by one and was being masked by
 # MACHO_TOLERANCE. The libpython trim brought that to 172; the bounded FFmpeg
 # executable added here brings the directly measured baseline back to 173.
-MACHO_BASELINE_COUNT="${MACHO_BASELINE_COUNT:-173}"
+# PyObjC's Computer Use framework closure adds 21 runtime extension modules
+# after its test/debug payload is trimmed below. They use the same signed
+# universal-wheel mechanism as the native extensions already in the bundle.
+MACHO_BASELINE_COUNT="${MACHO_BASELINE_COUNT:-194}"
 # Allow modest drift without blocking — wheel updates sometimes shift
 # 1-2 .so files. Bigger drift means a new dependency, needs review.
 # Kept at 5 across the 51 → 77 baseline rebase to give Pillow and
@@ -139,10 +142,17 @@ RAPID_MLX_SOURCE="${RAPID_MLX_SOURCE:-${ENGINE_ROOT}}"
 # fresh text-lane venv. Local builds retain the source-tree fallback.
 RAPID_MLX_WHEEL="${RAPID_MLX_WHEEL:-}"
 SIDECAR_CONSTRAINTS="${REPO_ROOT}/scripts/sidecar-constraints.txt"
+PYOBJC_LICENSE="${REPO_ROOT}/licenses/PyObjC-MIT.txt"
 OUT_DIR="${OUT_DIR:-${REPO_ROOT}/build/sidecar-stage}"
 DEVELOPER_ID="${DEVELOPER_ID:--}"
 SKIP_CODESIGN=0
 SKIP_VERIFY=0
+
+# Product code executed during assembly is build-machine work, even when the
+# staged package carries an official release stamp. Keep both kill switches in
+# the inherited environment and explicitly restore them after every clean-env call.
+TELEMETRY_OFF_ENV=(RAPID_MLX_TELEMETRY=0 DO_NOT_TRACK=1)
+export "${TELEMETRY_OFF_ENV[@]}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -188,6 +198,10 @@ if [ ! -f "$SIDECAR_CONSTRAINTS" ]; then
     echo "ERR: sidecar constraints missing at $SIDECAR_CONSTRAINTS" >&2
     exit 1
 fi
+if [ ! -f "$PYOBJC_LICENSE" ]; then
+    echo "ERR: PyObjC license notice missing at $PYOBJC_LICENSE" >&2
+    exit 1
+fi
 if [ -n "$RAPID_MLX_WHEEL" ] && [ ! -f "$RAPID_MLX_WHEEL" ]; then
     echo "ERR: RAPID_MLX_WHEEL does not exist: $RAPID_MLX_WHEEL" >&2
     exit 1
@@ -221,6 +235,8 @@ STAGE="${OUT_DIR}/rapid-mlx"
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/bin"
+mkdir -p "$STAGE/licenses"
+cp "$PYOBJC_LICENSE" "$STAGE/licenses/PyObjC-MIT.txt"
 
 # ----- step 1: embedded python interpreter -----------------------------
 
@@ -342,7 +358,7 @@ esac
 
 # ----- step 2: install rapid-mlx + runtime deps ------------------------
 
-echo "==> installing rapid-mlx into site-packages (no [vision] extras)"
+echo "==> installing rapid-mlx into site-packages (audio + Computer Use)"
 if [ ! -d "$RAPID_MLX_SOURCE" ] || [ ! -f "$RAPID_MLX_SOURCE/pyproject.toml" ]; then
     echo "ERR: rapid-mlx engine source tree missing at: $RAPID_MLX_SOURCE" >&2
     echo "     In the monorepo the engine is the repository root (two levels" >&2
@@ -379,7 +395,7 @@ fi
     --no-compile \
     --upgrade \
     --constraint "$SIDECAR_CONSTRAINTS" \
-    "${RAPID_MLX_INSTALL_TARGET}[audio-desktop]" \
+    "${RAPID_MLX_INSTALL_TARGET}[audio-desktop,computer-use]" \
     'mlx' \
     'transformers'
 
@@ -540,7 +556,7 @@ target.write_text(src)
 print("==> mflux torch imports deferred into the 3 torch-only loading modes")
 PY
 
-# mflux 0.19.0's PiD checkpoint converter is imported transitively by every
+# mflux 0.20.0's PiD checkpoint converter is imported transitively by every
 # Qwen Image model even though it is only used for the separate PiD upscaler.
 # Keep that optional PyTorch conversion path lazy too, otherwise selecting the
 # bundled qwen-image alias fails before model construction with
@@ -580,7 +596,8 @@ import sys
 
 importlib.import_module("mflux.models.common.weights.loading.weight_loader")
 importlib.import_module("mflux.models.qwen.variants.txt2img.qwen_image")
-importlib.import_module("vllm_mlx.image.bonsai_runtime")
+importlib.import_module("mflux.models.qwen21.variants.txt2img.qwen_image_21")
+importlib.import_module("rapid_mlx.image.bonsai_runtime")
 if "torch" in sys.modules:
     raise SystemExit("ERR: mflux still pulls torch at import time")
 print("==> mflux and Bonsai image lanes import without torch: OK")
@@ -693,7 +710,7 @@ old = '''    try:
         return None, None
 '''
 new = '''    try:
-        from vllm_mlx.video.encoding import encode_rgb_video
+        from rapid_mlx.video.encoding import encode_rgb_video
 
         encode_rgb_video(video_np, temp_video_path, fps)
         print(f"{Colors.GREEN}✅ Video encoded{Colors.RESET}")
@@ -710,7 +727,7 @@ wan.write_text('''import numpy as np
 
 def save_video(frames: np.ndarray, output_path: str, fps: int = 16):
     """Save RGB video frames through Rapid's bundled VideoToolbox bridge."""
-    from vllm_mlx.video.encoding import encode_rgb_video
+    from rapid_mlx.video.encoding import encode_rgb_video
 
     encode_rgb_video(frames, output_path, fps)
 ''')
@@ -907,6 +924,13 @@ find "$STAGE/site-packages/numpy" -type d -name tests -prune -exec rm -rf {} + 2
 find "$STAGE/site-packages/scipy" -type d -name tests -prune -exec rm -rf {} + 2>/dev/null || true
 find "$STAGE/site-packages/mlx_audio" -type d -name tests -prune -exec rm -rf {} + 2>/dev/null || true
 
+# pyobjc-core wheels include their upstream extension test bundle and dSYM
+# companions. Neither is imported by ApplicationServices/Quartz at runtime;
+# leaving them would add more than a hundred debug/test Mach-Os to the signing
+# sweep. Keep the 21 framework/runtime extensions and remove only that payload.
+rm -rf "$STAGE/site-packages/PyObjCTest"
+find "$STAGE/site-packages" -type d -name '*.dSYM' -prune -exec rm -rf {} +
+
 # The desktop Audio surface uses scipy.signal for input resampling. Speech WAV
 # output uses the standard-library `wave` writer, so scipy.io is not required.
 # SciPy's
@@ -928,13 +952,15 @@ rm -rf \
 # mlx-audio ships implementations for dozens of TTS families. The desktop
 # picker deliberately exposes only Qwen3 CustomVoice: it offers real named
 # preset speakers without the large Kokoro G2P or F5 cloning dependency
-# stacks. Drop the other family implementations so the release stays below
-# the app's 500 MiB envelope; shared TTS utilities and Qwen3's codec modules
-# remain intact.
+# stacks. mlx-audio 0.5.3's Qwen3 speech tokenizer imports the shared codec
+# registry, whose StepAudio2 implementation reuses Chatterbox's S3Gen
+# transformer blocks. Keep that transitive runtime closure even though
+# Chatterbox is not exposed in the Desktop picker. Drop the remaining family
+# implementations so the release stays below the app's 500 MiB envelope.
 if [ -d "$STAGE/site-packages/mlx_audio/tts/models" ]; then
     find "$STAGE/site-packages/mlx_audio/tts/models" \
         -mindepth 1 -maxdepth 1 -type d \
-        -not -name qwen3_tts -not -name __pycache__ \
+        -not -name qwen3_tts -not -name chatterbox -not -name __pycache__ \
         -prune -exec rm -rf {} +
 fi
 
@@ -1123,6 +1149,13 @@ else
                 exit 1
             }
     done < "$MACHOS_LIST"
+    automation_events=$(codesign -d --entitlements :- \
+        "$STAGE/python/bin/python3.12" 2>/dev/null \
+        | plutil -extract 'com\.apple\.security\.automation\.apple-events' raw -o - - 2>/dev/null || true)
+    if [ "$automation_events" != "true" ]; then
+        echo "ERR: sealed sidecar Python lacks com.apple.security.automation.apple-events=true" >&2
+        exit 1
+    fi
 fi
 
 # ----- step 6: smoke test (codex r1 B1: BEFORE packaging) --------------
@@ -1145,7 +1178,7 @@ else
     SMOKE_HOME="$(mktemp -d -t rapid-sidecar-smoke.XXXXXX)"
     trap 'rm -rf "$MACHOS_LIST" "$SMOKE_HOME"' EXIT INT TERM
 
-    SMOKE_OUT="$(env -i HOME="$SMOKE_HOME" PATH=/usr/bin:/bin \
+    SMOKE_OUT="$(env -i "${TELEMETRY_OFF_ENV[@]}" HOME="$SMOKE_HOME" PATH=/usr/bin:/bin \
         "$STAGE/bin/rapid-mlx" --version 2>&1)" || {
         echo "ERR: bundle --version failed:" >&2
         echo "$SMOKE_OUT" >&2
@@ -1163,7 +1196,7 @@ else
     # python3.12 can't find `mlx` in site-packages because the install
     # used `pip --target site-packages/` which isn't on the default
     # interpreter path.
-    IMPORT_OUT="$(env -i HOME="$SMOKE_HOME" PATH=/usr/bin:/bin \
+    IMPORT_OUT="$(env -i "${TELEMETRY_OFF_ENV[@]}" HOME="$SMOKE_HOME" PATH=/usr/bin:/bin \
         PYTHONHOME="$STAGE/python" \
         PYTHONPATH="$STAGE/site-packages" \
         PYTHONNOUSERSITE=1 \
@@ -1174,6 +1207,18 @@ else
         exit 3
     }
     echo "    mlx import: $IMPORT_OUT"
+
+    CUA_IMPORT_OUT="$(env -i "${TELEMETRY_OFF_ENV[@]}" HOME="$SMOKE_HOME" PATH=/usr/bin:/bin \
+        PYTHONHOME="$STAGE/python" \
+        PYTHONPATH="$STAGE/site-packages" \
+        PYTHONNOUSERSITE=1 \
+        "$STAGE/python/bin/python3.12" -s -c \
+        'import ApplicationServices, Quartz; print("macOS Computer Use frameworks: OK")' 2>&1)" || {
+        echo "ERR: bundled macOS Computer Use framework import failed:" >&2
+        echo "$CUA_IMPORT_OUT" >&2
+        exit 3
+    }
+    echo "    $CUA_IMPORT_OUT"
 
     # mlx_vlm import smoke. The bundle ships mlx-vlm --no-deps (step 2.5)
     # because gemma-4 + DiffusionGemma loaders need the architecture
@@ -1187,7 +1232,7 @@ else
     # at build time instead of letting the bundle ship and crash on
     # the user's first gemma-4 / DiffusionGemma launch — same failure
     # class that bit v0.7.7.
-    VLM_OUT="$(env -i HOME="$SMOKE_HOME" PATH=/usr/bin:/bin \
+    VLM_OUT="$(env -i "${TELEMETRY_OFF_ENV[@]}" HOME="$SMOKE_HOME" PATH=/usr/bin:/bin \
         PYTHONHOME="$STAGE/python" \
         PYTHONPATH="$STAGE/site-packages" \
         PYTHONNOUSERSITE=1 \
@@ -1200,9 +1245,9 @@ from mlx_vlm.models import (
     diffusion_gemma, gemma3, gemma3n, gemma4, gemma4_unified,
     qwen3_5, qwen3_5_moe, qwen3_vl, qwen3_vl_moe,
 )
-from vllm_mlx.image.hidream_runtime import HiDreamO1
-from vllm_mlx.image.sd35_runtime import SD35Large
-from vllm_mlx.image.sdxl_runtime import SDXL
+from rapid_mlx.image.hidream_runtime import HiDreamO1
+from rapid_mlx.image.sd35_runtime import SD35Large
+from rapid_mlx.image.sdxl_runtime import SDXL
 assert importlib.util.find_spec("cv2") is None
 assert importlib.util.find_spec("torch") is None
 assert importlib.util.find_spec("torchvision") is None
@@ -1222,19 +1267,19 @@ print("mlx_vlm", mlx_vlm.__version__, "sentencepiece", sentencepiece.__version__
     # register the routes but exits when an audio alias boots; checking the
     # actual loader modules here prevents the desktop from shipping controls
     # that can never complete a request.
-    AUDIO_OUT="$(env -i HOME="$SMOKE_HOME" PATH=/usr/bin:/bin \
+    AUDIO_OUT="$(env -i "${TELEMETRY_OFF_ENV[@]}" HOME="$SMOKE_HOME" PATH=/usr/bin:/bin \
         PYTHONHOME="$STAGE/python" \
         PYTHONPATH="$STAGE/site-packages" \
         PYTHONNOUSERSITE=1 \
         "$STAGE/python/bin/python3.12" -s -c \
-        'from importlib.metadata import version; import numpy as np; import mlx_audio; from mlx_audio.stt.utils import load_model as load_stt_model; from transformers.models.whisper.feature_extraction_whisper import WhisperFeatureExtractor; from mlx_audio.tts.generate import load_model as load_tts_model; from mlx_audio.tts.models.qwen3_tts import Model as Qwen3TTSModel; from scipy import signal; import soundfile; from vllm_mlx.audio.tts import AudioOutput, TTSEngine; payload = TTSEngine.__new__(TTSEngine).to_bytes(AudioOutput(audio=np.zeros(8, dtype=np.float32), sample_rate=24000, duration=8/24000), format="wav"); assert payload.startswith(b"RIFF"); print("mlx_audio", version("mlx-audio"))' 2>&1)" || {
+        'from importlib.metadata import version; import numpy as np; import mlx_audio; from mlx_audio.stt.utils import load_model as load_stt_model; from transformers.models.whisper.feature_extraction_whisper import WhisperFeatureExtractor; from mlx_audio.tts.generate import load_model as load_tts_model; from mlx_audio.tts.models.qwen3_tts import Model as Qwen3TTSModel; from scipy import signal; import soundfile; from rapid_mlx.audio.tts import AudioOutput, TTSEngine; payload = TTSEngine.__new__(TTSEngine).to_bytes(AudioOutput(audio=np.zeros(8, dtype=np.float32), sample_rate=24000, duration=8/24000), format="wav"); assert payload.startswith(b"RIFF"); print("mlx_audio", version("mlx-audio"))' 2>&1)" || {
         echo "ERR: bundled audio runtime import failed — desktop Audio would be unusable:" >&2
         echo "$AUDIO_OUT" >&2
         exit 3
     }
     echo "    audio import: $AUDIO_OUT"
 
-    VIDEO_OUT="$(env -i HOME="$SMOKE_HOME" PATH=/usr/bin:/bin \
+    VIDEO_OUT="$(env -i "${TELEMETRY_OFF_ENV[@]}" HOME="$SMOKE_HOME" PATH=/usr/bin:/bin \
         PYTHONHOME="$STAGE/python" \
         PYTHONPATH="$STAGE/site-packages" \
         PYTHONNOUSERSITE=1 \
@@ -1258,13 +1303,13 @@ from videox_fun_mlx.models.t5_encoder import T5Encoder
 from videox_fun_mlx.models.tokenizer import T5Tokenizer
 from videox_fun_mlx.pipeline.pipeline_cogvideox_fun_inpaint import CogVideoXFunInpaintPipeline
 from videox_fun_mlx.pipeline.scheduler import DDIMScheduler
-from vllm_mlx.runtime.video_lane import VideoEngine
-from vllm_mlx.video.encoding import encode_rgb_video
+from rapid_mlx.runtime.video_lane import VideoEngine
+from rapid_mlx.video.encoding import encode_rgb_video
 assert importlib.util.find_spec("cv2") is None
 assert importlib.util.find_spec("imageio") is None
 assert importlib.metadata.version("ltx-core-mlx") == "0.14.15"
 assert importlib.metadata.version("ltx-pipelines-mlx") == "0.14.15"
-from vllm_mlx.video.ltx25 import embedded_ltx25_interpreter
+from rapid_mlx.video.ltx25 import embedded_ltx25_interpreter
 assert embedded_ltx25_interpreter() is not None, "LTX-2.5 provenance stamp rejected"
 assert {"model_dir", "prompt"} <= set(inspect.signature(generate_video).parameters)
 assert {"load_wan_model", "load_t5_encoder", "load_vae_decoder"} <= set(generate_video.__globals__)
@@ -1296,7 +1341,7 @@ print("mlx_video minimal runtime + VideoToolbox encode/crop OK")' 2>&1)" || {
     # `if X="$(...)" ; then` lets `set -e` see the explicit guard and
     # falls through normally on both success and failure.
     METAL_RC=0
-    if METAL_OUT="$(env -i HOME="$SMOKE_HOME" PATH=/usr/bin:/bin \
+    if METAL_OUT="$(env -i "${TELEMETRY_OFF_ENV[@]}" HOME="$SMOKE_HOME" PATH=/usr/bin:/bin \
         PYTHONHOME="$STAGE/python" \
         PYTHONPATH="$STAGE/site-packages" \
         PYTHONNOUSERSITE=1 \
@@ -1366,6 +1411,170 @@ if [[ -n "${SIDECAR_IMAGE_SMOKE_MODEL:-}" ]]; then
 else
     echo "==> real image-generation smoke: not configured (set SIDECAR_IMAGE_SMOKE_MODEL for release candidates)"
 fi
+
+# ----- step 6b: stamp provenance ----------------------------------------
+#
+# A packaged runtime states how it was built instead of inferring it by
+# probing a Git checkout that may not be there. That probe used to run only
+# once a benchmark had finished measuring, so a Mac without usable `git` threw
+# away several minutes of work with "could not resolve the Rapid-MLX source
+# revision". The stamp removes the probe from the packaged path entirely.
+#
+# It records WHICH KIND of build this is, not merely that it was packaged.
+# Stamping everything "release" meant a developer's branch build published its
+# benchmarks as an official release with the commit that produced them
+# dropped, so numbers were attributed to a build nobody could identify. So: a
+# release must say so explicitly (RAPID_MLX_OFFICIAL_RELEASE=1, which the
+# release pipeline sets); everything else is a source build and must carry the
+# commit it was built from.
+STAMP="$STAGE/site-packages/rapid_mlx/_build_stamp.json"
+OFFICIAL_RELEASE="${RAPID_MLX_OFFICIAL_RELEASE:-0}"
+# Validated here, not just by the writer: this script branches on the value a
+# few lines down, so an unrecognised one would announce "source", build, and
+# only then be refused. Same rule, stated once, at the point of entry.
+if [[ "$OFFICIAL_RELEASE" != "0" && "$OFFICIAL_RELEASE" != "1" ]]; then
+    echo "ERR: RAPID_MLX_OFFICIAL_RELEASE must be exactly 0 or 1, got" >&2
+    echo "     '$OFFICIAL_RELEASE'. Refusing to guess what was meant." >&2
+    exit 1
+fi
+SIDECAR_REVISION="$(git -C "$RAPID_MLX_SOURCE" rev-parse HEAD 2>/dev/null || true)"
+# `git diff --quiet HEAD` sees tracked modifications and nothing else. An
+# untracked `rapid_mlx/whatever.py` is copied into site-packages by the install
+# step and runs in the packaged app, so a build containing one is NOT the
+# named commit. `status --porcelain` reports tracked edits, staged changes,
+# deletions and untracked files alike; `--untracked-files=normal` keeps
+# ignored build output (build/, .venv) out of it.
+# A nonempty revision that is not a real sha means `git rev-parse` answered
+# with something unexpected, and every later decision — cleanliness, the stamp,
+# what the benchmark record claims — rests on it. Rejected here so the failure
+# names the cause; `write-sidecar-stamp.py` enforces the same rule as the
+# authoritative boundary for any other caller.
+if [[ -n "$SIDECAR_REVISION" ]] \
+    && ! printf %s "$SIDECAR_REVISION" | grep -Eq '^[0-9a-f]{40}$'; then
+    echo "ERR: git rev-parse HEAD in $RAPID_MLX_SOURCE returned" >&2
+    echo "     '$SIDECAR_REVISION', which is not a 40-character lowercase" >&2
+    echo "     commit sha. Refusing to stamp a build on an unusable revision." >&2
+    exit 1
+fi
+
+SIDECAR_DIRTY=0
+SIDECAR_STATUS=""
+if [[ -n "$SIDECAR_REVISION" ]]; then
+    # `|| true` here was a fail-open: a git that errored produced empty output,
+    # which is indistinguishable from a clean tree, so an unverifiable checkout
+    # was stamped clean and could ship as an official release. Capture the exit
+    # status and treat a failure as "cleanliness unknown", never as "clean".
+    set +e
+    SIDECAR_STATUS="$(
+        git -C "$RAPID_MLX_SOURCE" status --porcelain --untracked-files=normal 2>&1
+    )"
+    SIDECAR_STATUS_RC=$?
+    set -e
+    if [[ "$SIDECAR_STATUS_RC" -ne 0 ]]; then
+        echo "ERR: could not determine whether $RAPID_MLX_SOURCE is clean." >&2
+        echo "     \`git status --porcelain\` exited $SIDECAR_STATUS_RC:" >&2
+        echo "$SIDECAR_STATUS" | head -10 | sed 's/^/       /' >&2
+        echo "     Refusing to stamp a build whose source state is unknown." >&2
+        exit 1
+    fi
+    if [[ -n "$SIDECAR_STATUS" ]]; then
+        SIDECAR_DIRTY=1
+    fi
+fi
+echo "==> stamping build provenance -> $STAMP"
+if [[ "$OFFICIAL_RELEASE" == "1" ]]; then
+    echo "    distribution: release (RAPID_MLX_OFFICIAL_RELEASE=1)"
+    # A release stamp carries no revision, so it says nothing about the tree it
+    # was built from — which means a modified tree would ship as an official
+    # release with no trace. Being at the expected candidate SHA is not enough:
+    # the SHA names a commit, not the working tree that was compiled.
+    if [[ "$SIDECAR_DIRTY" == "1" ]]; then
+        echo "ERR: refusing to build an OFFICIAL RELEASE from a modified" >&2
+        echo "     working tree. The release stamp cannot describe a tree" >&2
+        echo "     that is not a commit, so these bytes would ship as an" >&2
+        echo "     official build of code that was never committed." >&2
+        echo "     Uncommitted changes in $RAPID_MLX_SOURCE:" >&2
+        echo "$SIDECAR_STATUS" | head -20 | sed 's/^/       /' >&2
+        echo "     Commit or stash them, or drop RAPID_MLX_OFFICIAL_RELEASE." >&2
+        exit 1
+    fi
+    if [[ -z "$SIDECAR_REVISION" ]]; then
+        echo "ERR: refusing to build an OFFICIAL RELEASE outside a Git" >&2
+        echo "     checkout: there is no commit to verify the tree against." >&2
+        exit 1
+    fi
+else
+    echo "    distribution: source (set RAPID_MLX_OFFICIAL_RELEASE=1 for a release)"
+    if [[ -z "$SIDECAR_REVISION" ]]; then
+        echo "ERR: cannot stamp a source build: no Git revision for" >&2
+        echo "     $RAPID_MLX_SOURCE" >&2
+        echo "     A packaged source build must name the commit it was built" >&2
+        echo "     from, or its benchmark records cannot be attributed." >&2
+        echo "     Build from a checkout, or set RAPID_MLX_OFFICIAL_RELEASE=1." >&2
+        exit 1
+    fi
+    if [[ "$SIDECAR_DIRTY" == "1" ]]; then
+        # Recorded, not blocked: a dirty tree is the normal state while
+        # iterating, and refusing to build would stop development. The build
+        # runs and benchmarks save; only *publishing* is refused, because the
+        # wire contract has no way to name a tree that is not a commit.
+        echo "    WARNING: working tree differs from HEAD. Benchmarks from this" >&2
+        echo "             build can be run and saved, but NOT published." >&2
+        echo "$SIDECAR_STATUS" | head -5 | sed 's/^/             /' >&2
+    fi
+fi
+PYTHONNOUSERSITE=1 python3 "$REPO_ROOT/scripts/write-sidecar-stamp.py" \
+    "$STAMP" "$OFFICIAL_RELEASE" "$SIDECAR_REVISION" "$SIDECAR_DIRTY"
+
+# --- telemetry release stamp (begin) ---
+# Telemetry v2 transmits only when the installed package contains the release
+# stamp AND build_gate can prove that the running code is a non-editable,
+# non-source install. Write only into the fresh sidecar stage: the checkout
+# must never be stamped. Derive the channel from the distribution actually
+# bundled above (including rc versions), not from the Desktop tag prefix.
+TELEMETRY_STAMP="$STAGE/site-packages/rapid_mlx/telemetry/_release_stamp.json"
+if [[ "$OFFICIAL_RELEASE" == "1" ]]; then
+    SIDECAR_ENGINE_VERSION="$(
+        PYTHONPATH="$STAGE/site-packages" PYTHONNOUSERSITE=1 \
+            "$STAGE/python/bin/python3.12" -c \
+            'from importlib.metadata import version; print(version("rapid-mlx"))'
+    )"
+    echo "==> stamping telemetry release v$SIDECAR_ENGINE_VERSION -> $TELEMETRY_STAMP"
+    # No --force by design: a wheel carrying a different stamp must fail an
+    # official build instead of silently replacing its provenance.
+    PYTHONNOUSERSITE=1 python3 "$ENGINE_ROOT/scripts/write_release_stamp.py" \
+        --version "$SIDECAR_ENGINE_VERSION" \
+        --dest "$TELEMETRY_STAMP"
+else
+    # A source tree normally has no stamp, but removing one here also keeps a
+    # non-official build silent if RAPID_MLX_WHEEL points at stamped bytes.
+    rm -f "$TELEMETRY_STAMP"
+fi
+# --- telemetry release stamp (end) ---
+
+# Run the gate through the exact interpreter and package tree that ship. This
+# also proves that pip's non-editable local-directory install is accepted by
+# the PEP 610/source-tree checks. Keep the inverse assertion in every cheap
+# dev/smoke build so a stray inherited stamp cannot enable transmission.
+PYTHONPATH="$STAGE/site-packages" PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
+    "$STAGE/python/bin/python3.12" - "$OFFICIAL_RELEASE" <<'PY'
+import sys
+
+from rapid_mlx.telemetry.build_gate import official_build
+
+official = sys.argv[1] == "1"
+result = official_build()
+if (result is not None) != official:
+    raise SystemExit(
+        "telemetry release gate mismatch: "
+        f"official_release={official}, official_build()={result!r}"
+    )
+print(f"telemetry release gate verified: official_build()={result!r}")
+PY
+# Recompile so the stamped package is consistent with the .pyc set shipped
+# alongside it.
+PYTHONNOUSERSITE=1 "$STAGE/python/bin/python3.12" -m compileall -q \
+    "$STAGE/site-packages/rapid_mlx" >/dev/null 2>&1 || true
 
 # ----- step 7: package --------------------------------------------------
 

@@ -96,16 +96,16 @@ def _install_fake_mlx_audio(monkeypatch):
 
 def _patch_engine(monkeypatch, engine_cls):
     """Swap ``STTEngine`` at the import boundary the route resolves."""
-    monkeypatch.setattr("vllm_mlx.audio.stt.STTEngine", engine_cls, raising=False)
-    stt_mod = sys.modules.get("vllm_mlx.audio.stt")
+    monkeypatch.setattr("rapid_mlx.audio.stt.STTEngine", engine_cls, raising=False)
+    stt_mod = sys.modules.get("rapid_mlx.audio.stt")
     if stt_mod is not None:
         monkeypatch.setattr(stt_mod, "STTEngine", engine_cls)
 
 
 def _mount_audio_app() -> tuple[TestClient, callable]:
     """Mount the audio router on a bare FastAPI app, bypassing auth."""
-    from vllm_mlx.config import get_config
-    from vllm_mlx.routes import audio as audio_route
+    from rapid_mlx.config import get_config
+    from rapid_mlx.routes import audio as audio_route
 
     app = FastAPI()
     app.include_router(audio_route.router)
@@ -142,7 +142,7 @@ def _patch_engine_direct(audio_route, engine_cls):
     Also clears both engine caches so the next call constructs the new class
     rather than reusing whatever a previous test left resident.
     """
-    import vllm_mlx.audio.stt as stt_mod
+    import rapid_mlx.audio.stt as stt_mod
 
     stt_mod.STTEngine = engine_cls
     audio_route._stt_engine = None
@@ -201,8 +201,8 @@ class _FakeAlignerEngine:
 
 @pytest.fixture
 def _stub_aligner(monkeypatch):
-    from vllm_mlx.audio import probe
-    from vllm_mlx.routes import audio as audio_route
+    from rapid_mlx.audio import probe
+    from rapid_mlx.routes import audio as audio_route
 
     _install_fake_mlx_audio(monkeypatch)
     probe._reset_probe_cache()
@@ -221,9 +221,9 @@ def _stub_aligner(monkeypatch):
 def _fake_audio_env(monkeypatch):
     """Probe + engine-cache reset without binding a specific engine — for
     tests that install their own failure-shaped engine."""
-    import vllm_mlx.audio.stt as stt_mod
-    from vllm_mlx.audio import probe
-    from vllm_mlx.routes import audio as audio_route
+    import rapid_mlx.audio.stt as stt_mod
+    from rapid_mlx.audio import probe
+    from rapid_mlx.routes import audio as audio_route
 
     _install_fake_mlx_audio(monkeypatch)
     probe._reset_probe_cache()
@@ -264,13 +264,23 @@ def _err(response) -> dict:
 
 
 class TestAlignmentDefaults:
-    def test_text_field_alone_aligns_and_defaults_to_verbose_json(self, _stub_aligner):
+    def test_text_field_alone_aligns_and_defaults_to_verbose_json(
+        self, _stub_aligner, monkeypatch
+    ):
         """``text`` with no ``model`` / ``response_format`` must still align.
 
         The plain ``json`` envelope drops ``segments``, so defaulting
         ``response_format`` to it would return a 200 with none of the
         timestamps the caller came for.
         """
+        from rapid_mlx.telemetry import inference
+
+        emit_calls = []
+        monkeypatch.setattr(
+            inference,
+            "emit_completed_request",
+            lambda **kwargs: emit_calls.append(kwargs),
+        )
         client, restore = _mount_audio_app()
         try:
             r = _post(client, {"text": "临终前", "language": "Chinese"})
@@ -296,6 +306,9 @@ class TestAlignmentDefaults:
         assert call["text"] == "临终前"
         assert call["language"] == "Chinese"
         assert _FakeAlignerEngine.last_transcribe is None
+        assert len(emit_calls) == 1
+        assert emit_calls[0]["endpoint"] == "/v1/audio/transcriptions"
+        assert emit_calls[0]["result"] == "ok"
 
     def test_omitted_model_resolves_to_the_registered_aligner(self, _stub_aligner):
         """No ``model`` → the ALIGNER alias, not the ASR default.
@@ -303,7 +316,7 @@ class TestAlignmentDefaults:
         ``whisper-large-v3`` is not a forced aligner, so defaulting the
         alignment branch to it would fail deep in ``STTEngine.align``.
         """
-        from vllm_mlx.routes import audio as audio_route
+        from rapid_mlx.routes import audio as audio_route
 
         client, restore = _mount_audio_app()
         try:
@@ -329,7 +342,7 @@ class TestAlignmentDefaults:
         explicit choice, 404-ing as a nonexistent alias, so "just send
         audio + text" from a form with a spaced-out field never aligns.
         """
-        from vllm_mlx.routes import audio as audio_route
+        from rapid_mlx.routes import audio as audio_route
 
         client, restore = _mount_audio_app()
         try:
@@ -653,7 +666,7 @@ class TestAlignerEngineCache:
         which is safe precisely because the lane lock guarantees the released
         engine is idle.
         """
-        from vllm_mlx.routes import audio as audio_route
+        from rapid_mlx.routes import audio as audio_route
 
         client, restore = _mount_audio_app()
         try:
@@ -695,7 +708,7 @@ class TestAlignmentConcurrency:
         structurally — the engine must see a different thread than the
         loop.
         """
-        from vllm_mlx.routes import audio as audio_route
+        from rapid_mlx.routes import audio as audio_route
 
         seen: dict[str, int] = {}
         real_align = _FakeAlignerEngine.align
@@ -727,7 +740,7 @@ class TestAlignmentConcurrency:
         This behavioral check fails if ``__aenter__`` calls
         ``threading.Lock.acquire`` inline, regardless of wrapper type.
         """
-        from vllm_mlx.routes import audio as audio_route
+        from rapid_mlx.routes import audio as audio_route
 
         async def _drive():
             lock = audio_route._get_stt_lane_lock()
@@ -761,7 +774,7 @@ class TestAlignmentConcurrency:
         the ``finally`` would unlink the audio file while the abandoned
         worker was still using both.
         """
-        from vllm_mlx.routes._async_utils import run_to_completion
+        from rapid_mlx.routes._async_utils import run_to_completion
 
         started = threading.Event()
         release = threading.Event()
@@ -789,7 +802,7 @@ class TestAlignmentConcurrency:
 
     def test_direct_inner_task_cancel_still_drains_worker(self):
         """Cancelling the asyncio wrapper cannot outlive its worker thread."""
-        from vllm_mlx.routes._async_utils import run_to_completion
+        from rapid_mlx.routes._async_utils import run_to_completion
 
         started = threading.Event()
         release = threading.Event()
@@ -838,8 +851,8 @@ def test_direct_handler_call_tolerates_unresolved_form_defaults(monkeypatch):
     ``AttributeError: 'Form' object has no attribute 'strip'`` without the
     isinstance merge.
     """
-    from vllm_mlx.audio import probe
-    from vllm_mlx.routes import audio as audio_route
+    from rapid_mlx.audio import probe
+    from rapid_mlx.routes import audio as audio_route
 
     _install_fake_mlx_audio(monkeypatch)
     probe._reset_probe_cache()
@@ -858,6 +871,7 @@ def test_direct_handler_call_tolerates_unresolved_form_defaults(monkeypatch):
         with pytest.raises(HTTPException) as exc_info:
             asyncio.run(
                 audio_route.create_transcription(
+                    request=None,  # type: ignore[arg-type]
                     file=_UploadLike(_make_tone_wav()),  # type: ignore[arg-type]
                     model_form="definitely-not-a-real-alias",
                     language_form=None,
@@ -895,7 +909,7 @@ class TestSttLaneMutualExclusion:
         """
         import inspect
 
-        from vllm_mlx.routes import audio as audio_route
+        from rapid_mlx.routes import audio as audio_route
 
         for fn in (audio_route._run_stt_request, audio_route._run_alignment_request):
             src = inspect.getsource(fn)
@@ -995,7 +1009,7 @@ class TestSttLaneMutualExclusion:
 
             # Alignment must build its own — if it reused the ASR engine the
             # AssertionError above would fire.
-            import vllm_mlx.audio.stt as stt_mod
+            import rapid_mlx.audio.stt as stt_mod
 
             stt_mod.STTEngine = _FakeAlignerEngine
             await audio_route._run_alignment_request(
@@ -1017,7 +1031,7 @@ class TestSttLaneMutualExclusion:
         """
         import inspect
 
-        from vllm_mlx.routes import audio as audio_route
+        from rapid_mlx.routes import audio as audio_route
 
         src = inspect.getsource(audio_route._run_stt_request)
         lock_at = src.index("async with _get_stt_lane_lock()")
@@ -1049,7 +1063,7 @@ class TestDrainSurvivesRepeatedCancellation:
         twice, and check whether cleanup happened before the worker
         finished.
         """
-        from vllm_mlx.routes._async_utils import run_to_completion
+        from rapid_mlx.routes._async_utils import run_to_completion
 
         started = threading.Event()
         release = threading.Event()
@@ -1101,7 +1115,7 @@ class TestDrainSurvivesRepeatedCancellation:
         asyncio.run(_drive())
 
     def test_uncancelled_call_returns_the_result(self):
-        from vllm_mlx.routes._async_utils import run_to_completion
+        from rapid_mlx.routes._async_utils import run_to_completion
 
         async def _drive():
             return await run_to_completion(lambda: 42)
@@ -1112,7 +1126,7 @@ class TestDrainSurvivesRepeatedCancellation:
 class TestCrossLoopLock:
     def test_two_event_loops_share_one_exclusion_domain(self):
         """Separate event loops cannot drive the process-global engines together."""
-        from vllm_mlx.routes import audio as audio_route
+        from rapid_mlx.routes import audio as audio_route
 
         first_entered = threading.Event()
         release_first = threading.Event()

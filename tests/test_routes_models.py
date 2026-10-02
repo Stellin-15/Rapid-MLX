@@ -11,7 +11,7 @@ openai-python — those clients enumerate ``/v1/models`` to find
 ``client.embeddings.create()`` call.
 
 This file pins the discovery contract directly against
-``vllm_mlx.routes.models``. The broader H-08+H-09+H-13 regression net
+``rapid_mlx.routes.models``. The broader H-08+H-09+H-13 regression net
 lives in :mod:`tests.test_embeddings_extra_guard` (the same
 ``ModelsListEmbeddingCapability`` class); this dedicated file exists
 because the task spec named ``tests/test_routes_models.py::
@@ -19,12 +19,14 @@ test_embedding_model_in_models_list`` explicitly and discovery clients
 typically grep for the route file name when wiring up a new transport.
 
 A regression here is a wire-shape break, not a unit-level bug, so we
-mount a real :class:`FastAPI` app with the ``vllm_mlx.routes.models``
+mount a real :class:`FastAPI` app with the ``rapid_mlx.routes.models``
 router and inspect the JSON response — same shape rapid-desktop and
 the openai client see in production.
 """
 
 from __future__ import annotations
+
+import inspect
 
 import pytest
 from fastapi import FastAPI
@@ -35,11 +37,11 @@ def _mount_models_app(*, embedding_model_locked: str | None):
     """Mount a TestClient on the models router with a stubbed config.
 
     Saves + restores both :class:`ServerConfig` fields AND the
-    ``vllm_mlx.server._embedding_model_locked`` global so a test
+    ``rapid_mlx.server._embedding_model_locked`` global so a test
     interleave can't bleed state across cases.
     """
-    from vllm_mlx.config import get_config
-    from vllm_mlx.routes import models as models_route
+    from rapid_mlx.config import get_config
+    from rapid_mlx.routes import models as models_route
 
     app = FastAPI()
     app.include_router(models_route.router)
@@ -61,7 +63,7 @@ def _mount_models_app(*, embedding_model_locked: str | None):
     cfg.embedding_model_locked = embedding_model_locked
     cfg.api_key = None
 
-    import vllm_mlx.server as srv
+    import rapid_mlx.server as srv
 
     saved_srv = {"_embedding_model_locked": srv._embedding_model_locked}
     srv._embedding_model_locked = embedding_model_locked
@@ -197,7 +199,7 @@ class _StubEngine:
 def _stub_single_serve(monkeypatch, *, model_id: str, engine_is_mllm: bool):
     """Point get_config() at a single-model serve whose live engine reports
     ``engine_is_mllm``. Returns a restore callable."""
-    from vllm_mlx.config import get_config
+    from rapid_mlx.config import get_config
 
     cfg = get_config()
     saved = {
@@ -219,7 +221,7 @@ def _stub_single_serve(monkeypatch, *, model_id: str, engine_is_mllm: bool):
 def test_reported_modality_prefers_degraded_engine(monkeypatch):
     """Engine degraded to text ⇒ wire says ``text`` even though the static
     detector (reading the still-vision config/index) says otherwise."""
-    from vllm_mlx.routes import models as models_route
+    from rapid_mlx.routes import models as models_route
 
     restore = _stub_single_serve(
         monkeypatch, model_id="fake/gemma4-optiq-4bit", engine_is_mllm=False
@@ -244,7 +246,7 @@ def test_reported_modality_engine_authority_is_symmetric(monkeypatch):
     --mllm that loaded a real vision tower the config/index re-detect can't
     see). Scoping (`_served_engine_is_mllm`) — not asymmetry — is what keeps a
     different alias's leaked engine from contaminating an unrelated model."""
-    from vllm_mlx.routes import models as models_route
+    from rapid_mlx.routes import models as models_route
 
     # Engine loaded a vision tower; static detector disagrees (says text).
     # The live engine must win and report image/vision.
@@ -278,7 +280,7 @@ def test_reported_modality_engine_authority_is_symmetric(monkeypatch):
 def test_served_engine_authority_only_for_served_model(monkeypatch):
     """A registry-only / unserved id has no live engine ⇒ the helper returns
     None and the static detector remains the decider (no over-reach)."""
-    from vllm_mlx.routes import models as models_route
+    from rapid_mlx.routes import models as models_route
 
     restore = _stub_single_serve(
         monkeypatch, model_id="fake/served-model", engine_is_mllm=False
@@ -299,7 +301,7 @@ def test_engine_is_mllm_or_none_is_defensive():
     """Only a real bool is authoritative; anything else (None engine, a
     partially-built entry, a test double without ``is_mllm``) yields None so
     /v1/models falls through to the static detector rather than raising."""
-    from vllm_mlx.routes import models as models_route
+    from rapid_mlx.routes import models as models_route
 
     assert models_route._engine_is_mllm_or_none(None) is None
     assert models_route._engine_is_mllm_or_none(object()) is None  # no is_mllm attr
@@ -308,8 +310,8 @@ def test_engine_is_mllm_or_none_is_defensive():
 
 
 def test_model_info_exposes_live_serving_lane_reason(monkeypatch):
-    from vllm_mlx.config import get_config
-    from vllm_mlx.routes import models as models_route
+    from rapid_mlx.config import get_config
+    from rapid_mlx.routes import models as models_route
 
     model_id = "fake/qwen3.5-9b-4bit"
     restore = _stub_single_serve(monkeypatch, model_id=model_id, engine_is_mllm=False)
@@ -326,16 +328,92 @@ def test_model_info_exposes_live_serving_lane_reason(monkeypatch):
     assert info.serving_lane_reason == "vision_hybrid_runtime_unsupported"
 
 
+def test_model_info_exposes_only_qualified_personal_intelligence_harnesses():
+    """Tool support and Personal Intelligence qualification are distinct."""
+    from rapid_mlx.config import get_config
+    from rapid_mlx.routes import models as models_route
+
+    cfg = get_config()
+    saved = {
+        key: getattr(cfg, key, None)
+        for key in (
+            "model_name",
+            "model_path",
+            "model_alias",
+            "model_registry",
+            "tool_call_parser",
+        )
+    }
+    try:
+        cfg.model_registry = None
+        for alias, repository, parser, profile, qualification in (
+            (
+                "minicpm5-2b-4bit",
+                "openbmb/MiniCPM5-2B-MLX",
+                "minicpm",
+                "minicpm5-2b",
+                "minicpm5-2b-q4-v1",
+            ),
+            (
+                "qwen3.5-4b-4bit",
+                "mlx-community/Qwen3.5-4B-MLX-4bit",
+                "hermes",
+                "qwen3.5-4b",
+                "qwen3.5-4b-q4-v1",
+            ),
+            (
+                "qwen3.5-9b-4bit",
+                "mlx-community/Qwen3.5-9B-4bit",
+                "hermes",
+                "qwen3.5-9b",
+                "qwen3.5-9b-q4-v1",
+            ),
+        ):
+            cfg.model_name = repository
+            cfg.model_path = repository
+            cfg.model_alias = alias
+            cfg.tool_call_parser = parser
+            info = models_route._build_model_info(alias)
+            assert info.personal_intelligence_profile == profile
+            assert info.personal_intelligence_qualification == qualification
+
+        assert (
+            models_route._build_model_info(
+                "gemma-4-e2b-4bit"
+            ).personal_intelligence_profile
+            is None
+        )
+
+        class BrokenRegistry:
+            def get_entry(self, _model_id):
+                caller = inspect.currentframe().f_back
+                if caller is not None and caller.f_code.co_name == "_build_model_info":
+                    raise RuntimeError("corrupt registry")
+                return None
+
+        cfg.model_registry = BrokenRegistry()
+        cfg.model_name = "mlx-community/Qwen3.5-4B-MLX-4bit"
+        cfg.model_path = cfg.model_name
+        cfg.model_alias = "qwen3.5-4b-4bit"
+        cfg.tool_call_parser = "hermes"
+        broken = models_route._build_model_info(cfg.model_alias)
+        assert broken.personal_intelligence_profile is None
+        assert broken.personal_intelligence_qualification is None
+    finally:
+        for key, value in saved.items():
+            setattr(cfg, key, value)
+
+
 def test_build_model_info_prefers_live_hybrid_probe(monkeypatch):
     """The wire reports the scheduler's loaded profile, not stale alias data."""
-    from vllm_mlx.routes import models as models_route
+    from rapid_mlx.routes import models as models_route
 
     restore = _stub_single_serve(
         monkeypatch,
         model_id="mlx-community/LFM2.5-1.2B-Instruct-4bit",
         engine_is_mllm=False,
     )
-    from vllm_mlx.config import get_config
+    from rapid_mlx.config import get_config
 
     cfg = get_config()
     cfg.model_alias = "lfm2.5-1b-4bit"
@@ -354,7 +432,7 @@ def test_build_model_info_prefers_live_hybrid_probe(monkeypatch):
 
 def test_mllm_engine_reports_loaded_hybrid_cache_profile():
     """MLLM has no text EngineCore; its loaded cache probe is authoritative."""
-    from vllm_mlx.engine.batched import BatchedEngine
+    from rapid_mlx.engine.batched import BatchedEngine
 
     engine = BatchedEngine.__new__(BatchedEngine)
     engine._is_mllm = True
@@ -368,7 +446,7 @@ def test_mllm_engine_reports_loaded_hybrid_cache_profile():
 
 def test_build_model_info_keeps_static_hybrid_for_unserved_alias(monkeypatch):
     """Discovery-only aliases retain registry metadata without a live engine."""
-    from vllm_mlx.routes import models as models_route
+    from rapid_mlx.routes import models as models_route
 
     restore = _stub_single_serve(
         monkeypatch, model_id="fake/other-model", engine_is_mllm=False
@@ -383,7 +461,7 @@ def test_reported_hybrid_keeps_static_for_unmounted_registry_entry(monkeypatch):
     """A registered model is discovery-only until its engine is attached."""
     from types import SimpleNamespace
 
-    from vllm_mlx.routes import models as models_route
+    from rapid_mlx.routes import models as models_route
 
     entry = SimpleNamespace(engine=None, matches=lambda model_id: model_id == "alias")
     registry = SimpleNamespace(get_entry=lambda _model_id: entry)
@@ -399,14 +477,14 @@ def test_reported_hybrid_keeps_static_for_unmounted_registry_entry(monkeypatch):
 )
 def test_build_model_info_does_not_backfill_unknown_live_hybrid(monkeypatch, probe):
     """A loaded engine's unknown state must not be replaced by alias metadata."""
-    from vllm_mlx.routes import models as models_route
+    from rapid_mlx.routes import models as models_route
 
     restore = _stub_single_serve(
         monkeypatch,
         model_id="mlx-community/LFM2.5-1.2B-Instruct-4bit",
         engine_is_mllm=False,
     )
-    from vllm_mlx.config import get_config
+    from rapid_mlx.config import get_config
 
     cfg = get_config()
     cfg.model_alias = "lfm2.5-1b-4bit"
@@ -431,7 +509,7 @@ def test_build_model_info_raw_hf_path_honors_degraded_engine(monkeypatch):
     NO vision capability. Pinning the exact modality (not just "!= image")
     proves ``modality`` and ``capabilities`` are consistent and that the
     degraded VLM is indistinguishable from a plain text model (#1187)."""
-    from vllm_mlx.routes import models as models_route
+    from rapid_mlx.routes import models as models_route
 
     model_id = "mlx-community/gemma-4-26B-A4B-it-qat-OptiQ-4bit"
 

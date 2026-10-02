@@ -70,17 +70,23 @@ struct ToolCallResult: Equatable, Hashable, Sendable {
     /// Stable UI classification. Raw ``content`` is still passed back to
     /// the model, while the transcript renders this diagnosis instead.
     let failureKind: FailureDiagnosis.Kind?
+    /// Whether dispatch crossed into the concrete tool implementation. False
+    /// for schema, availability, settings, and approval refusals; true once a
+    /// tool owns the call, even when that tool later reports an error.
+    let executed: Bool
 
     init(
         toolCallID: String,
         content: String,
         isError: Bool = false,
-        failureKind: FailureDiagnosis.Kind? = nil
+        failureKind: FailureDiagnosis.Kind? = nil,
+        executed: Bool = true
     ) {
         self.toolCallID = toolCallID
         self.content = content
         self.isError = isError
         self.failureKind = failureKind
+        self.executed = executed
     }
 }
 
@@ -219,8 +225,9 @@ protocol ToolRegistry: AnyObject, Sendable {
 ///
 /// The model chooses a tool from the definitions advertised on this round.
 /// This executor then applies the same policy to every built-in and connector:
-/// refuse tools that were not advertised, require an arguments object, remove
-/// top-level fields outside the tool's JSON schema, and only then dispatch.
+/// refuse tools that were not advertised, require an arguments object, enforce
+/// strict schemas (or remove unknown top-level fields for permissive schemas),
+/// and only then dispatch.
 /// Tool-specific intent parsing does not belong here or in the view model.
 @MainActor
 struct NativeToolCallExecutor {
@@ -242,16 +249,27 @@ struct NativeToolCallExecutor {
                     known: knownNames
                 ) ?? "tool '\(call.function.name)' is unavailable",
                 isError: true,
-                failureKind: .toolFailed
+                failureKind: .toolFailed,
+                executed: false
             )
         }
 
-        guard let normalized = Self.normalized(call, for: definition) else {
+        let normalized: ToolCall
+        switch Self.normalize(call, for: definition) {
+        case .success(let value):
+            normalized = value
+        case .failure(let rejection):
+            // Name what was wrong. A generic "arguments must match the
+            // advertised schema" leaves a small model guessing which key it
+            // got wrong, and it re-emits the same call — the strict-schema
+            // path (#3314) makes that retry loop reachable often enough to
+            // matter.
             return ToolCallResult(
                 toolCallID: call.id,
-                content: "tool '\(call.function.name)' error: arguments must be a JSON object matching the advertised schema",
+                content: "tool '\(call.function.name)' error: \(rejection.reason)",
                 isError: true,
-                failureKind: .toolFailed
+                failureKind: .toolFailed,
+                executed: false
             )
         }
         return await registry.run(normalized)
@@ -277,21 +295,78 @@ struct NativeToolCallExecutor {
         _ call: ToolCall,
         for definition: ToolDefinition
     ) -> ToolCall? {
+        try? normalize(call, for: definition).get()
+    }
+
+    /// Why a tool call's arguments were rejected, in wording meant for the
+    /// model that wrote them.
+    struct ArgumentRejection: Error {
+        let reason: String
+    }
+
+    /// Same filtering as ``normalized(_:for:)``, but carries WHY a call was
+    /// rejected so the model gets a message it can act on.
+    nonisolated static func normalize(
+        _ call: ToolCall,
+        for definition: ToolDefinition
+    ) -> Result<ToolCall, ArgumentRejection> {
         let raw = call.function.arguments.trimmingCharacters(in: .whitespacesAndNewlines)
         let data = Data((raw.isEmpty ? "{}" : raw).utf8)
         guard var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return nil }
+        else {
+            return .failure(ArgumentRejection(
+                reason: "arguments must be a single JSON object, e.g. {\"key\": \"value\"}"
+            ))
+        }
 
         if case .object(let schema) = definition.function.parameters,
            case .object(let properties)? = schema["properties"]
         {
+            let allowed = properties.keys.sorted()
+            if case .array(let requiredValues)? = schema["required"] {
+                let required = requiredValues.compactMap { value -> String? in
+                    if case .string(let name) = value { return name }
+                    return nil
+                }
+                let missing = required.filter { object[$0] == nil }
+                if !missing.isEmpty {
+                    return .failure(ArgumentRejection(
+                        reason: "missing required argument(s): \(missing.joined(separator: ", "))"
+                    ))
+                }
+            }
+            if schema["additionalProperties"] == .bool(false) {
+                let unknown = object.keys.filter { !properties.keys.contains($0) }.sorted()
+                if !unknown.isEmpty {
+                    // Bound the echo: keys are model-supplied and unbounded.
+                    // By SCALARS, not characters — `String.prefix` counts
+                    // grapheme clusters, and one cluster can carry thousands
+                    // of combining marks, so a character bound is not a bound
+                    // at all.
+                    let names = unknown.prefix(5)
+                        .map { key -> String in
+                            let scalars = key.unicodeScalars
+                            guard scalars.count > 80 else { return key }
+                            return String(String.UnicodeScalarView(scalars.prefix(80)))
+                        }
+                        .joined(separator: ", ")
+                    let suffix = unknown.count > 5 ? ", …" : ""
+                    return .failure(ArgumentRejection(
+                        reason: "unknown argument(s): \(names)\(suffix) — this tool accepts only: \(allowed.joined(separator: ", "))"
+                    ))
+                }
+            }
             object = object.filter { properties.keys.contains($0.key) }
         }
         guard JSONSerialization.isValidJSONObject(object),
               let normalized = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
               let arguments = String(data: normalized, encoding: .utf8)
-        else { return nil }
-        return ToolCall(id: call.id, name: call.function.name, arguments: arguments)
+        else {
+            return .failure(ArgumentRejection(
+                reason: "arguments could not be re-encoded as JSON — re-send them as a plain JSON object"
+            ))
+        }
+        return .success(ToolCall(id: call.id, name: call.function.name, arguments: arguments))
     }
 }
 
@@ -302,6 +377,11 @@ struct NativeToolCallExecutor {
 final class EmptyToolRegistry: ToolRegistry {
     var definitions: [ToolDefinition] { [] }
     func run(_ call: ToolCall) async -> ToolCallResult {
-        ToolCallResult(toolCallID: call.id, content: "no tool registry wired up", isError: true)
+        ToolCallResult(
+            toolCallID: call.id,
+            content: "no tool registry wired up",
+            isError: true,
+            executed: false
+        )
     }
 }

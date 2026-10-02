@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from vllm_mlx.telemetry.redact import (
+from rapid_mlx.telemetry.redact import (
     bucket_memory_gb,
     bucket_tokens,
     bucket_tps,
@@ -344,6 +344,27 @@ def test_platform_info_no_unbounded_strings():
 )
 def test_normalize_caller_agent_buckets_known(ua, expected):
     assert normalize_caller_agent(ua) == expected
+
+
+@pytest.mark.parametrize(
+    "ua,expected",
+    [
+        # openai-node: ``${this.constructor.name}/JS ${VERSION}`` (4.95.1 core.js
+        # getUserAgent; src/client.ts on 5.x). AzureOpenAI shares the suffix.
+        ("OpenAI/JS 4.95.1", "openai-node"),
+        ("OpenAI/JS 5.23.0", "openai-node"),
+        ("AzureOpenAI/JS 5.23.0", "openai-node"),
+        # aiohttp default client UA: aiohttp.http.SERVER_SOFTWARE.
+        ("Python/3.12 aiohttp/3.9.5", "python-aiohttp"),
+    ],
+)
+def test_normalize_caller_agent_buckets_real_sdk_user_agents(ua, expected):
+    assert normalize_caller_agent(ua) == expected
+
+
+def test_aiohttp_marker_matches_the_installed_default_user_agent():
+    aiohttp_http = pytest.importorskip("aiohttp.http")
+    assert normalize_caller_agent(aiohttp_http.SERVER_SOFTWARE) == "python-aiohttp"
 
 
 def test_normalize_caller_agent_named_agent_beats_generic_client():

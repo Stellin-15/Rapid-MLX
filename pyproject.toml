@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rapid-mlx"
-version = "0.14.0"
-description = "Rapid-MLX — AI inference for Apple Silicon. Drop-in OpenAI API, up to 3x Ollama's measured throughput."
+version = "0.15.4"
+description = "Rapid-MLX is an open-source (Apache 2.0) OpenAI- and Anthropic-compatible LLM inference server and Mac app for Apple Silicon, built on MLX, focused on reliable tool calling for coding agents."
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
@@ -69,20 +69,20 @@ dependencies = [
     # pinned and validated.
     #
     # HY3 vendor note (2026-07-09): the 0.11.0 Hy3 vendor drop
-    # (``vllm_mlx/models/hy_v3.py``) was validated end-to-end against
+    # (``rapid_mlx/models/hy_v3.py``) was validated end-to-end against
     # ``transformers==5.7.0`` — that release is treated as the *canonical
     # reference version* for the vendored model_type. The public floor
     # stays at 5.0.0 so we don't force a downgrade / resolver conflict
     # on users whose environments already sit at 5.8-5.12 for another
     # dependency — the vendored HY3 tokenizer path in
-    # ``vllm_mlx/utils/tokenizer.py`` bypasses ``AutoTokenizer`` entirely
+    # ``rapid_mlx/utils/tokenizer.py`` bypasses ``AutoTokenizer`` entirely
     # (via ``_VENDORED_MODEL_TYPES``), so the transformers minor is not
     # in the HY3 hot path. If a future transformers release above 5.7
     # introduces an HY3-specific regression, we tighten the floor with a
     # dedicated bump PR + Phase-0 re-audit rather than pinning here.
     "transformers>=5.0.0,!=5.13.0,<5.16",
     "tokenizers>=0.19.0",
-    "huggingface-hub>=0.23.0",
+    "huggingface-hub>=1.1.0",
     "numpy>=1.24.0",
     "tqdm>=4.66.0",
     # pillow is opt-in via [vision] extras — only the MLLM paths (mllm.py,
@@ -158,6 +158,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Native macOS Computer Use. Keep these Darwin-only so installing the extra on
+# Linux remains safe for server deployments that expose no local desktop.
+computer-use = [
+    "pyobjc-framework-ApplicationServices==12.2.2; platform_system == 'Darwin'",
+    "pyobjc-framework-Quartz==12.2.2; platform_system == 'Darwin'",
+]
 # Vision/multimodal models (Gemma 4, Qwen-VL, etc.) — adds ~322 MB
 # Required for any model with vision input. Text-only models work without this.
 # 0.5.0+ also unlocks DFlash speculative decoding (see [dflash] extras).
@@ -166,11 +172,11 @@ vision = [
     # A floating 0.6.x range backtracks to 0.6.3 under older Transformers
     # constraints and can also advance CLI users beyond the Desktop's validated
     # lane. Updating this exact pin is a gated coherence event (#1248).
-    "mlx-vlm==0.6.17",
+    "mlx-vlm==0.7.2",
     "opencv-python>=4.8.0",
     "torch>=2.3.0",
     "torchvision>=0.18.0",
-    # vllm_mlx imports PIL directly on vision paths (mllm.py, benchmark.py
+    # rapid_mlx imports PIL directly on vision paths (mllm.py, benchmark.py
     # image mode); mlx-vlm requires it too — listed for explicitness.
     "pillow>=10.0.0",
 ]
@@ -180,12 +186,12 @@ vision = [
 # the vision extras do. Only enable if you serve a DFlash-eligible alias
 # (e.g. qwen3.5-27b-8bit) with --speculative-config '{"method":"dflash"}'.
 dflash = [
-    "mlx-vlm==0.6.17",
+    "mlx-vlm==0.7.2",
 ]
 # MTP (Multi-Token Prediction) speculative decoding — Gemma 4 external
 # assistant path via ``--speculative-config '{"method":"mtp","model":"<path>"}'``.
 # assistant-drafter loader in
-# ``vllm_mlx/spec_decode/mtp/gemma4_inject.py`` transitively pulls
+# ``rapid_mlx/spec_decode/mtp/gemma4_inject.py`` transitively pulls
 # ``mlx_lm.utils`` → ``transformers`` which reaches for PIL when a
 # checkpoint contains an image-processor preprocessor_config.json (the
 # case for the assistant drafters we've dogfooded so far). Without PIL
@@ -194,29 +200,29 @@ dflash = [
 # banner prints — misleading users into thinking their sidecar path is
 # wrong. Text-only; does NOT pull torch/cv2 like [vision].
 #
-# Codex round-I NIT (0.9.13 PR-A): do NOT re-pin ``mlx-vlm`` here.
-# The only place a Gemma 4 MTP boot touches ``mlx_vlm`` at all is
-# during target model construction in
-# ``vllm_mlx/models/gemma4_text.py``, which surfaces its own
-# actionable ImportError with a size-tiered install hint (16 MB vs
-# +450 MB). Duplicating that pin under ``[mtp]`` doubled the install
-# surface of a text-only sidecar path just to satisfy a transitive
-# PIL import that ``pillow`` already covers directly. Operators who
-# want Gemma 4 targets install ``rapid-mlx[mtp,vision]`` (or the
-# ``pip install --no-deps mlx-vlm>=0.6.1`` sliver flagged by
-# gemma4_text.py) — the ``[mtp]`` extra stays narrow to just the
-# MTP subsystem's own direct dependencies.
+# The original sidecar injector needed only Pillow. The explicit native-MTP
+# backend now calls mlx-vlm directly, so [mtp] owns the same exact runtime pin
+# as the signed Desktop sidecar. It remains text-only: no torch/cv2 extras.
 mtp = [
+    # Required by the explicit native-MTP backend. Keep this exact pin aligned
+    # with the signed Desktop sidecar and the vision/DFlash extras.
+    "mlx-vlm==0.7.2",
     "pillow>=10.0.0",
 ]
 # Embedding endpoint
 embeddings = [
     "mlx-embeddings>=0.1.0",
 ]
+# Typed decision models served through the TypeSafe-compatible System One API.
+# laya-mlx is Python 3.11+; keep the extra installable on Rapid-MLX's Python
+# 3.10 floor so the native CLM backend and protocol remain available there.
+system-one = [
+    "laya-mlx>=0.2,<0.3; python_version >= '3.11'",
+]
 # HF → Cloudflare R2 mirror tooling (scripts/mirror_to_r2.py).
 # Off the hot path — only maintainers who seed models.rapidmlx.com need
 # this. Users NEVER install [mirror]; the client-side download path
-# (vllm_mlx/_mirror.py) uses stdlib urllib and does NOT depend on boto3.
+# (rapid_mlx/_mirror.py) uses stdlib urllib and does NOT depend on boto3.
 mirror = [
     "boto3>=1.34.0",
 ]
@@ -229,8 +235,11 @@ chat = [
 # Expanded directly to avoid a self-dependency that breaks
 # pip install .[all] and editable installs.
 all = [
+    # computer-use (Darwin only)
+    "pyobjc-framework-ApplicationServices==12.2.2; platform_system == 'Darwin'",
+    "pyobjc-framework-Quartz==12.2.2; platform_system == 'Darwin'",
     # vision
-    "mlx-vlm==0.6.17",
+    "mlx-vlm==0.7.2",
     "opencv-python>=4.8.0",
     "torch>=2.3.0",
     "torchvision>=0.18.0",
@@ -240,9 +249,11 @@ all = [
     "pytz>=2024.1",
     # embeddings
     "mlx-embeddings>=0.1.0",
+    # system-one (Laya; native CLM support is built in)
+    "laya-mlx>=0.2,<0.3; python_version >= '3.11'",
     # dflash (text-only path covered by mlx-vlm above; listed for clarity)
     # audio
-    "mlx-audio>=0.2.9,<0.4.4",
+    "mlx-audio>=0.5.3,<0.6",
     "f5-tts-mlx==0.2.6",
     "sounddevice>=0.4.0",
     "soundfile>=0.12.0",
@@ -302,8 +313,8 @@ test = [
     # ``pytest tests/`` without hand-installed local extras.
     "aiohttp>=3.9.0",
     "pillow>=10.0.0",
-    "mlx-vlm==0.6.17; platform_system == 'Darwin'",
-    "mlx-audio>=0.2.9,<0.4.4; platform_system == 'Darwin'",
+    "mlx-vlm==0.7.2; platform_system == 'Darwin'",
+    "mlx-audio>=0.5.3,<0.6; platform_system == 'Darwin'",
     # Powers the property-based invariant suite in tests/property/ — encodes
     # numeric/validation invariants over the whole input space (e.g. the
     # #1208-class quantized-KV round-trip bounds) that example tests can't.
@@ -360,7 +371,7 @@ ci-linux = [
     "psutil>=5.9.0",
     "transformers>=5.0.0,!=5.13.0,<5.16",
     "tokenizers>=0.19.0",
-    "huggingface-hub>=0.23.0",
+    "huggingface-hub>=1.1.0",
     "numpy>=1.24.0",
     "tqdm>=4.66.0",
     "requests>=2.28.0",
@@ -401,8 +412,8 @@ dev = [
     'tomli>=2.0.1; python_version < "3.11"',
     "aiohttp>=3.9.0",
     "pillow>=10.0.0",
-    "mlx-vlm==0.6.17; platform_system == 'Darwin'",
-    "mlx-audio>=0.2.9,<0.4.4; platform_system == 'Darwin'",
+    "mlx-vlm==0.7.2; platform_system == 'Darwin'",
+    "mlx-audio>=0.5.3,<0.6; platform_system == 'Darwin'",
     # Mirror of the [test] entry — keep `dev` a strict superset of `test`
     # (enforced by tests/test_pr_validate_test_env.py).
     "hypothesis>=6.100.0",
@@ -421,7 +432,7 @@ dev = [
 # llguidance drives constrained decoding via its native MLX Metal mask
 # kernel (llguidance.mlx); it interprets JSON Schema natively ($defs/$ref/
 # anyOf/enum/numeric-bounds/additionalProperties). Replaced outlines[mlxlm]
-# in 0.10 — see vllm_mlx/api/guided.py.
+# in 0.10 — see rapid_mlx/api/guided.py.
 #
 # NOTE (0.10.15, #558 fix-slot): llguidance was PROMOTED TO CORE
 # ``[project].dependencies`` above so default-on grammar-constrained
@@ -437,19 +448,11 @@ guided = [
 ]
 # Audio dependencies for TTS/STT (mlx-audio)
 audio = [
-    # R7-H3 (Bo 0.8.8 dogfood): pin BELOW 0.4.4. The 0.4.4 release
-    # regressed ``mlx_audio.tts.models.kokoro.istftnet.SineGen`` so the
-    # internal interpolation step produces an off-by-one length mismatch
-    # versus the noise tensor — every Kokoro request ends with
-    # ``[broadcast_shapes] Shapes (1,36600,1) and (1,36900,9) cannot be
-    # broadcast`` deep inside the istftnet generator. The rapid-mlx
-    # route's catch-all collapsed that into the opaque ``No audio
-    # generated`` 500 (the chunk loop swallowed the upstream raise).
-    # 0.4.3 (and earlier) does NOT have the regression — the same
-    # request returns a 73 KB WAV. Cap the upper bound until upstream
-    # ships a fix so every fresh ``pip install rapid-mlx[audio]``
-    # works out of the box.
-    "mlx-audio>=0.2.9,<0.4.4",
+    # 0.5.3 is the first qualified release that includes the Silero VAD
+    # architecture used by Rapid's Whisper silence guard and also contains
+    # the fix for the 0.4.4 Kokoro istftnet length regression. Keep a minor
+    # cap so audio runtime/API changes are adopted deliberately.
+    "mlx-audio>=0.5.3,<0.6",
     # F5-TTS (pure-MLX, no torch): EN+ZH multilingual + zero-shot voice cloning.
     # Fills the Chinese expressive/cloneable TTS gap. Standalone package (not an
     # mlx_audio family) — wired directly in audio/tts.py's `f5` branch.
@@ -500,8 +503,8 @@ audio = [
 # less capable while preventing the signed app from absorbing llvmlite,
 # spaCy, espeak, and language dictionaries it cannot drive from its UI.
 audio-desktop = [
-    "mlx-audio>=0.2.9,<0.4.4",
-    # vllm_mlx.audio.tts encodes the in-memory result with libsndfile.
+    "mlx-audio>=0.5.3,<0.6",
+    # rapid_mlx.audio.tts encodes the in-memory result with libsndfile.
     "soundfile>=0.12.0",
 ]
 video = [
@@ -520,17 +523,18 @@ video = [
 ]
 image = [
     # MLX-native text-to-image / image-edit (FLUX.1-schnell, Qwen-Image,
-    # Qwen-Image-Edit) via mflux. mflux 0.19.0 is the first release compatible
+    # Qwen-Image-Edit, Qwen-Image-2.1) via mflux. mflux 0.20.0 adds Qwen-Image-2.1
     # with MLX 0.32.x; the 0.18.x line pins ``mlx<0.32`` and therefore cannot
     # coexist with the coherence-validated core runtime. Keep a minor cap so
-    # image-lane API changes remain deliberate. mflux requires Python >=3.11
-    # (Rapid-MLX core still supports 3.10, so the image lane preflight gives
-    # 3.10 users an explicit upgrade diagnostic). Model-weight licenses are
+    # image-lane API changes remain deliberate. The Rapid-MLX image extra is
+    # still gated to Python >=3.11 although mflux 0.20 itself allows 3.10;
+    # the image lane preflight gives 3.10 users an explicit upgrade diagnostic.
+    # Model-weight licenses are
     # independent of this runtime and documented per family.
-    "mflux>=0.19.0,<0.20; platform_system == 'Darwin' and python_version >= '3.11'",
+    "mflux>=0.20.0,<0.21; platform_system == 'Darwin' and python_version >= '3.11'",
     # HiDream-O1 reuses the exact Qwen3-VL runtime already validated and
     # bundled by Desktop. Keep this pin coherent with [vision]/the sidecar.
-    "mlx-vlm==0.6.17; platform_system == 'Darwin' and python_version >= '3.11'",
+    "mlx-vlm==0.7.2; platform_system == 'Darwin' and python_version >= '3.11'",
     # The vendored SDXL backend needs Pillow for PNG encoding. Keep this direct
     # because SDXL and SD3.5 also work on Rapid's Python 3.10 floor without
     # mflux. SD3.5's reviewed local T5 tokenizer additionally needs
@@ -540,37 +544,65 @@ image = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/raullenchai/Rapid-MLX"
-Documentation = "https://github.com/raullenchai/Rapid-MLX#readme"
-Repository = "https://github.com/raullenchai/Rapid-MLX"
+Homepage = "https://rapidmlx.com"
+Documentation = "https://rapidmlx.com/docs/"
+Source = "https://github.com/raullenchai/Rapid-MLX"
+Changelog = "https://rapidmlx.com/changelog/"
+Issues = "https://github.com/raullenchai/Rapid-MLX/issues"
 
 [project.scripts]
-rapid-mlx = "vllm_mlx.cli:cli_entrypoint"
+rapid-mlx = "rapid_mlx.cli:cli_entrypoint"
 # First-class short command for accessibility and reduced typing (#1279).
-rmlx = "vllm_mlx.cli:cli_entrypoint"
-rapid-mlx-chat = "vllm_mlx.gradio_app:main"
-rapid-mlx-bench = "vllm_mlx.benchmark:main"
+rmlx = "rapid_mlx.cli:cli_entrypoint"
+rapid-mlx-chat = "rapid_mlx.gradio_app:main"
+rapid-mlx-bench = "rapid_mlx.benchmark:main"
+rapid-mlx-convert-clm-head = "rapid_mlx.system_one.convert_clm:main"
 # Deprecated pre-rename aliases — kept so existing users' scripts/muscle
 # memory keep working. Prefer the rapid-mlx* commands above.
-vllm-mlx = "vllm_mlx.cli:main"
-vllm-mlx-chat = "vllm_mlx.gradio_app:main"
-vllm-mlx-bench = "vllm_mlx.benchmark:main"
+vllm-mlx = "rapid_mlx.cli:main"
+vllm-mlx-chat = "rapid_mlx.gradio_app:main"
+vllm-mlx-bench = "rapid_mlx.benchmark:main"
 
 [tool.setuptools.package-data]
-vllm_mlx = [
+rapid_mlx = [
     "aliases.json",
     "model_recommendations.json",
     "audio/aliases.json",
     "catalog/schemas/*.json",
+    # Telemetry v2 event registry -- the single source of truth the Python
+    # validator (rapid_mlx/telemetry/registry.py) loads via
+    # importlib.resources. Without this the wheel ships a validator with
+    # nothing to validate against. The desktop app bundles a byte-identical
+    # copy; tests/test_telemetry_registry_drift.py holds the two together.
+    "telemetry/events.json",
+    # Telemetry v2 release stamp -- written ONLY by the release workflow
+    # (scripts/write_release_stamp.py in both PyPI release workflows, before
+    # `python -m build`) and NEVER committed (.gitignore covers
+    # rapid_mlx/telemetry/_release_stamp.json). Absent in checkouts by design:
+    # setuptools ignores a missing glob, so a checkout build simply ships no
+    # stamp and the official-build gate (rapid_mlx/telemetry/build_gate.py)
+    # keeps telemetry silent. Listed here so the official wheel AND sdist
+    # carry the stamp (plain setuptools -- no MANIFEST.in, no setuptools-scm --
+    # includes package_data globs in the sdist's default file list; pinned by
+    # scripts/verify_release_stamp.py in the publish job and by the slow
+    # real-build test in tests/test_release_stamp_scripts.py).
+    "telemetry/_release_stamp.json",
     # Download-size manifest (hf_path -> footprint bytes) powering the Size
     # column in `rapid-mlx models` and the size line in `rapid-mlx info`.
     # Regenerate with scripts/gen_model_sizes.py when aliases change.
     "model_sizes.json",
+    # Compiled decode cache/replay includes adapted MIT-licensed design.
+    "COMPILED_DECODE_LICENSE",
     # Canonical Google Gemma 4 chat templates used to repair stale converted
     # checkpoints without a network fetch at serve time.
     "templates/*.jinja",
     "agents/profiles/*.yaml",
     "kernels/*.metal",
+    # Adapted Qwen4 stage-one selector license must ship with the Python file.
+    "kernels/LICENSE-QSA-STAGE1",
+    # Lane matmul adapts separately MIT-licensed kernels; the complete
+    # copyright, permission text, and provenance must accompany every wheel.
+    "kernels/lane_matmul/LICENSE-LANE-MATMUL",
     # Integration tests bundled inside the package so `rapid-mlx agents
     # <name> --test` works on pip/brew installs (the source layout keeps
     # them at tests/integrations/, mirrored here via symlinks). Without
@@ -596,12 +628,23 @@ vllm_mlx = [
     # Vendored SD3.5 MLX runtime attribution must ship beside the MIT source.
     "image/sd35_runtime/LICENSE",
     "image/sd35_runtime/NOTICE",
+    # DeepSeek V4.1 native target + DSpark implementations retain separate
+    # upstream licenses; ship both texts and the provenance notice.
+    "models/deepseek_v41_native/LICENSE",
+    "models/deepseek_v41_native/LICENSE-DSPARK",
+    "models/deepseek_v41_native/NOTICE",
+    # The vendored mlx-vlm APC/cache implementation is MIT-licensed; its
+    # license text must travel with every wheel that redistributes the source.
+    "models/mlx_vlm_vendored/LICENSE",
 ]
 videox_fun_mlx = ["LICENSE", "NOTICE"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["vllm_mlx*", "videox_fun_mlx*"]
+# ``vllm_mlx*`` is the deprecated import shim (see vllm_mlx/__init__.py) --
+# it ships so ``import vllm_mlx`` keeps working for code written against
+# pre-rename releases. Drop it once the shim is retired.
+include = ["rapid_mlx*", "vllm_mlx*", "videox_fun_mlx*"]
 
 [tool.ruff]
 line-length = 88
@@ -618,15 +661,16 @@ exclude = [
     # examples intentionally optimize for readability and are not Python source;
     # the repository-wide Python gate should not mechanically rewrite them.
     "*.md",
-    "vllm_mlx/models/deepseek_v4*.py",
-    "vllm_mlx/models/gemma4_vendored/*.py",
-    "vllm_mlx/models/hy_v3.py",
+    "rapid_mlx/models/deepseek_v4*.py",
+    "rapid_mlx/models/gemma4_vendored/*.py",
+    "rapid_mlx/models/mlx_vlm_vendored/*.py",
+    "rapid_mlx/models/hy_v3.py",
     # Vendored Stability AI MLX Stable Audio 3 (models + scripts). Keep
     # formatting identical to the upstream source so future syncs stay clean.
-    "vllm_mlx/audio/sa3/**/*.py",
+    "rapid_mlx/audio/sa3/**/*.py",
     # Vendored Bonsai low-bit FLUX.2 numerical core. The Rapid-owned adapter
     # in runtime.py remains under the normal formatter.
-    "vllm_mlx/image/bonsai_runtime/_vendor/**/*.py",
+    "rapid_mlx/image/bonsai_runtime/_vendor/**/*.py",
     # Vendored CogVideoX-Fun MLX runtime. Keep iso-upstream.
     "videox_fun_mlx/**/*.py",
 ]
@@ -662,35 +706,42 @@ ignore = [
 # Vendored from ml-explore/mlx-lm PR #1192 (Blaizzy). Keep as-is so
 # upstream syncs remain a clean diff. Drop this once mlx-lm 0.32+
 # ships native deepseek_v4 support and we delete the vendored copy.
-"vllm_mlx/models/deepseek_v4*.py" = ["UP", "B", "SIM", "N", "F", "I", "E"]
+"rapid_mlx/models/deepseek_v4*.py" = ["UP", "B", "SIM", "N", "F", "I", "E"]
 # Vendored from Blaizzy/mlx-vlm 0.6.3 for the Gemma 4 text-only
 # fresh-install regression fix (#1017, closes 0.10.0 dead-end). Keep
 # lint quiet on the copy so upstream diffs stay clean. Sync policy
-# and rationale in vllm_mlx/models/gemma4_vendored/__init__.py.
-"vllm_mlx/models/gemma4_vendored/*.py" = ["UP", "B", "SIM", "N", "F", "I", "E"]
+# and rationale in rapid_mlx/models/gemma4_vendored/__init__.py.
+"rapid_mlx/models/gemma4_vendored/*.py" = ["UP", "B", "SIM", "N", "F", "I", "E"]
+# Vendored from Blaizzy/mlx-vlm 0.7.2 as staged dependency-retirement slices
+# (cache types/seam first, then the APC engine and producer cutover).
+# Upstream-shaped with only the documented bug-fix deviations; keep lint
+# quiet on the copy so upstream diffs and the step-3 revert stay clean.
+# Provenance and sync policy in
+# rapid_mlx/models/mlx_vlm_vendored/__init__.py.
+"rapid_mlx/models/mlx_vlm_vendored/*.py" = ["UP", "B", "SIM", "N", "F", "I", "E", "W"]
 # Vendored from ml-explore/mlx-lm PR #1211 (kernelpool, add-hy3-preview,
 # b7635e9c) for Tencent Hunyuan 3 (295B/21B active MoE) as part of the
 # 0.11.0 vendor drop. PR is open with zero maintainer reviews since
 # 2026-04-27. Keep lint quiet on the copy so upstream sync diffs stay
-# clean. Sync policy in vllm_mlx/models/hy_v3.py module docstring.
-"vllm_mlx/models/hy_v3.py" = ["UP", "B", "SIM", "N", "F", "I", "E"]
+# clean. Sync policy in rapid_mlx/models/hy_v3.py module docstring.
+"rapid_mlx/models/hy_v3.py" = ["UP", "B", "SIM", "N", "F", "I", "E"]
 # Vendored Stability AI MLX Stable Audio 3 (models + scripts, ~680K source).
 # Keep lint quiet on the copy so upstream sync diffs stay clean. The engine
-# entrypoint (vllm_mlx/audio/music.py) is NOT vendored and is linted normally.
-"vllm_mlx/audio/sa3/**/*.py" = ["UP", "B", "SIM", "N", "F", "I", "E", "W"]
+# entrypoint (rapid_mlx/audio/music.py) is NOT vendored and is linted normally.
+"rapid_mlx/audio/sa3/**/*.py" = ["UP", "B", "SIM", "N", "F", "I", "E", "W"]
 # Adapted from the pinned upstream HiDream-O1 MLX runtime. Keep source-shape
 # lint exceptions local so the Rapid-owned engine integration stays strict.
-"vllm_mlx/image/hidream_runtime/*.py" = ["UP", "B", "SIM", "N", "F", "I", "E", "W"]
+"rapid_mlx/image/hidream_runtime/*.py" = ["UP", "B", "SIM", "N", "F", "I", "E", "W"]
 # Vendored SDXL implementation. Rapid-owned adapter/runtime.py remains linted;
 # upstream-shaped model, converter, scheduler, and pipeline files stay syncable.
-"vllm_mlx/image/sdxl_runtime/{caching,configuration,hub,modeling,quantization,utils}.py" = ["UP", "B", "SIM", "N", "F", "I", "E", "W"]
-"vllm_mlx/image/sdxl_runtime/{converters,models,pipelines,schedulers}/**/*.py" = ["UP", "B", "SIM", "N", "F", "I", "E", "W"]
+"rapid_mlx/image/sdxl_runtime/{caching,configuration,hub,modeling,quantization,utils}.py" = ["UP", "B", "SIM", "N", "F", "I", "E", "W"]
+"rapid_mlx/image/sdxl_runtime/{converters,models,pipelines,schedulers}/**/*.py" = ["UP", "B", "SIM", "N", "F", "I", "E", "W"]
 # Adapted verbatim from the pinned low-bit runtime. Keep exceptions confined
 # to _vendor; the checkpoint validation and product adapter stay strict.
-"vllm_mlx/image/bonsai_runtime/_vendor/*.py" = ["UP", "B", "SIM", "N", "F", "I", "E", "W"]
+"rapid_mlx/image/bonsai_runtime/_vendor/*.py" = ["UP", "B", "SIM", "N", "F", "I", "E", "W"]
 # Pinned DiffusionKit numerical core. Rapid-owned adapter/runtime.py stays
 # linted; only the source-shaped vendor directory receives exceptions.
-"vllm_mlx/image/sd35_runtime/_vendor/**/*.py" = ["UP", "B", "SIM", "N", "F", "I", "E", "W"]
+"rapid_mlx/image/sd35_runtime/_vendor/**/*.py" = ["UP", "B", "SIM", "N", "F", "I", "E", "W"]
 # Tensor-shape parameter names (B, H, N, D) follow ML literature
 # convention; N803 lowercase rule is incompatible.
 "scripts/bench_attention.py" = ["N803"]
@@ -702,7 +753,7 @@ ignore = [
 # Chain-of-K MTP uses ``K`` as chain length (Ollama speculate.go, Google
 # mlx-vlm draft_block); N803 lowercase rule incompatible with the
 # speculative-decode literature convention.
-"vllm_mlx/spec_decode/mtp/generator.py" = ["N803"]
+"rapid_mlx/spec_decode/mtp/generator.py" = ["N803"]
 
 [tool.mypy]
 python_version = "3.10"
@@ -713,13 +764,20 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 # Exact third-party numerical core; Rapid-owned runtime.py remains under the
 # repository-wide shrink-only error budget.
-module = "vllm_mlx.image.bonsai_runtime._vendor.*"
+module = "rapid_mlx.image.bonsai_runtime._vendor.*"
 ignore_errors = true
 
 [[tool.mypy.overrides]]
 # Pinned third-party numerical core; keep the Rapid-owned SD3.5 adapter under
 # the repository-wide shrink-only error budget.
-module = "vllm_mlx.image.sd35_runtime._vendor.*"
+module = "rapid_mlx.image.sd35_runtime._vendor.*"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+# Pinned third-party cache implementation. Keep the upstream-shaped vendored
+# source syncable while the Rapid-owned compatibility seam remains under the
+# repository-wide shrink-only error budget.
+module = "rapid_mlx.models.mlx_vlm_vendored.cache"
 ignore_errors = true
 
 [tool.pytest.ini_options]

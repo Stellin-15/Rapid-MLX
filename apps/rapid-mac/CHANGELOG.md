@@ -23,6 +23,405 @@ can actually understand.
   secondary entry point. Multi-model pools say `Unload all`, and active work
   retains the existing guarded/disabled behaviour.
 
+## [0.15.4] — 2026-10-01
+
+Rapid-MLX 0.15.4 adds experimental accelerated profiles for Qwen3.8 27B and
+GLM-5.3 Flash, and brings Share Compute to the Desktop app.
+
+### Added
+- **Qualified experimental acceleration.** Dedicated Qwen3.8 27B and GLM-5.3
+  Flash profiles pin the supported runtime and model revisions, expose active
+  status, and fail closed outside their text-only capability boundaries.
+- **Share Compute.** Desktop can join a live compute pool, show contribution
+  state and settled API credit, stop sharing, and restore the previous model.
+- **High-concurrency lane kernels.** Qualified dense models can opt into a
+  row-invariant matrix multiplication path for eight or more concurrent rows.
+
+### Changed
+- **GLM acceleration is easy to try and leave.** The dedicated experimental
+  alias enables its accelerated backend on eligible 256 GB systems; Desktop
+  labels it Experimental and offers an explicit opt-out and ordinary fallback.
+
+### Fixed
+- **GLM TensorFold Desktop chat.** The built-in GLM acceleration profile now
+  accepts ordinary Desktop chat requests by omitting unsupported app-provided
+  tools and applying neutral sampling defaults only when controls are
+  untouched. Explicit unsupported settings remain visible and fail closed.
+- **Accelerated serving contracts.** Qwen admits one accelerated request at a
+  time. Runtime source revisions are verified before load, and GLM streaming
+  preserves code whitespace and private reasoning boundaries.
+- **Immutable audio weights.** Stable Audio 3 downloads now resolve a reviewed
+  pinned revision.
+- **Restart-loop telemetry deduplication.** Repeated server restarts no longer
+  emit duplicate anonymous startup and app-open events within the bounded
+  deduplication window, while startup attempts and outcomes remain paired.
+- **Release and test hygiene.** Managed GUI test shards have bounded lifetimes,
+  release evidence is restored, and obsolete scripts, dead code, and stale
+  benchmark artifacts have been removed.
+
+## [0.15.3] — 2026-09-29
+
+Rapid-MLX Desktop 0.15.3 adds supervised Computer Use for general Mac tasks.
+Describe the task, choose a planning Model, and approve consequential actions;
+Rapid resolves the app scope and asks you to choose when several scopes fit.
+
+### Added
+- **Task-first Computer Use.** Describe the task first. Rapid resolves a
+  bounded scope from open apps and windows, asks you to choose when several
+  scopes fit, and limits each run to at most three apps or windows. Progress,
+  results, approval, and cancellation stay in the same workspace. Add or select a
+  local or HTTPS OpenAI-compatible planning Model directly in the panel.
+  The Computer Use service starts without loading a chat model.
+- **Mac permission guidance.** The Desktop app requests Screen Recording
+  while its bundled helper requests Accessibility. Browser tasks can ask
+  macOS for Desktop-to-browser Automation access before app scope is
+  resolved; if authorization is unavailable, the panel explains how to retry.
+- **Client API.** The authenticated local `/v1/cua` API supports target
+  discovery, bounded observations, run and event polling, approval decisions,
+  and cancellation for clients with their own interface. Screenshot responses
+  require an explicit server and request opt-in.
+- **Anonymous first-run funnel counts.** Official Desktop builds now send
+  identifier-free, once-per-install setup milestones for installs whose first
+  setup starts on this version or later; existing installs and re-shown setup
+  never enter the cohort. The counters measure aggregate onboarding, download,
+  engine-start, and first-reply drop-off. The request contains only the app
+  version and a closed milestone name, honors telemetry and update-check
+  opt-outs, and is documented in `PRIVACY.md`. Existing and incomplete installs
+  are durably excluded, only the engine start caused by first-run setup is
+  counted, failed milestone requests are not retried, and development or
+  dogfood packages cannot enable the sender.
+
+### Changed
+- **Computer Use starts from a general task.** Retired predefined workflows
+  and their controls have been removed from the panel.
+
+### Fixed
+- **Task scope and completion.** Runs remain bound to the resolved or approved
+  app and website scope, validate browser domains before input, and reject
+  completion claims that cannot be verified. Failed setup and interrupted run
+  creation expose recovery controls instead of leaving an invisible run.
+  If the optional local outcome ranker is unavailable, the task continues
+  with observed execution and readback as the authority.
+- **Blank PDF import.** Exact-white rendered pages skip text recognition;
+  nonblank pages still use OCR, and unreadable documents retain their existing
+  rejection behavior.
+
+## [0.15.2] — 2026-09-24
+
+Rapid-MLX 0.15.2 makes local model serving easier to connect, harder to
+misconfigure, and much more useful when startup fails.
+
+### Added
+- **Agent connection setup is visible at a glance.** Desktop now leads with the
+  local endpoint and copy-ready connection details, then guides users through
+  popular agent integrations.
+- **More capable local models.** GLM-5.3 Flash can join the QuickSilver pool,
+  Qwen4 can load validated PLE rows from a bounded sidecar, Laya and CLM System
+  One are supported, and LFM2.5-VL gains a qualified DSpark companion.
+- **Reasoning control for GLM-5.3.** The server accepts an explicit default
+  reasoning effort and correctly recognises GLM's coercion behavior.
+- **Persistent crash diagnostics.** Fatal server tracebacks survive process
+  death, and a subsequent start can report that the previous startup ended
+  before reaching a terminal state.
+
+### Changed
+- **`rapid-mlx serve` finds a free default port.** When no port is specified,
+  the CLI scans a bounded local range instead of failing immediately on 8000;
+  explicit ports still fail closed.
+- **Optional features are installable from the failure itself.** Missing
+  vision, image, video, or audio support now offers the exact extra to install,
+  with `--yes` available for unattended setup.
+
+### Fixed
+- **Startup failures retain their real cause.** Hugging Face access failures,
+  invalid model configs, tokenizer assets, incompatible weights,
+  quantization mismatches, and memory pressure map to actionable, stable
+  categories instead of collapsing into a generic error.
+
+## [0.15.1] — 2026-09-23
+
+Rapid-MLX 0.15.1 makes first-start failures actionable in Desktop and aligns
+readiness and success reporting across every serving lane.
+
+### Added
+- **Closed startup-state telemetry.** Accepted serve invocations now record an
+  `attempted` state followed by `ready` or `failed`; failures carry only a closed
+  startup stage. Missing optional runtimes report a closed extra name rather
+  than free-form text.
+
+### Changed
+- **`Ready:` now means the server is accepting connections.** The banner is
+  printed only after the listener binds, so scripts waiting for it can connect
+  immediately.
+- **Serving success is consistent across lanes.** Image, video, audio,
+  embedding, and specialised text servers now emit the same `model_served`
+  event as the default lane.
+
+### Fixed
+- **Desktop shows the real optional-runtime startup failure.** The
+  startup-failure panel names the closed reason and affected vision, video,
+  audio, or image extra, then opens the Startup Log containing the exact
+  `pip install 'rapid-mlx[<extra>]'` hint instead of showing only a generic
+  engine-start failure.
+
+## [0.15.0] — 2026-09-22
+
+Rapid-MLX 0.15.0 adds privacy-safe product telemetry with clear local
+controls, expands local image generation and editing with Qwen-Image 2.1,
+and improves Desktop efficiency, reliability, and failure recovery.
+
+### Added
+- **Privacy-safe telemetry v2 with visible controls.** Official release builds
+  report only validated metadata from a closed registry after the applicable
+  notice has been delivered. The old v1 collector is retired. Users can inspect
+  the live decision and build gate with `rapid-mlx telemetry status`, preview
+  an exact event without sending it, turn reporting off, or reset the local
+  installation identity. Desktop shows the one-time disclosure and exposes the
+  same control in Settings.
+- **Qwen-Image 2.1 generation and editing.** The Server and Images workspace
+  use a dedicated Qwen-Image 2.1 runtime for text-to-image and one-image
+  img2img instead of misrouting the family through the incompatible 1.x path.
+- **Explicit Gemma 4 assistant-sidecar MTP.** Qualified Gemma 4 targets can be
+  paired with a named assistant sidecar without changing ordinary Gemma 4
+  inference or enabling speculation automatically.
+- **A direct feedback route.** `rapid-mlx feedback` and Desktop's Help menu
+  open the community feedback channel without reading telemetry state or
+  attaching diagnostics.
+- **Xiaomi MiMo-V2.6 Flash is in the model picker** as `mimo-v2.6-flash-4bit`
+  (experimental, Mac Studio class: 192 GB minimum, about 165 GB resident).
+  The 309B-parameter mixture-of-experts model with 15B active parameters
+  runs text-only in this build; tool calling and JSON output work out of the
+  box, and the Desktop marks its tool support as verified.
+
+### Fixed
+- Community Benchmark: the progress bar no longer cuts through the running
+  cheetah while a measurement is in progress. The layout reserved the
+  character's visible size (40 pt) but the artwork renders in a ~78 pt box
+  whose plate sits near its bottom edge, so the bar crossed the mascot's
+  legs at every progress step; the run tab now reserves the rendered box,
+  matching the fix already shipped on the Published sheet.
+- Community Benchmark: the repository Performance page (`index.html`) now
+  explains the fix when it is opened straight from the Finder — browsers
+  block `fetch` on `file://` URLs, and the page previously died with a bare
+  "Failed to fetch" and no hint that serving the folder over HTTP resolves
+  it.
+- `community-benchmarks/scripts/validate.py`: corrected the module docstring,
+  which still described the removed stdlib-only fallback ("schema check is
+  skipped with a warning when jsonschema is missing"). The script has
+  failed closed since PR #582 — every file now FAILs with an install hint
+  until `jsonschema>=4.0` is installed — and the header claimed otherwise.
+- **The Desktop no longer burns CPU while idle.** The status dot's breathing
+  animation kept running invisibly after a model finished starting, which
+  committed a frame every refresh and held the app at a quarter of a core on
+  an M3 Ultra and a full core on an M2 Pro with an accessibility pointer.
+  The loop now lives in a view that is removed when there is nothing to
+  signal. Fans, battery and VoiceOver responsiveness at rest all benefit.
+- **Answers keep the quotes the model typed.** Prose outside a code block
+  was being typeset with curly quotes, en dashes and ellipses, so a bare
+  JSON reply rendered as `{ “city”: “Tokyo” }` and pasted as invalid JSON.
+- **Fewer false "answered without calling any of the available tools"
+  cautions.** With the built-in tools (web search, browse, weather, read
+  document, local workspace) a correct answer to plain arithmetic such as
+  `17 * 23` no longer wears the caution: none of those tools is a
+  calculator. The caution still appears when a tool that could have done
+  the job was on offer — a calculator or code-interpreter connector for
+  arithmetic, web search or weather for live data — and for any connector
+  whose name does not say what it does.
+- **A second copy of the app no longer hijacks the first.** Launching
+  Rapid-MLX Desktop again (for example with `open -n`, or by running the
+  binary directly) used to start a second engine on the same port and leave
+  the original window reporting "Couldn't start <model> — check the model
+  files". The second launch now hands off to the running app — reopening its
+  window if it had been closed — and quits before it starts anything.
+- **Relaunching always brings back the main window.** Quitting with only the
+  Settings window open (main window closed with ⌘W) made the next launch
+  restore just Settings — no chat window and, because the chat window is what
+  starts the engine, no engine. Settings is no longer part of window
+  restoration, and a launch that comes back Settings-only opens the main
+  window itself.
+
+## [0.14.3] — 2026-09-18
+
+Rapid-MLX 0.14.3 makes multimodal conversations materially faster, gives
+Personal Intelligence bounded access to local files and code, and rebuilds the
+Community Benchmark experience around live, trustworthy evidence. It also
+fixes the downloaded DMG install window on affected macOS versions.
+
+### Added
+- **Personal Intelligence can work with local files and code.** From Desktop
+  chat, qualified local models can search and read text, write reviewed files,
+  move a file to recoverable Trash, and compile or run a bounded development
+  command. Every local-data action shows its exact path and arguments for
+  approval; mutation permission is never remembered, networking is denied,
+  and hidden or credential-bearing locations remain unavailable.
+- **Community Benchmark is now a complete Desktop experience.** Runs expose
+  live stages, pass counts, ETA, and the latest measurement; My Results and
+  Community views preserve contributor identity across restarts; comparison
+  copy distinguishes bounded recent evidence from complete totals; and
+  publication now verifies immutable build provenance before accepting a run.
+- **Bonsai 2 Hadamard model packs now run natively.** Rapid-owned loading for
+  packed Hadamard projections and inverse embeddings covers the qualified
+  text, streaming, and image-serving paths without changing existing MLLM
+  behavior.
+
+### Changed
+- **Follow-up questions about the same image start much sooner.** The serialized
+  multimodal lane can resume an exact media-aware prefix instead of encoding
+  and prefilling the same image again. On the qualified Qwen3.6 35B workload,
+  second-turn TTFT fell **54.8%** and elapsed time fell **22.4%**; the first
+  eligible short turn pays a bounded 10–25 ms snapshot cost, and operators can
+  disable the cache with `--mllm-media-prefix-cache off`.
+- **Serialized multimodal decode is about 35% faster on the qualified path.**
+  Structural single-request lanes no longer merge and repack a cache that
+  already has exactly the required shape. The 21-case Qwen3.6 media suite
+  improved median generation throughput by **35.4%** with identical output
+  hashes and unchanged peak memory.
+- **DeepSeek V4.1 Community Benchmark uses the qualified serial runtime.** On
+  the 256 GB M3 Ultra qualification, the 2-bit build measured approximately
+  **31.09 tok/s** on the short case and **29.42 tok/s** on the long case, with
+  its DSpark sidecar and 8,192-token input limit recorded in provenance.
+
+### Fixed
+- **GLM-5.3 Flash no longer exhausts Metal on a qualified 32K native-MTP
+  request.** Prefill is processed in bounded 1,024-token chunks while retaining
+  the exact speculative transaction. Two consecutive real 32K requests passed
+  on a 256 GB M3 Ultra; this does not claim the checkpoint's advertised 1M
+  window is usable.
+- Multimodal requests now honor `seed`, `top_k`, and `min_p` instead of silently
+  dropping those sampling controls on the media lane.
+- Gracefully stopping `rapid-mlx serve` no longer enters a Python interpreter
+  finalization race on macOS 15, and a cancelled DNS-pinned HTTP request no
+  longer risks resuming an already-completed continuation.
+- A sandboxed Personal Intelligence command now returns at its hard deadline
+  even when macOS is slow to tear down a denied child process, rather than
+  leaving the Desktop task waiting indefinitely.
+- **The install window opens instead of closing Finder.** Double-clicking the
+  downloaded DMG and selecting the mounted volume made Finder blank out and
+  close the window (and on older macOS, quit and relaunch outright), so there
+  was no way to drag the app into Applications from the Finder window. The
+  disk image's saved Finder layout stored two of its view records in an
+  encoding Finder rejects the instant it opens the volume; they are now
+  written the way Finder itself writes them, and the branded install
+  background — previously blank — renders again. Terminal installs were never
+  affected. ([#3468](https://github.com/raullenchai/Rapid-MLX/issues/3468))
+- **"See what's new" no longer quits the app.** Clicking the link on the
+  "Updated to vX.Y.Z" notice opened the release notes and then crashed
+  Rapid-MLX Desktop. The app was doing its bookkeeping — remembering that the
+  notice had been read — on whichever thread macOS happened to finish opening
+  the browser on, which is not allowed. The same latent fault in the "Star on
+  GitHub" prompt is fixed with it.
+
+## [0.14.2] — 2026-09-14
+
+Rapid-MLX 0.14.2 focuses on faster local inference and a safer first Agent
+Mode. It adds an experimental native K2 Horizon runtime, productizes the
+qualified DeepSeek V4.1 lane for 256 GB Macs, and removes several expensive
+re-prefill and tool-loop failure modes from Desktop chat.
+
+### Added
+- **Experimental Agent Mode in Desktop and Server.** A bounded local agent loop
+  can use configured MCP tools, pause before consequential actions, show a
+  redacted action summary, and resume only after approval. Runs are
+  authenticated, process-local, resource-bounded, and fail closed if the tool
+  registry changes underneath them.
+- **Experimental K2 Horizon 7B support.** Server, Desktop, model discovery,
+  reasoning parsing, and tool calls now share a Rapid-owned native adapter. On
+  an M4 Pro 48 GB Mac it measured 49–51 tok/s through shipped paths, roughly
+  matching Qwen3.5 9B decode speed while using slightly less peak memory.
+- **Experimental DeepSeek V4.1 Flash support for 256 GB Macs.** The pinned
+  2-bit target and mixed-precision DSpark sidecar now have a bounded, serial,
+  deterministic K4 serving path. It measured 19.39 tok/s versus 9.58 tok/s
+  autoregressive (2.02×) with a 218.23 GB peak; the alias remains text-only
+  and explicitly experimental.
+- **What changed after an update.** The first launch on a new version shows a
+  one-line "Updated to vX.Y.Z" notice with a link to that release's notes.
+  Updates install silently in the background, so until now the only sign that
+  anything had changed was the version number in the status bar.
+
+### Changed
+- **Qwen3.6 35B is substantially faster on the qualified local path.** The
+  native MTP path reached 130.93 tok/s median versus 83.32 tok/s target-only
+  (+57.1%) in the fixed qualification, while exact-output compiled replay
+  improved a separate no-MTP HTTP request by 19.6%. Default-on, fail-closed
+  GDN and MoE kernels retain stock fallbacks outside their qualified shapes.
+- **GLM-5.3 Flash speculative decoding is now owned and qualified by Rapid.**
+  The six-task paired suite improved median throughput from 26.58 to 35.54
+  tok/s (+33.7%) while preserving all 12 reasoning traces and final answers.
+  Existing installs stay on ordinary decoding unless the tagged dependency
+  exposes the required cache protocol.
+- **Editing code in a chat decodes up to twice as fast.** When a reply
+  reuses text that is already in the conversation, such as a function you
+  asked to rename, annotate, or fix, the engine now copies that text
+  forward in blocks and only verifies it instead of generating it token by
+  token. This works at the app's normal sampling temperature and on every
+  turn of a conversation, not only the first; a rename or bug-fix turn on
+  Qwen3.5/3.8 measured 71–99% of copied tokens accepted and 1.6–2× faster
+  decoding, while replies with nothing to copy are unchanged. It rides on
+  MTP, which is on by default for Qwen3.8-27B and a Performance-panel
+  switch for Qwen3.5-4B.
+  ([#3388](https://github.com/raullenchai/Rapid-MLX/pull/3388),
+  [#3398](https://github.com/raullenchai/Rapid-MLX/pull/3398),
+  [#3417](https://github.com/raullenchai/Rapid-MLX/pull/3417))
+
+### Fixed
+- **A web search no longer makes the whole conversation start over.** On the
+  turn that used a tool, the app added its "use only the tool result" rules to
+  the very top of the prompt and removed them again on the next message. The
+  engine reuses a conversation only while its beginning is unchanged, so every
+  tool call re-read the entire conversation twice — 20 seconds each on a long
+  one with a 27B model. The rules now travel with the message that asked, and
+  the beginning of the conversation stays put.
+- Document follow-ups now reject malformed retrieval cursors instead of
+  silently reading from the beginning and returning a plausible wrong page.
+- **Searching a document no longer reports a false "nothing found".** Asking
+  for a document's outline and a search term in the same request ran the
+  outline and dropped the search without saying so, and the answer came back
+  as if the term were absent. The search now wins and the result says the
+  outline was skipped.
+- **A document's section list is no longer returned empty.** A long report
+  whose headings are numbered several levels deep ("118.14 …") produced no
+  sections at all alongside the note "showing the first 0 entries of 800".
+- **An answer that breaks off mid-way keeps its text.** When a model garbles
+  its own request for a tool, the part it had already written stays on screen
+  above the explanation, instead of the whole turn being replaced by a caption
+  or the raw machine syntax being dumped into the transcript.
+- A tool call the model gets wrong now tells the model which argument was
+  wrong, so it can correct itself instead of repeating the same call.
+- A failed tool no longer asks the user to "check its input" — the input is
+  written by the model, not by them — and the arguments shown on an expanded
+  failure are now labelled as the model's request.
+
+## [0.14.1] — 2026-09-10
+
+Rapid-MLX 0.14.1 is a focused reliability update for document analysis,
+multimodal chat, and sampled speculative decoding.
+
+### Added
+- **Large and scanned PDF analysis.** Desktop can analyze long selectable PDFs,
+  image-only scans, and documents that mix both forms. Extraction continues in
+  a bounded background cache, document reads have hard deadlines, and follow-up
+  questions can retrieve the relevant page ranges instead of placing an entire
+  large document in one prompt.
+- **Stronger sampled-MTP regression coverage.** Distribution-level and
+  real-weight checks now protect independent acceptance draws and rejection-
+  residual sampling, including bugs that the prior 246-test MTP suite could
+  miss.
+
+### Fixed
+- **Multimodal repetition no longer exhausts Metal.** Exact token loops are
+  stopped at the scheduler boundary, the completed row is retired immediately,
+  and the valid partial response finishes normally instead of ending in a
+  delayed empty HTTP 500.
+- PDF extraction now reports incomplete OCR honestly, respects cancellation and
+  removal races, bounds malformed document identifiers, and forces synthesis
+  when a model repeatedly exceeds the document/tool budget.
+
+### Qualification
+- A 199 GiB experimental DeepSeek V4.1 Flash REAP 2-bit checkpoint loaded in
+  239.44 seconds with 213.51 GB peak MLX memory on a 256 GiB M3 Ultra, but
+  decoded at only 7.31–7.92 tok/s. It remains outside the model catalog,
+  Server, and Desktop because it missed the 12 tok/s product floor.
+
 ## [0.14.0] — 2026-09-09
 
 Rapid-MLX 0.14.0 adds experimental local Computer Use and shared-compute
@@ -3776,7 +4175,15 @@ Older versions: see the
 [GitHub Releases page](https://github.com/machinefi/rapid-desktop/releases)
 for auto-generated notes against earlier tags.
 
-[Unreleased]: https://github.com/raullenchai/Rapid-MLX/compare/rapid-mac-v0.14.0...HEAD
+[Unreleased]: https://github.com/raullenchai/Rapid-MLX/compare/rapid-mac-v0.15.4...HEAD
+[0.15.4]: https://github.com/raullenchai/Rapid-MLX/compare/rapid-mac-v0.15.3...rapid-mac-v0.15.4
+[0.15.3]: https://github.com/raullenchai/Rapid-MLX/compare/rapid-mac-v0.15.2...rapid-mac-v0.15.3
+[0.15.2]: https://github.com/raullenchai/Rapid-MLX/compare/rapid-mac-v0.15.1...rapid-mac-v0.15.2
+[0.15.1]: https://github.com/raullenchai/Rapid-MLX/compare/rapid-mac-v0.15.0...rapid-mac-v0.15.1
+[0.15.0]: https://github.com/raullenchai/Rapid-MLX/compare/rapid-mac-v0.14.3...rapid-mac-v0.15.0
+[0.14.3]: https://github.com/raullenchai/Rapid-MLX/compare/rapid-mac-v0.14.2...rapid-mac-v0.14.3
+[0.14.2]: https://github.com/raullenchai/Rapid-MLX/compare/rapid-mac-v0.14.1...rapid-mac-v0.14.2
+[0.14.1]: https://github.com/raullenchai/Rapid-MLX/compare/rapid-mac-v0.14.0...rapid-mac-v0.14.1
 [0.14.0]: https://github.com/raullenchai/Rapid-MLX/compare/rapid-mac-v0.13.4...rapid-mac-v0.14.0
 [0.13.4]: https://github.com/raullenchai/Rapid-MLX/compare/rapid-mac-v0.13.3...rapid-mac-v0.13.4
 [0.13.3]: https://github.com/raullenchai/Rapid-MLX/compare/rapid-mac-v0.13.2...rapid-mac-v0.13.3

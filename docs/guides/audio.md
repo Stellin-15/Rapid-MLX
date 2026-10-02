@@ -210,9 +210,9 @@ Install with: pip install 'rapid-mlx[audio]'
 ## Installation
 
 ```bash
-# Core audio support — stay inside the supported range
-# (mlx-audio 0.4.4 has a Kokoro istftnet regression; the pin excludes it)
-pip install 'mlx-audio>=0.2.9,<0.4.4'
+# Core audio support — 0.5.3 adds the Silero VAD runtime used by Whisper
+# while retaining the Kokoro istftnet fix
+pip install 'mlx-audio>=0.5.3,<0.6'
 
 # Required dependencies for TTS
 pip install sounddevice soundfile scipy misaki spacy num2words phonemizer-fork numba tiktoken loguru
@@ -277,7 +277,7 @@ with open("output.wav", "wb") as f:
 Isolate voice from background noise, music, or other sounds:
 
 ```python
-from vllm_mlx.audio import AudioProcessor
+from rapid_mlx.audio import AudioProcessor
 
 # Load SAM-Audio model
 processor = AudioProcessor("mlx-community/sam-audio-large-fp16")
@@ -513,7 +513,7 @@ curl http://localhost:8000/v1/audio/speech \
 
 Generate music or sound effects from a text prompt, via the MLX-native
 [Stable Audio 3](https://huggingface.co/stabilityai/stable-audio-3-optimized)
-engine vendored under `vllm_mlx/audio/sa3/`. Request-in / audio-bytes-out —
+engine vendored under `rapid_mlx/audio/sa3/`. Request-in / audio-bytes-out —
 the same shape as `/v1/audio/speech`.
 
 **Parameters (JSON body):**
@@ -708,7 +708,7 @@ python -m mlx_audio.tts.generate --model mlx-community/Kokoro-82M-bf16 \
 ### Direct Usage (without server)
 
 ```python
-from vllm_mlx.audio import STTEngine, TTSEngine, AudioProcessor
+from rapid_mlx.audio import STTEngine, TTSEngine, AudioProcessor
 
 # Speech-to-Text
 stt = STTEngine("mlx-community/whisper-large-v3-mlx")
@@ -733,7 +733,7 @@ processor.save(result.residual, "background.wav")
 ### Convenience Functions
 
 ```python
-from vllm_mlx.audio import transcribe_audio, generate_speech, separate_voice
+from rapid_mlx.audio import transcribe_audio, generate_speech, separate_voice
 
 # Quick transcription
 result = transcribe_audio("audio.mp3")
@@ -821,8 +821,8 @@ Tested on Apple M2 Max (32GB).
 pip install 'rapid-mlx[audio]'
 ```
 This installs `mlx-audio` with the supported version pin
-(`mlx-audio>=0.2.9,<0.4.4` — 0.4.4 has a Kokoro istftnet regression that
-breaks every Kokoro request).
+(`mlx-audio>=0.5.3,<0.6`). This range includes the Silero VAD runtime used
+to reject silent Whisper input and excludes the historical Kokoro regression.
 
 ### Model download slow
 Models are downloaded from HuggingFace on first use. Use `huggingface-cli download` to pre-download:
@@ -843,7 +843,6 @@ mlx-audio 0.2.9 exactly had a Kokoro g2p bug: non-English languages
 (Spanish, Chinese, Japanese, etc.) crashed with `ValueError: too many
 values to unpack` because English g2p returned a tuple `(phonemes, tokens)`
 while other languages returned just a string. Newer releases inside the
-supported range (`mlx-audio>=0.2.9,<0.4.4`, e.g. 0.4.3 — what a fresh
-`pip install 'rapid-mlx[audio]'` resolves to) no longer contain the buggy
-unpacking. If you hit this error, upgrade `mlx-audio` within the pinned
-range instead of hand-patching the package.
+supported range (`mlx-audio>=0.5.3,<0.6`) no longer contain the buggy
+unpacking. If you hit this error, upgrade `mlx-audio` within the pinned range
+instead of hand-patching the package.

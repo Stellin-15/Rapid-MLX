@@ -7,8 +7,19 @@ on:
 permissions:
   contents: read
 
+# Every job in this workflow runs product code (engine, CLI, Desktop app) on
+# shared or self-hosted machines. None of that is a user: keep it out of the
+# production telemetry store. The engine and the Desktop app both honour this
+# kill switch; the golden-flow harness lifts it only for the flows that turn
+# telemetry on against a loopback sink (fresh-install, fresh-install-share,
+# no-dead-controls). The Desktop unit tests pin their own environment, so the
+# switch stays on while they run.
+env:
+  RAPID_MLX_TELEMETRY: "0"
+
 jobs:
   build:
+    if: startsWith(github.event.release.tag_name, 'v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -24,6 +35,21 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install build twine
+
+      - name: Write the telemetry release stamp
+        # Telemetry v2 transmits ONLY from official release builds
+        # (rapid_mlx/telemetry/build_gate.py): the stamp file
+        # rapid_mlx/telemetry/_release_stamp.json must exist inside the
+        # package BEFORE `python -m build` runs so the wheel AND sdist carry
+        # it. Written once, outside the retry loop -- every rebuild stamps
+        # identically and the retry's `rm -rf dist/ build/` never touches it.
+        # The channel (stable|rc) is derived from the release tag; anything
+        # but a valid version fails the job here instead of publishing a
+        # silent or mislabelled build. TAG travels via env, not inline
+        # expression interpolation, to avoid script injection.
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: python scripts/write_release_stamp.py --version "$TAG"
 
       - name: Build package (retry on magic-byte collision)
         # PyPI's _is_valid_dist_file rejects any file where both
@@ -54,9 +80,23 @@ jobs:
           echo "ERROR: 5 builds in a row hit PyPI's zip+tar collision check"
           exit 1
 
+      - name: Verify the telemetry release stamp in the built artifacts
+        # A stamp is only real if it SHIPS: open the built wheel (zip) and
+        # sdist (tar), require rapid_mlx/telemetry/_release_stamp.json in
+        # each, parse it with the runtime gate's own validator, and require
+        # its channel to match the release tag's kind. Runs on the FINAL
+        # bytes (after the retry loop settled) and BEFORE the manifest step,
+        # so a stamp problem can never reach PyPI. Read-only on dist/; the
+        # manifest step below still owns the hash hand-off and every
+        # existing check is untouched.
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: python scripts/verify_release_stamp.py dist/ --version "$TAG"
+
       - name: Validate distribution metadata and create release manifest
         run: |
           twine check dist/*
+          python scripts/verify_dependency_metadata.py dist/
           SOURCE_SHA="$(git rev-parse HEAD)"
           python scripts/release_manifest.py create \
             --dist-dir dist \
@@ -66,7 +106,7 @@ jobs:
           cat release-manifest.json
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: release-candidate
           path: |
@@ -87,7 +127,7 @@ jobs:
       sdist_sha256: ${{ steps.verify-manifest.outputs.sdist_sha256 }}
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           name: release-candidate
           path: candidate/

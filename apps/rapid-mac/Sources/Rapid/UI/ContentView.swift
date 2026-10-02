@@ -1,11 +1,42 @@
 import SwiftUI
 
+actor StartupModelLinkMaintenanceCoordinator {
+    private var inFlight: (generation: UInt, id: UUID, task: Task<Void, Never>)?
+    private var completedGeneration: UInt?
+
+    func run(generation: UInt, _ operation: @escaping @Sendable () -> Void) async {
+        if let completedGeneration, completedGeneration >= generation { return }
+        if let current = inFlight {
+            await current.task.value
+            if inFlight?.id == current.id {
+                completedGeneration = max(completedGeneration ?? 0, current.generation)
+                inFlight = nil
+            }
+            if !Task.isCancelled,
+               (completedGeneration ?? 0) < generation {
+                await run(generation: generation, operation)
+            }
+            return
+        }
+        let id = UUID()
+        let task = Task.detached(priority: .utility) { operation() }
+        inFlight = (generation, id, task)
+        await task.value
+        if inFlight?.id == id {
+            completedGeneration = max(completedGeneration ?? 0, generation)
+            inFlight = nil
+        }
+    }
+}
+
 /// Main window content. Minimal menu-bar app: a model picker at the
 /// top, the chat transcript in the middle, a status footer at the
 /// bottom. The chat surface is gated on ``ServerState`` — before the
 /// server is ready the picker's Start button owns the flow, and a
 /// brand-new user with no model on disk sees the Quickstart card.
 struct ContentView: View {
+    private static let startupModelLinkMaintenance =
+        StartupModelLinkMaintenanceCoordinator()
     enum RestoredChatAlias: Equatable {
         case pendingCatalog
         /// The bounded catalog retry also failed. The persisted key remains
@@ -73,6 +104,7 @@ struct ContentView: View {
     // See the note beside the detail's `.frame(minWidth: 440)`.
 
     @Environment(ServerManager.self) private var server
+    @Environment(CUAServerManager.self) private var cuaServer
     @Environment(DownloadManager.self) private var downloads
     @Environment(ShareComputeManager.self) private var shareCompute
     @Environment(ChatViewModel.self) private var chat
@@ -84,9 +116,10 @@ struct ContentView: View {
     @Environment(UpdateChecker.self) private var updater
     @Environment(QuickstartCoordinator.self) private var quickstart
     @Environment(BrowseApprovalStore.self) private var browseApproval
+    @Environment(LocalToolApprovalStore.self) private var localToolApproval
     @Environment(MCPCatalog.self) private var mcpCatalog
     @Environment(MCPToolApprovalStore.self) private var mcpApproval
-    @Environment(DeferredTelemetryConsentCoordinator.self) private var deferredTelemetryConsent
+    @Environment(TelemetryNoticeCoordinator.self) private var telemetryNotice
     @Environment(GitHubStarPromptCoordinator.self) private var githubStarPrompt
     @Environment(SparkleUpdateController.self) private var sparkleUpdater
     @Environment(CommandPaletteRequestCoordinator.self) private var commandPaletteRequest
@@ -98,7 +131,15 @@ struct ContentView: View {
     /// from a real user override while launch probing is suspended.
     @State private var userSelectionRevision: UInt = 0
     /// Which detail surface the sidebar shows (chat vs the Launch page).
-    @State private var section: SidebarSection = .chat
+    /// Starts on Chat unless a GUI harness asked for another surface — see
+    /// ``SidebarSection/harnessRequested(environment:)``, which is inert
+    /// outside golden mode.
+    @State private var section: SidebarSection = SidebarSection.harnessRequested() ?? .chat
+    /// Measured width of the whole shell, used for the one responsive
+    /// decision the chrome makes: whether the rail is collapsed. Zero until
+    /// the first layout pass, which is why ``usesCompactRail`` treats zero as
+    /// "not yet known" rather than "narrow".
+    @State private var shellWidth: CGFloat = 0
     @AppStorage(VideoFeatureConfig.enabledKey)
     private var videoGenerationEnabled = VideoFeatureConfig.defaultEnabled
     @AppStorage(ComputerUseFeatureConfig.enabledKey)
@@ -175,9 +216,13 @@ struct ContentView: View {
         handedOffVersion: String?,
         onboardingVisible: Bool,
         blockingOverlayVisible: Bool,
-        hasAction: Bool
+        hasAction: Bool,
+        /// Set only by a visual-review capture; see
+        /// ``suppressesReviewChrome(environment:)``. Defaulted so every
+        /// existing caller and test keeps its current meaning.
+        suppressedForReview: Bool = false
     ) -> Bool {
-        guard let releaseVersion, hasAction else { return false }
+        guard let releaseVersion, hasAction, !suppressedForReview else { return false }
         return !onboardingVisible
             && !blockingOverlayVisible
             && dismissedVersion != releaseVersion
@@ -198,6 +243,36 @@ struct ContentView: View {
         return true
     }
 
+    /// Whether the rail is collapsed to Paper's icon rail.
+    ///
+    /// Zero means "not measured yet" — the shell starts on the full column
+    /// and collapses on the first layout pass if it has to, rather than
+    /// flashing a collapsed rail on every launch.
+    private var usesCompactRail: Bool {
+        shellWidth > 0 && shellWidth <= SidebarView.compactBreakpoint
+    }
+
+    /// Whether this process is a visual-review capture and should not paint
+    /// opportunistic chrome over the surface under review.
+    ///
+    /// Two keys, both required, matching the existing
+    /// ``RAPID_GUI_UPDATE_BUSY_FIXTURE`` / dictation fixtures: a normal
+    /// launch — and a dev launch, and a golden-flow launch that has not asked
+    /// for this — never reads it, so update discovery keeps working exactly
+    /// as it ships. It suppresses PRESENTATION only; the checker still runs,
+    /// still records what it found, and the menu path to it is untouched.
+    ///
+    /// This exists because the review screenshots were not usable artifacts:
+    /// the update card is a bottom-trailing overlay, and in every capture it
+    /// sat on top of the workbench's lower-right corner — the reward panel on
+    /// My Contribution, the contribution band on Pool.
+    static func suppressesReviewChrome(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        environment["RAPID_GUI_GOLDEN_MODE"] == "1"
+            && environment["RAPID_GUI_SUPPRESS_REVIEW_CHROME"] == "1"
+    }
+
     private var presentedUpdateRelease: UpdateChecker.Release? {
         guard let release = updater.availableUpdate else { return nil }
         let releaseURL = Self.missingOverlayDownloadURL(for: release)
@@ -207,7 +282,8 @@ struct ContentView: View {
             handedOffVersion: updateHandedOffVersion,
             onboardingVisible: quickstartVisible,
             blockingOverlayVisible: showConversationSearch || showCommandPalette,
-            hasAction: sparkleUpdater.isEnabled || releaseURL != nil
+            hasAction: sparkleUpdater.isEnabled || releaseURL != nil,
+            suppressedForReview: Self.suppressesReviewChrome()
         ) else { return nil }
         return release
     }
@@ -469,6 +545,7 @@ struct ContentView: View {
         // the user has turned on auto-approve in Settings (resolved before a
         // request is ever published), so it only appears on a real prompt.
         .modifier(BrowseApprovalDialog(store: browseApproval))
+        .modifier(LocalToolApprovalDialog(store: localToolApproval))
         // Issue #1716: per-tool consent for MCP connector tools. Same shape as
         // the browse sheet above — an MCP server is an arbitrary local process,
         // so "may the model run this" is a decision that belongs on screen.
@@ -611,8 +688,13 @@ struct ContentView: View {
             // but was never mounted, so a failed Finder replacement was
             // detected and then silently discarded.
             FailedReplaceBanner()
-            if deferredTelemetryConsent.isPresented {
-                DeferredTelemetryConsentBanner()
+            // Suppresses itself while the banner above is showing — see the
+            // note in `WhatsNewBanner.body`. They are NOT mutually exclusive
+            // by construction any more: the upgrade notice is sticky until the
+            // user acknowledges it.
+            WhatsNewBanner()
+            if telemetryNotice.isPresented {
+                TelemetryNoticeBanner()
             }
             if let campaign,
                !UserDefaults.standard.bool(forKey: campaign.dismissalKey) {
@@ -625,12 +707,14 @@ struct ContentView: View {
             }
             NavigationSplitView {
                 SidebarView(
+                    isCompact: usesCompactRail,
                     selection: $section,
                     videoGenerationEnabled: videoGenerationEnabled,
                     computerUseEnabled: computerUseEnabled,
                     benchmarkEnabled: communityBenchmarkEnabled,
                     shareComputeEnabled: shareComputeEnabled,
                     shareComputeActive: shareCompute.state.isActive,
+                    cuaViewModel: cuaServer.viewModel,
                     chat: chat,
                 onNewChat: {
                     chat.newConversation()
@@ -651,10 +735,14 @@ struct ContentView: View {
             // cool translucent grey that fought the warm canvas beside
             // it — the two planes read as belonging to different apps.
             .background(RapidTheme.surfaceSidebar)
+            // Pinned to a single value in the compact state: the collapsed
+            // rail is a fixed 64pt object, and leaving a min/ideal/max range
+            // there would let the divider be dragged into a width the icon
+            // rail has no layout for.
             .navigationSplitViewColumnWidth(
-                min: SidebarView.columnMinWidth,
-                ideal: SidebarView.columnIdealWidth,
-                max: SidebarView.columnMaxWidth
+                min: usesCompactRail ? SidebarView.compactWidth : SidebarView.columnMinWidth,
+                ideal: usesCompactRail ? SidebarView.compactWidth : SidebarView.columnIdealWidth,
+                max: usesCompactRail ? SidebarView.compactWidth : SidebarView.columnMaxWidth
             )
             } detail: {
                 detailArea
@@ -686,6 +774,20 @@ struct ContentView: View {
                 .frame(minWidth: 440)
                     .background(RapidTheme.surfaceCanvas)
             }
+            // Drives the responsive rail. Measured on the split view itself,
+            // which is the shell's full width — the rail collapsing does not
+            // change this number, so there is no feedback loop between the
+            // measurement and the decision it feeds.
+            .background {
+                GeometryReader { proxy in
+                    Color.clear
+                        .onAppear { shellWidth = proxy.size.width }
+                        .onChange(of: proxy.size.width) { _, width in
+                            shellWidth = width
+                        }
+                }
+                .accessibilityHidden(true)
+            }
             // Background pulls are process-wide, not chat-only.  Keep their
             // progress visible whichever sidebar destination is selected.
             DownloadStrip(
@@ -714,7 +816,10 @@ struct ContentView: View {
             statusFooter
         }
         .overlay(alignment: .bottomTrailing) {
-            if githubStarPrompt.isPresented {
+            // Same gate as the update card: the star prompt is the other
+            // bottom-trailing overlay that can land on the surface under
+            // review.
+            if githubStarPrompt.isPresented, !Self.suppressesReviewChrome() {
                 GitHubStarPromptCard()
                     .padding(.trailing, 16)
                     .padding(.bottom, 40)
@@ -746,7 +851,7 @@ struct ContentView: View {
         return .init(
             isBusy: hasActiveModelWork,
             hasBlockingSurface: quickstartVisible
-                || deferredTelemetryConsent.isPresented
+                || telemetryNotice.isPresented
                 || campaignIsVisible
                 || showConversationSearch
                 || server.pendingMemoryWarning != nil
@@ -924,6 +1029,7 @@ struct ContentView: View {
             sizeText: sizeText(for: alias),
             progress: progressSnapshot,
             failure: readinessFailure,
+            startupFailure: server.startupFailure,
             downloadInFlight: downloads.isDownloading(alias)
         )
     }
@@ -1029,6 +1135,8 @@ struct ContentView: View {
     private func refreshCatalogSnapshot() async {
         guard let binary = server.binaryPath else { return }
         let generation = downloads.cacheGeneration
+        await Self.ensureStartupModelLinks(generation: generation)
+        guard !Task.isCancelled, generation == downloads.cacheGeneration else { return }
         var loaded = await ModelCatalogCache.shared.entries(
             binary: binary,
             generation: generation
@@ -1087,6 +1195,8 @@ struct ContentView: View {
         case .restart(let target):
             chat.clearStaleErrorBanner()
             restartModel(target)
+        case .openStartupLog:
+            showLogs = true
         case .openModelManagement:
             settingsRouter.route(.openModelManagement) {
                 openWindow(id: "settings")
@@ -1205,23 +1315,10 @@ struct ContentView: View {
         case .computerUse:
             if computerUseEnabled {
                 ComputerUseView(
-                    languageRuntime: DraftPostLanguageRuntime(
-                        profile: server.activeModelProfile,
-                        selectedAlias: alias,
-                        host: server.host,
-                        port: server.activePort,
-                        bearerToken: server.activeBearer,
-                        liveServer: server
-                    ),
-                    visualRuntime: DraftPostVisualRuntime(
-                        profile: server.activeModelProfile,
-                        selectedAlias: alias,
-                        host: server.host,
-                        port: server.activePort,
-                        bearerToken: server.activeBearer,
-                        liveServer: server
-                    )
+                    cuaServer: cuaServer,
+                    cuaViewModel: cuaServer.viewModel
                 )
+                .id(cuaServer.sessionID)
             } else {
                 mainArea
             }
@@ -1239,11 +1336,45 @@ struct ContentView: View {
                 CommunityBenchmarkView(
                     catalog: catalogEntries,
                     binary: server.binaryPath,
-                    prepareServer: { try await server.prepareForCommunityBenchmark() },
-                    releaseServer: { server.finishCommunityBenchmark($0) },
+                    prepareServer: {
+                        try await server.prepareForCommunityBenchmark()
+                    },
+                    releaseServer: { reservation in
+                        server.finishCommunityBenchmark(
+                            reservation,
+                            restoringWith: { restoredAlias in
+                                let entry = catalogEntries.first {
+                                    $0.alias == restoredAlias
+                                }
+                                let hint = entry.map {
+                                    ServerManager.CatalogEntryHint(
+                                        entry: $0,
+                                        generation: catalogGeneration
+                                    )
+                                }
+                                return await server.ensureServing(
+                                    alias: restoredAlias,
+                                    hfPath: entry?.hfRepo,
+                                    estimatedMemoryGB: nil,
+                                    replacementGroup: .assistant,
+                                    catalogEntryHint: hint
+                                )
+                            }
+                        )
+                    },
                     retainServerDuringDeferredReap: {
                         server.retainCommunityBenchmarkDuringDeferredReap($0)
-                    }
+                    },
+                    // The public atomic feed identifies models by Hugging Face
+                    // repo id; the rest of the app speaks product aliases, so
+                    // the catalogue does the translation. Captured by value:
+                    // the adapter is Sendable and must not reach back into
+                    // view state from a background request.
+                    directory: CommunityBenchmarkAPIDirectory(
+                        aliasForRepoID: { [entries = catalogEntries] repoID in
+                            entries.first { $0.hfRepo == repoID }?.alias ?? repoID
+                        }
+                    )
                 )
             } else {
                 // Flag flipped off while this tab was selected. Show the
@@ -1741,8 +1872,15 @@ struct ContentView: View {
             if case .pendingCatalog = restoredChatAlias { return true }
             return false
         }()
-        _ = BundledModel.installBundledSnapshotSymlink()
-        _ = QuickstartModel.installAllSnapshotSymlinks()
+        // Cache repair can cross a user-selected or symlinked removable
+        // volume. Keep its ordering before catalog discovery, but never run
+        // that potentially blocking filesystem work on MainActor: the main
+        // window and model-free Computer Use must remain usable while macOS
+        // resolves volume access.
+        let maintenanceGeneration = downloads.cacheGeneration
+        await Self.ensureStartupModelLinks(generation: maintenanceGeneration)
+        guard !Task.isCancelled,
+              maintenanceGeneration == downloads.cacheGeneration else { return }
         let sessionCatalog: [ModelEntry]
         if let suppliedCatalog {
             sessionCatalog = suppliedCatalog
@@ -1799,6 +1937,13 @@ struct ContentView: View {
         await dictation.finishDeferredBootstrap(
             waitingForPrimaryLaunch: chatRestoreOutcome == .primaryLaunchPending
         )
+    }
+
+    private static func ensureStartupModelLinks(generation: UInt) async {
+        await startupModelLinkMaintenance.run(generation: generation) {
+            _ = BundledModel.installBundledSnapshotSymlink()
+            _ = QuickstartModel.installAllSnapshotSymlinks()
+        }
     }
 
     private enum LaunchAutoStartOutcome {
@@ -2094,6 +2239,58 @@ private struct BrowseApprovalSheet: View {
         // needs to press. "The approval is up" is better asserted by waiting
         // for `ToolApproval.Browse.Allow`, which is the control the user acts
         // on rather than a wrapper around it.
+    }
+}
+
+/// Approval for Rapid's built-in local workspace. Mutations intentionally omit
+/// an "Always allow" button, so a model can never turn one approval into future
+/// writes, command executions, or removals.
+private struct LocalToolApprovalDialog: ViewModifier {
+    let store: LocalToolApprovalStore
+
+    func body(content: Content) -> some View {
+        content.sheet(isPresented: Binding(
+            get: { store.pendingRequest != nil },
+            set: { if !$0 && store.pendingRequest != nil { store.answer(.deny) } }
+        )) {
+            if let request = store.pendingRequest {
+                VStack(alignment: .leading, spacing: 14) {
+                    Text(request.title).font(.headline)
+                    Text("Personal Intelligence wants to use Rapid's local workspace on this Mac.")
+                        .font(.callout).foregroundStyle(.secondary)
+                    ScrollView {
+                        Text(request.argumentsPreview)
+                            .font(.system(.callout, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(10)
+                    }
+                    .frame(minHeight: 44, maxHeight: 180)
+                    .background(Color(nsColor: .textBackgroundColor))
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(.quaternary))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    Text(request.toolName == "local_trash"
+                         ? "Files are moved to Trash and remain recoverable. Folders are never removed."
+                         : "Review the exact path, content, command, and arguments before allowing it.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    HStack {
+                        Spacer()
+                        Button("Don't allow") { store.answer(.deny) }
+                            .keyboardShortcut(.cancelAction)
+                            .accessibilityIdentifier("ToolApproval.Local.Deny")
+                        if request.allowsPersistentGrant {
+                            Button("Allow for this session") { store.answer(.alwaysAllowTool) }
+                                .accessibilityIdentifier("ToolApproval.Local.AlwaysAllow")
+                        }
+                        Button("Allow once") { store.answer(.allowOnce) }
+                            .keyboardShortcut(.defaultAction)
+                            .accessibilityIdentifier("ToolApproval.Local.Allow")
+                    }
+                }
+                .padding(20)
+                .frame(width: 500)
+            }
+        }
     }
 }
 

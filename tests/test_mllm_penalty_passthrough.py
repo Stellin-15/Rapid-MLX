@@ -35,7 +35,7 @@ from unittest.mock import MagicMock
 
 import mlx.core as mx
 
-from vllm_mlx.mllm_batch_generator import (
+from rapid_mlx.mllm_batch_generator import (
     MLLMBatchRequest,
     _maybe_apply_penalty_processors,
 )
@@ -60,7 +60,7 @@ def test_neutral_defaults_skip_processor_allocation():
     row = mx.ones((1, 8))
     out = _maybe_apply_penalty_processors(req, row)
     assert out is row, "neutral knobs must return the input row unchanged"
-    assert not hasattr(req, "_cached_penalty_processors"), (
+    assert req._cached_penalty_processors is None, (
         "neutral defaults must not allocate processor cache"
     )
 
@@ -140,7 +140,7 @@ def test_first_token_no_history_is_unchanged():
 def _stub_scheduler():
     """Construct a scheduler with all I/O dependencies stubbed out so we can
     drive ``add_request`` synchronously without booting Metal/VLM."""
-    from vllm_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
+    from rapid_mlx.mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
 
     scheduler = MLLMScheduler.__new__(MLLMScheduler)
     scheduler.config = MLLMSchedulerConfig()
@@ -231,7 +231,7 @@ async def test_engine_stream_generate_mllm_forwards_penalty_kwargs():
     (``build_extended_sampling_kwargs`` → ``chat_kwargs`` →
     ``engine.stream_chat`` → ``engine.stream_generate``) bottomed out
     here for vision models."""
-    from vllm_mlx.engine.batched import BatchedEngine
+    from rapid_mlx.engine.batched import BatchedEngine
 
     engine = BatchedEngine.__new__(BatchedEngine)
     engine._loaded = True
@@ -265,6 +265,10 @@ async def test_engine_stream_generate_mllm_forwards_penalty_kwargs():
         repetition_penalty=1.7,
         presence_penalty=0.3,
         frequency_penalty=0.4,
+        ignore_eos=True,
+        top_k=12,
+        min_p=0.08,
+        seed=17,
         grammar_logits_processor=grammar,
         reasoning_budget_logits_processor=budget,
         suppressed_tokens_logits_processor=suppression,
@@ -274,6 +278,10 @@ async def test_engine_stream_generate_mllm_forwards_penalty_kwargs():
     assert captured["repetition_penalty"] == 1.7
     assert captured["presence_penalty"] == 0.3
     assert captured["frequency_penalty"] == 0.4
+    assert captured["ignore_eos"] is True
+    assert captured["top_k"] == 12
+    assert captured["min_p"] == 0.08
+    assert captured["seed"] == 17
     assert captured["logits_processors"] == [grammar, budget, suppression]
     assert captured["prefix_boundary"] == 5
 

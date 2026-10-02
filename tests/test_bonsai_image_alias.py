@@ -9,16 +9,16 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 
-from vllm_mlx import _download_gate
-from vllm_mlx.catalog import build_catalog_bundle
-from vllm_mlx.image.engine import (
+from rapid_mlx import _download_gate
+from rapid_mlx.catalog import build_catalog_bundle
+from rapid_mlx.image.engine import (
     ImageGenerationEngine,
     ImageRuntimeError,
     _detect_family,
 )
-from vllm_mlx.model_aliases import resolve_profile
-from vllm_mlx.model_sizes import size_bytes
-from vllm_mlx.runtime.resident_models import estimate_model_bytes
+from rapid_mlx.model_aliases import resolve_profile
+from rapid_mlx.model_sizes import size_bytes
+from rapid_mlx.runtime.resident_models import estimate_model_bytes
 
 REPO = "prism-ml/bonsai-image-ternary-4B-mlx-2bit"
 REVISION = "2c24c81b934a658ba5590cf39088ba929985b4a8"
@@ -165,7 +165,7 @@ def test_cold_snapshot_is_pinned_allowlisted_and_verified(
 
     engine = ImageGenerationEngine(REPO)
     monkeypatch.setattr(
-        "vllm_mlx._download_gate.mflux_local_snapshot", lambda _name: None
+        "rapid_mlx._download_gate.mflux_local_snapshot", lambda _name: None
     )
     verified = []
     monkeypatch.setattr(
@@ -195,8 +195,9 @@ def test_cold_snapshot_is_pinned_allowlisted_and_verified(
 def test_pull_uses_exact_revision_and_data_allowlist(
     monkeypatch: pytest.MonkeyPatch, requested: str
 ) -> None:
-    from vllm_mlx import cli
-    from vllm_mlx.audio import registry
+    from rapid_mlx import cli
+    from rapid_mlx.audio import registry
+    from rapid_mlx.runtime import image_lane
 
     calls = []
     monkeypatch.setattr(
@@ -204,9 +205,9 @@ def test_pull_uses_exact_revision_and_data_allowlist(
         "_pull_repository",
         lambda args, **kwargs: calls.append((args.model, kwargs)),
     )
-    monkeypatch.setattr(cli, "_emit_pull_activation", lambda: None)
     monkeypatch.setattr(registry, "runtime_assets_for", lambda _repo: ())
     monkeypatch.setattr(registry, "runtime_requirements_for", lambda _repo: ())
+    monkeypatch.setattr(image_lane, "image_runtime_issue", lambda _model: None)
 
     cli.pull_command(SimpleNamespace(model=requested))
 
@@ -224,7 +225,7 @@ def test_pull_uses_exact_revision_and_data_allowlist(
 @pytest.mark.requires_mlx
 def test_runtime_checkpoint_validation_is_fail_closed(tmp_path: Path) -> None:
     pytest.importorskip("mflux")
-    from vllm_mlx.image.bonsai_runtime.runtime import (
+    from rapid_mlx.image.bonsai_runtime.runtime import (
         BONSAI_IMAGE_REPO,
         BONSAI_IMAGE_REVISION,
         BonsaiCheckpointError,
@@ -270,7 +271,7 @@ def test_engine_builds_only_the_fixed_bonsai_checkpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pytest.importorskip("mflux")
-    from vllm_mlx.image import bonsai_runtime
+    from rapid_mlx.image import bonsai_runtime
 
     built = []
 
@@ -300,7 +301,7 @@ def test_runtime_definitions_and_json_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pytest.importorskip("mflux")
-    from vllm_mlx.image.bonsai_runtime import runtime
+    from rapid_mlx.image.bonsai_runtime import runtime
 
     components = runtime._VAEWeightDefinition.get_components()
     assert [component.name for component in components] == ["vae"]
@@ -334,7 +335,7 @@ def test_checkpoint_rejects_wrong_pipeline_and_text_quantization(
     tmp_path: Path,
 ) -> None:
     pytest.importorskip("mflux")
-    from vllm_mlx.image.bonsai_runtime import runtime
+    from rapid_mlx.image.bonsai_runtime import runtime
 
     files = {
         "model_index.json": '{"_class_name":"WrongPipeline"}',
@@ -372,7 +373,7 @@ def test_runtime_load_helpers_apply_the_fixed_quantization(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     pytest.importorskip("mflux")
-    from vllm_mlx.image.bonsai_runtime import runtime
+    from rapid_mlx.image.bonsai_runtime import runtime
 
     class Weight:
         def __init__(self, name: str):
@@ -469,7 +470,7 @@ def test_runtime_constructor_and_prompt_cache_lifecycle(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     pytest.importorskip("mflux")
-    from vllm_mlx.image.bonsai_runtime import runtime
+    from rapid_mlx.image.bonsai_runtime import runtime
 
     model_config = SimpleNamespace(text_encoder_overrides={"hidden_size": 4})
     callbacks = object()
@@ -550,7 +551,7 @@ def test_tiled_vae_uses_bonsai_default_and_honors_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pytest.importorskip("mflux")
-    from vllm_mlx.image.bonsai_runtime import runtime
+    from rapid_mlx.image.bonsai_runtime import runtime
 
     calls = []
     monkeypatch.setattr(

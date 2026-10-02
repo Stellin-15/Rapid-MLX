@@ -29,13 +29,13 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from vllm_mlx.api.errors import GuidedGenerationCancelledError
-from vllm_mlx.api.models import ChatCompletionRequest
-from vllm_mlx.config import reset_config
-from vllm_mlx.engine.base import GenerationOutput
-from vllm_mlx.routes.chat import router as chat_router
-from vllm_mlx.routes.chat import stream_chat_completion_guided
-from vllm_mlx.routes.health import cancel_request
+from rapid_mlx.api.errors import GuidedGenerationCancelledError
+from rapid_mlx.api.models import ChatCompletionRequest
+from rapid_mlx.config import reset_config
+from rapid_mlx.engine.base import GenerationOutput
+from rapid_mlx.routes.chat import router as chat_router
+from rapid_mlx.routes.chat import stream_chat_completion_guided
+from rapid_mlx.routes.health import cancel_request
 
 
 class _GuidedEngine:
@@ -130,8 +130,16 @@ def _parse_sse_events(text: str) -> tuple[list[dict], bool]:
 
 
 @pytest.mark.asyncio
-async def test_guided_stream_publishes_cancellable_id_before_buffered_output():
+async def test_guided_stream_publishes_cancellable_id_before_buffered_output(
+    monkeypatch,
+):
     """The first SSE event addresses live guided work, not completed work."""
+    from rapid_mlx.telemetry import inference
+
+    emit_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        inference, "emit_completed_request", lambda **kwargs: emit_calls.append(kwargs)
+    )
 
     class _CancellableGuidedEngine(_GuidedEngine):
         def __init__(self):
@@ -198,11 +206,18 @@ async def test_guided_stream_publishes_cancellable_id_before_buffered_output():
     with pytest.raises(StopAsyncIteration):
         await anext(stream)
     assert engine.stream_calls == [], "cancellation must never fall back unconstrained"
+    assert emit_calls == [], "explicit client cancellation is not an inference result"
 
 
 @pytest.mark.asyncio
-async def test_guided_stream_shutdown_consumes_exact_lifecycle_owner():
+async def test_guided_stream_shutdown_consumes_exact_lifecycle_owner(monkeypatch):
     """Shutdown emits the model-replacement terminal and clears its ledger."""
+    from rapid_mlx.telemetry import inference
+
+    emit_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        inference, "emit_completed_request", lambda **kwargs: emit_calls.append(kwargs)
+    )
 
     class _ShutdownGuidedEngine(_GuidedEngine):
         def __init__(self):
@@ -242,12 +257,31 @@ async def test_guided_stream_shutdown_consumes_exact_lifecycle_owner():
     assert events[-1] == "data: [DONE]\n\n"
     assert engine.lifecycle_consumed is True
     assert engine.stream_calls == []
+    assert emit_calls == [
+        {
+            "model": "<custom>",
+            "endpoint": "/v1/chat/completions",
+            "caller_agent": None,
+            "caller_client": None,
+            "result": "failed",
+            "error_class": "model_replaced",
+        }
+    ]
 
 
 @pytest.mark.asyncio
-async def test_shutdown_during_retained_handoff_keeps_replacement_semantics():
+async def test_shutdown_during_retained_handoff_keeps_replacement_semantics(
+    monkeypatch,
+):
     """A retained guided owner carries shutdown cause through handoff."""
     from types import SimpleNamespace
+
+    from rapid_mlx.telemetry import inference
+
+    emit_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        inference, "emit_completed_request", lambda **kwargs: emit_calls.append(kwargs)
+    )
 
     class _ShutdownHandoffEngine(_GuidedEngine):
         def __init__(self):
@@ -290,6 +324,16 @@ async def test_shutdown_during_retained_handoff_keeps_replacement_semantics():
     assert events[-1] == "data: [DONE]\n\n"
     assert engine.lifecycle_consumed is True
     assert engine.stream_calls == []
+    assert emit_calls == [
+        {
+            "model": "<custom>",
+            "endpoint": "/v1/chat/completions",
+            "caller_agent": None,
+            "caller_client": None,
+            "result": "failed",
+            "error_class": "model_replaced",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -488,6 +532,55 @@ def test_nonstream_guided_user_cancel_is_not_model_replacement():
         )
 
 
+def test_nonstream_guided_lifecycle_cancel_is_model_replacement():
+    """A guided cancellation OWNED by the engine (the primary model was
+    replaced under the request) must surface the stable ``model_replacement``
+    503 envelope so the GUI reads a calm "ask again" -- not the generic failure
+    card. This lane previously raised a bare-string 503 with no code."""
+
+    class _ReplacedEngine(_GuidedEngine):
+        async def generate_with_schema(self, *, messages, json_schema, **kwargs):
+            err = GuidedGenerationCancelledError()
+            # A truthy owning task marks this as a model replacement (vs. a
+            # plain user cancel, which has no lifecycle task and propagates).
+            err.lifecycle_task = object()
+            raise err
+
+        def consume_lifecycle_task_abort(self, task) -> bool:
+            return True
+
+    cfg = reset_config()
+    cfg.engine = _ReplacedEngine()
+    cfg.model_name = "test-model"
+    cfg.model_registry = None
+    app = FastAPI()
+    app.include_router(chat_router)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "emit json"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "result",
+                    "schema": {"type": "object"},
+                    "strict": False,
+                },
+            },
+        },
+    )
+    assert response.status_code == 503, response.text
+    body = response.json()
+    # A bare FastAPI app surfaces a dict detail under ``detail``; the production
+    # server's handlers unwrap it to ``error`` -- accept either.
+    err = body.get("error") or body.get("detail", {}).get("error")
+    assert err is not None, body
+    assert err["code"] == "model_replacement"
+
+
 _SCHEMA = {
     "type": "object",
     "$defs": {
@@ -517,7 +610,7 @@ _SCHEMA = {
 _GUIDED_OUTPUT = json.dumps({"label": "red", "items": [{"name": "alpha", "qty": 2}]})
 
 
-def test_streaming_json_schema_routes_through_guided_generation():
+def test_streaming_json_schema_routes_through_guided_generation(monkeypatch):
     """stream=true + json_schema must call generate_with_schema, NOT stream_chat.
 
     The bug class this gates: a refactor that re-wires the stream branch
@@ -527,6 +620,12 @@ def test_streaming_json_schema_routes_through_guided_generation():
     but catastrophic for adversarial / complex schemas.
     """
     engine = _GuidedEngine(guided_text=_GUIDED_OUTPUT)
+    from rapid_mlx.telemetry import inference
+
+    emit_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        inference, "emit_completed_request", lambda **kwargs: emit_calls.append(kwargs)
+    )
     client = _make_client(engine)
 
     payload = {
@@ -587,13 +686,68 @@ def test_streaming_json_schema_routes_through_guided_generation():
     assert saw_role, "first SSE chunk must announce assistant role"
     assert saw_finish, "stream must emit a finish_reason chunk"
     assert "".join(content_parts) == _GUIDED_OUTPUT
+    assert emit_calls == [
+        {
+            "model": "<custom>",
+            "endpoint": "/v1/chat/completions",
+            "caller_agent": "testclient",
+            "caller_client": None,
+            "result": "ok",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ["guided_exception", "strict_violation"])
+async def test_guided_strict_failures_emit_failed(monkeypatch, failure_kind):
+    from rapid_mlx.telemetry import inference
+
+    engine = _GuidedEngine(
+        guided_text='{"label": 7}',
+        raise_in_guided=failure_kind == "guided_exception",
+    )
+    request = ChatCompletionRequest(
+        model="test-model",
+        stream=True,
+        messages=[{"role": "user", "content": "emit json"}],
+    )
+    emit_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        inference, "emit_completed_request", lambda **kwargs: emit_calls.append(kwargs)
+    )
+
+    events = [
+        event
+        async for event in stream_chat_completion_guided(
+            engine,
+            request.messages,
+            request,
+            _SCHEMA,
+            strict_mode=True,
+            caller_agent="openai-python/1.2",
+            caller_client="rapid-cli-chat",
+            served_telemetry_id="resolved/model",
+        )
+    ]
+
+    assert any("strict_schema_violation" in event for event in events)
+    assert emit_calls == [
+        {
+            "model": "resolved/model",
+            "endpoint": "/v1/chat/completions",
+            "caller_agent": "openai-python/1.2",
+            "caller_client": "rapid-cli-chat",
+            "result": "failed",
+            "error_class": "strict_schema_violation",
+        }
+    ]
 
 
 def test_mllm_streaming_schema_stays_on_scheduler_with_request_processor(
     monkeypatch,
 ):
     """Vision-capable serving keeps its lane and constrains decode in place."""
-    from vllm_mlx.api import guided
+    from rapid_mlx.api import guided
 
     marker = object()
     monkeypatch.setattr(
@@ -601,7 +755,7 @@ def test_mllm_streaming_schema_stays_on_scheduler_with_request_processor(
         "build_json_schema_logits_processor",
         lambda _tokenizer, schema: marker if schema == _SCHEMA else None,
     )
-    from vllm_mlx.routes import chat as chat_route
+    from rapid_mlx.routes import chat as chat_route
 
     monkeypatch.setattr(
         chat_route,

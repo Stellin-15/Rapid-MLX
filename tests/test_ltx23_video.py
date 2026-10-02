@@ -19,10 +19,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from vllm_mlx.model_aliases import resolve_profile
-from vllm_mlx.routes import video
-from vllm_mlx.runtime import video_lane
-from vllm_mlx.runtime.video_lane import (
+from rapid_mlx.model_aliases import resolve_profile
+from rapid_mlx.routes import video
+from rapid_mlx.runtime import video_lane
+from rapid_mlx.runtime.optional_runtime import OptionalRuntimeMissing
+from rapid_mlx.runtime.video_lane import (
     VideoEngine,
     VideoRuntimeError,
     _resolve_ffmpeg,
@@ -45,7 +46,7 @@ def test_ltx23_alias_routes_to_video_lane() -> None:
 
 
 def test_ltx23_model_discovery_is_video_shaped() -> None:
-    from vllm_mlx.routes.models import _build_model_info
+    from rapid_mlx.routes.models import _build_model_info
 
     info = _build_model_info("ltx-2.3-mlx-q4")
     assert info.modality == "video-gen"
@@ -64,18 +65,17 @@ def test_invalid_video_reference_image_is_rejected(tmp_path: Path) -> None:
 
 
 def test_video_runtime_preflight_fails_before_download(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(video_lane.sys, "version_info", (3, 11))
     monkeypatch.setattr("importlib.util.find_spec", lambda _: None)
     monkeypatch.setattr("shutil.which", lambda _: None)
     monkeypatch.setattr(video_lane, "_FFMPEG_FALLBACK_PATHS", ())
 
-    with pytest.raises(SystemExit) as exc:
+    with pytest.raises(OptionalRuntimeMissing) as exc:
         require_video_runtime_or_exit()
 
-    assert exc.value.code == 2
-    error = capsys.readouterr().err
+    error = exc.value.format_user_message()
     assert "rapid-mlx[video]" in error
     assert "brew install ffmpeg" in error
 
@@ -93,6 +93,37 @@ def test_ffmpeg_resolver_uses_homebrew_fallback_when_path_is_missing(
     monkeypatch.setattr(video_lane, "_FFMPEG_FALLBACK_PATHS", (homebrew_link,))
 
     assert _resolve_ffmpeg() == str(homebrew_link)
+
+
+def test_ffmpeg_resolver_uses_binary_from_declared_video_extra(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundled = tmp_path / "ffmpeg-macos-aarch64"
+    bundled.write_bytes(b"#!/bin/sh\n")
+    bundled.chmod(0o755)
+    monkeypatch.delenv("FFMPEG_BINARY", raising=False)
+    monkeypatch.setattr(video_lane.shutil, "which", lambda _: None)
+    monkeypatch.setattr(video_lane, "_FFMPEG_FALLBACK_PATHS", ())
+    imageio_ffmpeg = ModuleType("imageio_ffmpeg")
+    imageio_ffmpeg.get_ffmpeg_exe = lambda: str(bundled)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "imageio_ffmpeg", imageio_ffmpeg)
+
+    assert _resolve_ffmpeg() == str(bundled)
+
+
+def test_ffmpeg_resolver_rejects_unusable_video_extra_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundled = tmp_path / "ffmpeg-macos-aarch64"
+    bundled.write_bytes(b"not executable")
+    monkeypatch.delenv("FFMPEG_BINARY", raising=False)
+    monkeypatch.setattr(video_lane.shutil, "which", lambda _: None)
+    monkeypatch.setattr(video_lane, "_FFMPEG_FALLBACK_PATHS", ())
+    imageio_ffmpeg = ModuleType("imageio_ffmpeg")
+    imageio_ffmpeg.get_ffmpeg_exe = lambda: str(bundled)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "imageio_ffmpeg", imageio_ffmpeg)
+
+    assert _resolve_ffmpeg() is None
 
 
 def test_ffmpeg_resolver_honors_executable_override(
@@ -169,7 +200,7 @@ def test_video_remux_uses_resolved_ffmpeg_absolute_path(
 
 
 def test_video_runtime_preflight_reports_python_311_floor(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class Python310(tuple):
         major = 3
@@ -177,11 +208,10 @@ def test_video_runtime_preflight_reports_python_311_floor(
 
     monkeypatch.setattr(video_lane.sys, "version_info", Python310((3, 10, 0)))
 
-    with pytest.raises(SystemExit) as exc:
+    with pytest.raises(OptionalRuntimeMissing) as exc:
         require_video_runtime_or_exit()
 
-    assert exc.value.code == 2
-    error = capsys.readouterr().err
+    error = exc.value.format_user_message()
     assert "requires Python 3.11 or newer" in error
     assert "current: 3.10" in error
 
@@ -199,7 +229,7 @@ def test_video_extra_marks_every_dependency_python_311_or_newer() -> None:
 
 @pytest.mark.asyncio
 async def test_video_multipart_gate_authenticates_before_reading_body() -> None:
-    from vllm_mlx.config import get_config
+    from rapid_mlx.config import get_config
 
     cfg = get_config()
     saved_key = cfg.api_key
@@ -239,7 +269,7 @@ async def test_video_multipart_gate_authenticates_before_reading_body() -> None:
 
 @pytest.mark.asyncio
 async def test_video_multipart_gate_rejects_content_length_before_read() -> None:
-    from vllm_mlx.config import get_config
+    from rapid_mlx.config import get_config
 
     cfg = get_config()
     saved_key = cfg.api_key
@@ -286,7 +316,7 @@ async def test_video_multipart_gate_rejects_content_length_before_read() -> None
 async def test_video_multipart_gate_caps_chunked_body(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm_mlx.config import get_config
+    from rapid_mlx.config import get_config
 
     cfg = get_config()
     saved_key = cfg.api_key
@@ -335,7 +365,7 @@ async def test_video_multipart_gate_emits_one_413_through_starlette(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The streaming cap must reject outside Starlette's 500 handler."""
-    from vllm_mlx.config import get_config
+    from rapid_mlx.config import get_config
 
     cfg = get_config()
     saved_key = cfg.api_key
@@ -390,8 +420,8 @@ async def test_video_multipart_gate_emits_one_413_through_starlette(
 
 
 def test_serve_dispatches_video_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vllm_mlx import cli
-    from vllm_mlx.runtime import video_lane
+    from rapid_mlx import cli
+    from rapid_mlx.runtime import video_lane
 
     class PreflightReachedError(RuntimeError):
         pass

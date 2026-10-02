@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+import builtins
+import sys
 from types import SimpleNamespace
 
 import pytest
 
-from vllm_mlx.patches.glm5_next_runtime import (
+from rapid_mlx.patches.glm5_next_runtime import (
+    _install_quantized_lm_head_sanitize,
     _keep_glm5_next_fp32,
     _projection_quantization_is_homogeneous,
 )
@@ -23,6 +26,49 @@ class _Quantized:
         self.group_size = group_size
         self.bits = bits
         self.mode = mode
+
+
+@pytest.mark.requires_mlx
+def test_moe_fusion_declines_uninspectable_call_contract() -> None:
+    from rapid_mlx import moe_fusion
+
+    class UninspectableSwitchGLU:
+        __call__ = 1
+
+    assert not moe_fusion._supports_fused_call_contract(UninspectableSwitchGLU)
+
+
+@pytest.mark.requires_mlx
+def test_moe_family_discovery_survives_optional_import_failure(monkeypatch) -> None:
+    from rapid_mlx import moe_fusion
+
+    real_import = builtins.__import__
+
+    def import_without_mlx_lm_switch(name, *args, **kwargs):
+        if name == "mlx_lm.models.switch_layers":
+            raise ImportError("simulated optional dependency failure")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_mlx_lm_switch)
+    monkeypatch.delitem(sys.modules, "mlx_vlm.models.switch_layers", raising=False)
+
+    assert moe_fusion._switch_layer_families() == ()
+
+
+@pytest.mark.requires_mlx
+def test_moe_family_discovery_ignores_incomplete_vlm_module(monkeypatch) -> None:
+    from rapid_mlx import moe_fusion
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_vlm.models.switch_layers",
+        SimpleNamespace(),
+    )
+
+    families = moe_fusion._switch_layer_families()
+    assert any(
+        family[1].__module__ == "mlx_lm.models.switch_layers" for family in families
+    )
 
 
 def test_kda_projection_fusion_requires_one_quantization() -> None:
@@ -46,13 +92,60 @@ def test_fp32_state_allowlist_is_narrow() -> None:
 
 
 @pytest.mark.requires_mlx
+def test_quantized_lm_head_sanitize_remaps_every_tensor() -> None:
+    from mlx_vlm.models.glm5_next import glm5_next
+
+    model = glm5_next.Model
+    original = model.sanitize
+    marker = getattr(model, "_RAPID_QUANTIZED_LM_HEAD_SANITIZE", None)
+    marker_existed = hasattr(model, "_RAPID_QUANTIZED_LM_HEAD_SANITIZE")
+    captured = {}
+
+    def released_sanitize(_self, weights):
+        captured.update(weights)
+        return weights
+
+    try:
+        model.sanitize = released_sanitize
+        if marker_existed:
+            del model._RAPID_QUANTIZED_LM_HEAD_SANITIZE
+        assert _install_quantized_lm_head_sanitize() is True
+        assert _install_quantized_lm_head_sanitize() is False
+        result = model.sanitize(
+            object(),
+            {
+                "lm_head.weight": "weight",
+                "lm_head.scales": "scales",
+                "lm_head.biases": "biases",
+                "vision_tower.weight": "vision",
+            },
+        )
+        assert result == {
+            "language_model.lm_head.weight": "weight",
+            "language_model.lm_head.scales": "scales",
+            "language_model.lm_head.biases": "biases",
+            "vision_tower.weight": "vision",
+        }
+        assert captured == result
+    finally:
+        model.sanitize = original
+        if marker_existed:
+            model._RAPID_QUANTIZED_LM_HEAD_SANITIZE = marker
+        elif hasattr(model, "_RAPID_QUANTIZED_LM_HEAD_SANITIZE"):
+            del model._RAPID_QUANTIZED_LM_HEAD_SANITIZE
+
+
+@pytest.mark.requires_mlx
 def test_installer_applies_glm_math_without_changing_shared_models() -> None:
     import mlx.core as mx
     import mlx.nn as nn
     from mlx_vlm.models.deepseek_v32 import language as deepseek_language
     from mlx_vlm.models.glm5_next import language
 
-    from vllm_mlx.patches import glm5_next_runtime as patch
+    from rapid_mlx.patches import glm5_next_runtime as patch
+
+    if patch._has_native_glm5_next_runtime(language):
+        pytest.skip("the pinned runtime already owns the corrected GLM math")
 
     def config(*, attention="linear_attention", mlp="sparse"):
         return language.TextConfig(
@@ -202,7 +295,7 @@ def test_installer_applies_glm_math_without_changing_shared_models() -> None:
 def test_installer_respects_runtime_that_is_already_patched() -> None:
     from mlx_vlm.models.glm5_next import language
 
-    from vllm_mlx.patches import glm5_next_runtime as patch
+    from rapid_mlx.patches import glm5_next_runtime as patch
 
     marker = getattr(language, "_RAPID_MLX_RUNTIME_FIX_INSTALLED", None)
     marker_existed = hasattr(language, "_RAPID_MLX_RUNTIME_FIX_INSTALLED")
@@ -212,6 +305,75 @@ def test_installer_respects_runtime_that_is_already_patched() -> None:
         assert patch.install_glm5_next_runtime_fix() is False
         assert patch.is_installed() is True
     finally:
+        if marker_existed:
+            language._RAPID_MLX_RUNTIME_FIX_INSTALLED = marker
+        else:
+            del language._RAPID_MLX_RUNTIME_FIX_INSTALLED
+        patch._INSTALLED = False
+
+
+def test_native_runtime_probe_requires_the_complete_new_class_family() -> None:
+    from rapid_mlx.patches.glm5_next_runtime import _has_native_glm5_next_runtime
+
+    complete = SimpleNamespace(
+        Glm5NextAttention=object,
+        Glm5NextLinearAttention=object,
+        Glm5NextMLP=object,
+        Glm5NextMoE=object,
+        LanguageModel=type(
+            "LanguageModel",
+            (),
+            {
+                "cast_predicate": property(lambda self: None),
+                "sanitize": lambda self, weights: weights,
+            },
+        ),
+    )
+
+    assert _has_native_glm5_next_runtime(complete)
+    del complete.Glm5NextMoE
+    assert not _has_native_glm5_next_runtime(complete)
+    complete.Glm5NextMoE = object
+    complete.Glm5NextSparseAttention = object
+    assert not _has_native_glm5_next_runtime(complete)
+
+
+@pytest.mark.requires_mlx
+def test_installer_defers_to_complete_native_runtime() -> None:
+    from mlx_vlm.models.glm5_next import language
+
+    from rapid_mlx.patches import glm5_next_runtime as patch
+
+    native_names = (
+        "Glm5NextAttention",
+        "Glm5NextLinearAttention",
+        "Glm5NextMLP",
+        "Glm5NextMoE",
+    )
+    missing = object()
+    saved = {name: getattr(language, name, missing) for name in native_names}
+    sparse_attention = getattr(language, "Glm5NextSparseAttention", missing)
+    marker = getattr(language, "_RAPID_MLX_RUNTIME_FIX_INSTALLED", None)
+    marker_existed = hasattr(language, "_RAPID_MLX_RUNTIME_FIX_INSTALLED")
+    patch._INSTALLED = False
+
+    try:
+        if sparse_attention is not missing:
+            del language.Glm5NextSparseAttention
+        for name in native_names:
+            setattr(language, name, object)
+
+        assert patch.install_glm5_next_runtime_fix() is False
+        assert patch.is_installed() is True
+        assert language._RAPID_MLX_RUNTIME_FIX_INSTALLED is True
+    finally:
+        if sparse_attention is not missing:
+            language.Glm5NextSparseAttention = sparse_attention
+        for name, value in saved.items():
+            if value is missing:
+                delattr(language, name)
+            else:
+                setattr(language, name, value)
         if marker_existed:
             language._RAPID_MLX_RUNTIME_FIX_INSTALLED = marker
         else:

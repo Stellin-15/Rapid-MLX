@@ -48,6 +48,12 @@ Create `mcp.json`:
 }
 ```
 
+When the [Rapid Agent Runtime](agent-runtime.md) may execute MCP tools, declare
+only exact namespaced tools known to be side-effect-free in
+that server's `agent_read_only_tools`. Every undeclared MCP tool pauses for per-call approval;
+Rapid deliberately does not infer safety from a name such as `get_*` or
+`read_*`.
+
 ### 2. Start Server with MCP
 
 ```bash
@@ -350,7 +356,7 @@ For development only, you can bypass security validation:
 To add custom commands to the whitelist programmatically:
 
 ```python
-from vllm_mlx.mcp import MCPCommandValidator, set_validator
+from rapid_mlx.mcp import MCPCommandValidator, set_validator
 
 # Add custom commands
 validator = MCPCommandValidator(
@@ -390,7 +396,7 @@ Tools matching these patterns trigger security warnings:
 ### Custom Sandbox Configuration
 
 ```python
-from vllm_mlx.mcp import ToolSandbox, set_sandbox
+from rapid_mlx.mcp import ToolSandbox, set_sandbox
 
 # Create sandbox with custom settings
 sandbox = ToolSandbox(
@@ -412,7 +418,7 @@ set_sandbox(sandbox)
 ### Accessing Audit Logs
 
 ```python
-from vllm_mlx.mcp import get_sandbox
+from rapid_mlx.mcp import get_sandbox
 
 sandbox = get_sandbox()
 

@@ -53,7 +53,7 @@ import SwiftUI
 ///   * A short install + chat path for the brand-new user.
 ///   * A dedicated "Quickstart" picker section after onboarding.
 ///
-/// The alias resolves in ``vllm_mlx/aliases.json`` (rapid-mlx submodule)
+/// The alias resolves in ``rapid_mlx/aliases.json`` (rapid-mlx submodule)
 /// so the value is pinned, not derived. Bumping it is a deliberate
 /// product decision — change the constant + re-run the model
 /// recommendation tests. Air-gapped bundled builds keep their independently
@@ -97,7 +97,7 @@ struct QuickstartModelChoice: Equatable, Identifiable, Sendable {
     }
 
     var id: String { alias }
-    /// Canonical alias resolved in ``vllm_mlx/aliases.json``.
+    /// Canonical alias resolved in ``rapid_mlx/aliases.json``.
     let alias: String
     /// Prose label for onboarding copy (for example, "Qwen 3.5 · 4B"). Hand-picked
     /// rather than catalog-derived so the copy never reads a raw alias.
@@ -401,6 +401,14 @@ final class QuickstartCoordinator {
     /// Pre-2026-08-05 completion flag. Read-only — nothing writes it any
     /// more; it exists so a user who dismissed under v1 stays dismissed.
     static let legacyStorageKey: String = "rapid.quickstart.v1.done"
+
+    /// Durable evidence that this installation used Rapid before the current
+    /// onboarding presentation. Unlike the completion keys, this is never
+    /// cleared by Settings → Run guided setup again: that path may re-show the
+    /// UI, but it must never turn an existing installation into a first-run
+    /// analytics cohort. Existing installs migrate from completion, served-
+    /// model, or chat-history evidence at coordinator initialization.
+    static let priorUseStorageKey: String = "rapid.quickstart.v1.priorUse"
 
     /// Welcome message seeded into the active session after the sidecar
     /// comes online, so the user always lands in chat with a friendly
@@ -781,6 +789,18 @@ Open the picker any time to switch models.
     /// Snapshot of ``legacyStorageKey`` taken at init. Never written.
     let legacyDone: Bool
 
+    /// Stable first-run discriminator for the anonymous Desktop funnel.
+    /// `false` means there was no app-owned evidence of prior use when this
+    /// coordinator was created. It becomes true on completion or reset and is
+    /// intentionally independent of the resettable onboarding eligibility.
+    private(set) var hasPriorUse: Bool
+
+    /// Process-only capability for milestones caused by this install's genuine
+    /// first-run flow. It deliberately lives with the coordinator so a SwiftUI
+    /// remount cannot manufacture or accidentally preserve eligibility.
+    @ObservationIgnored
+    private(set) var desktopFunnelFlowToken: DesktopFunnelReporter.FlowToken?
+
     /// True once the seeded assistant message has been appended to the
     /// active session. Stops ``markReady`` from double-seeding when the
     /// observation pipeline fires multiple ``.ready`` transitions for
@@ -931,17 +951,33 @@ Open the picker any time to switch models.
     /// unchanged.
     private let defaults: UserDefaults
 
-    init(defaults: UserDefaults = .standard) {
+    init(
+        defaults: UserDefaults = .standard,
+        hasChatHistory: Bool = false,
+        hadPreviousLaunch: Bool = false
+    ) {
+        let storedDone = defaults.bool(forKey: Self.storageKey)
+        let storedLegacyDone = defaults.bool(forKey: Self.legacyStorageKey)
+        let storedSetupBegun = defaults.bool(forKey: Self.setupBegunKey)
+        let storedPriorUse = defaults.bool(forKey: Self.priorUseStorageKey)
+            || storedDone
+            || storedLegacyDone
+            || storedSetupBegun
+            || hadPreviousLaunch
+            || ServerManager.lastServedAlias(defaults: defaults) != nil
+            || hasChatHistory
         self.defaults = defaults
         self.baselineStarterAlias = defaults.string(forKey: Self.baselineStarterAliasKey)
             ?? Self.defaultChoice.alias
-        self.done = defaults.bool(forKey: Self.storageKey)
-        self.legacyDone = defaults.bool(forKey: Self.legacyStorageKey)
+        self.done = storedDone
+        self.legacyDone = storedLegacyDone
+        self.hasPriorUse = storedPriorUse
+        self.desktopFunnelFlowToken = nil
         // History only. Nothing below reconstructs a phase, a selection or a
         // job from it — a relaunch always starts at ``.idle``, which is what
         // makes "never restore a fake active transfer" true by construction
         // rather than by remembering to avoid it.
-        self.setupBegun = defaults.bool(forKey: Self.setupBegunKey)
+        self.setupBegun = storedSetupBegun
         // Codex r5: read the persisted awaiting-seed flag so a
         // quit-mid-deferred-flow relaunch can resume the welcome
         // injection once an active session lands. (Assigning a stored
@@ -970,6 +1006,9 @@ Open the picker any time to switch models.
             self.selectionUsesAutomaticPolicy = false
             self.stage = .chooseModel
         }
+        if storedPriorUse {
+            defaults.set(true, forKey: Self.priorUseStorageKey)
+        }
     }
 
     /// Resolve a wizard choice from a persisted alias — used to restore
@@ -997,12 +1036,27 @@ Open the picker any time to switch models.
     func markDone() {
         done = true
         defaults.set(true, forKey: Self.storageKey)
+        hasPriorUse = true
+        defaults.set(true, forKey: Self.priorUseStorageKey)
         // Setup is finished, so there is no unfinished setup to resume.
         // Retired rather than left set: ``isResumingIncompleteSetup`` already
         // guards on ``done``, but a stale true here would come back to life if
         // a future ``storageKey`` bump ever re-opened onboarding, and offer to
         // "continue" a run that completed on an older version.
         setupBegun = false
+    }
+
+    func enrollDesktopFunnelFlowIfNeeded() -> DesktopFunnelReporter.FlowToken? {
+        guard !hasPriorUse else {
+            desktopFunnelFlowToken = nil
+            return nil
+        }
+        if desktopFunnelFlowToken == nil {
+            desktopFunnelFlowToken = DesktopFunnelReporter.beginFirstRunFlow(
+                isFirstRun: true
+            )
+        }
+        return desktopFunnelFlowToken
     }
 
     /// Put the wizard back to the state a Mac has before it has ever run.
@@ -1017,6 +1071,12 @@ Open the picker any time to switch models.
     /// true first-run state must stop the server too; ``ReonboardingReset``
     /// does exactly that.
     internal func resetForReonboarding() {
+        // Re-showing setup is not a new install. Record that fact before the
+        // reset clears the completion and served-model signals from which it
+        // would otherwise be inferred on the next launch.
+        hasPriorUse = true
+        desktopFunnelFlowToken = nil
+        defaults.set(true, forKey: Self.priorUseStorageKey)
         done = false
         phase = .idle
         stage = .welcome
@@ -1436,6 +1496,7 @@ Open the picker any time to switch models.
 /// ``QuickstartCoordinator`` reports the surface should show.
 struct QuickstartView: View {
     @Environment(SettingsRouter.self) private var settingsRouter
+    @AppStorage(ContentView.showLogsKey) private var showLogs = false
 
     /// The ONLY mechanism that opens this app's Settings. It declares a real
     /// ``Window("Settings", id: "settings")`` and no SwiftUI ``Settings``
@@ -1494,6 +1555,13 @@ struct QuickstartView: View {
     /// view lifetime. The parked warning remains owned by ServerManager; this
     /// handle exists solely to propagate SwiftUI teardown cancellation.
     @State private var foregroundMemoryRefreshTask: Task<Void, Never>?
+
+    /// Exists only for the genuinely new-install flow that created the local
+    /// cohort marker in this process. A later guided-setup run never receives
+    /// it, even when this install belongs to the historical cohort.
+    private var activeFunnelFlowToken: DesktopFunnelReporter.FlowToken? {
+        coordinator.hasPriorUse ? nil : coordinator.desktopFunnelFlowToken
+    }
 
     /// First-run setup should present a decision, not mirror every cached
     /// quantization of that decision.  Sibling variants stay reachable behind
@@ -1562,6 +1630,11 @@ struct QuickstartView: View {
                     hardware: hardware,
                     catalog: catalogLoaded ? cachedModels : []
                 )
+            }
+            .onAppear {
+                if let token = coordinator.enrollDesktopFunnelFlowIfNeeded() {
+                    DesktopFunnelReporter.enqueueOnboardingShown(flowToken: token)
+                }
             }
             // Observe serve transitions so we can flip to ``.ready`` (and
             // seed the welcome message) as soon as the sidecar comes
@@ -2464,10 +2537,19 @@ struct QuickstartView: View {
                     }
 
                     ForEach(list.starters) { choice in
+                        let cached = Self.cachedModel(
+                            alias: choice.alias,
+                            cachedModels: cachedModels
+                        )
                         QuickstartRecommendedCard(
                             choice: choice,
                             selected: coordinator.selection.alias == choice.alias,
-                            sizeText: Self.sizeText(for: choice),
+                            sizeText: Self.shortlistSizeText(
+                                for: choice,
+                                cached: cached,
+                                recommendedForPhysicalRAMGB: nil
+                            ),
+                            isCached: cached != nil,
                             onActivate: { activatePrimary(in: .shortlist) }
                         ) { coordinator.select(choice) }
                     }
@@ -2480,13 +2562,19 @@ struct QuickstartView: View {
                         )
                         .padding(.top, 14)
                         ForEach(list.recommended) { choice in
+                            let cached = Self.cachedModel(
+                                alias: choice.alias,
+                                cachedModels: cachedModels
+                            )
                             QuickstartCompactCard(
                                 choice: choice,
                                 selected: coordinator.selection.alias == choice.alias,
-                                sizeText: Self.sizeText(
-                                    forRecommended: choice,
-                                    physicalRAMGB: hardware.physicalRAMGB
+                                sizeText: Self.shortlistSizeText(
+                                    for: choice,
+                                    cached: cached,
+                                    recommendedForPhysicalRAMGB: hardware.physicalRAMGB
                                 ),
+                                isCached: cached != nil,
                                 onActivate: { activatePrimary(in: .shortlist) }
                             ) { coordinator.select(choice) }
                         }
@@ -2496,10 +2584,19 @@ struct QuickstartView: View {
                         OnboardingGroupLabel(text: "NEED THE LIGHTEST OPTION?")
                             .padding(.top, 14)
                         ForEach(list.lowMemory) { choice in
+                            let cached = Self.cachedModel(
+                                alias: choice.alias,
+                                cachedModels: cachedModels
+                            )
                             QuickstartLowMemoryCard(
                                 choice: choice,
                                 selected: coordinator.selection.alias == choice.alias,
-                                sizeText: Self.sizeText(for: choice),
+                                sizeText: Self.shortlistSizeText(
+                                    for: choice,
+                                    cached: cached,
+                                    recommendedForPhysicalRAMGB: nil
+                                ),
+                                isCached: cached != nil,
                                 onActivate: { activatePrimary(in: .shortlist) }
                             ) { coordinator.select(choice) }
                         }
@@ -3059,10 +3156,19 @@ struct QuickstartView: View {
         OnboardingIntrinsicColumn {
             VStack(alignment: .leading, spacing: 10) {
                 ForEach(list.starters) { choice in
+                    let cached = Self.cachedModel(
+                        alias: choice.alias,
+                        cachedModels: cachedModels
+                    )
                     QuickstartRecommendedCard(
                         choice: choice,
                         selected: coordinator.selection.alias == choice.alias,
-                        sizeText: Self.sizeText(for: choice),
+                        sizeText: Self.shortlistSizeText(
+                            for: choice,
+                            cached: cached,
+                            recommendedForPhysicalRAMGB: nil
+                        ),
+                        isCached: cached != nil,
                         onActivate: { activatePrimary(in: .review) }
                     ) { coordinator.select(choice) }
                 }
@@ -3074,13 +3180,19 @@ struct QuickstartView: View {
                     )
                     .padding(.top, 14)
                     ForEach(list.recommended) { choice in
+                        let cached = Self.cachedModel(
+                            alias: choice.alias,
+                            cachedModels: cachedModels
+                        )
                         QuickstartCompactCard(
                             choice: choice,
                             selected: coordinator.selection.alias == choice.alias,
-                            sizeText: Self.sizeText(
-                                forRecommended: choice,
-                                physicalRAMGB: hardware.physicalRAMGB
+                            sizeText: Self.shortlistSizeText(
+                                for: choice,
+                                cached: cached,
+                                recommendedForPhysicalRAMGB: hardware.physicalRAMGB
                             ),
+                            isCached: cached != nil,
                             onActivate: { activatePrimary(in: .review) }
                         ) { coordinator.select(choice) }
                     }
@@ -3089,10 +3201,19 @@ struct QuickstartView: View {
                     OnboardingGroupLabel(text: "NEED THE LIGHTEST OPTION?")
                         .padding(.top, 14)
                     ForEach(list.lowMemory) { choice in
+                        let cached = Self.cachedModel(
+                            alias: choice.alias,
+                            cachedModels: cachedModels
+                        )
                         QuickstartLowMemoryCard(
                             choice: choice,
                             selected: coordinator.selection.alias == choice.alias,
-                            sizeText: Self.sizeText(for: choice),
+                            sizeText: Self.shortlistSizeText(
+                                for: choice,
+                                cached: cached,
+                                recommendedForPhysicalRAMGB: nil
+                            ),
+                            isCached: cached != nil,
                             onActivate: { activatePrimary(in: .review) }
                         ) { coordinator.select(choice) }
                     }
@@ -3656,6 +3777,53 @@ struct QuickstartView: View {
             return sizeText(for: choice)
         }
         return recommendationSizeText(from: pick)
+    }
+
+    /// The size lane for a shortlist row, cached-aware.
+    ///
+    /// Every lane has to answer "download, or already here?" the same way.
+    /// Only the trade-up lane did. The cached shortlist is bounded to six
+    /// rows, so on a Mac holding more than six chat models the seventh is
+    /// rendered by one of the download-shaped lanes — which is how
+    /// `qwen3.6-35b-4bit` came to read "download 20 GB · 87%" on a Mac that
+    /// already held all 19.03 GB of it, three rows below an "ALREADY ON THIS
+    /// MAC" heading and beside a rail reading "Free space 6 GB". Following
+    /// that row cost a 20 GB download the user did not need and, at 6 GB
+    /// free, could not complete.
+    ///
+    /// A cached row keeps its capability percentage when it has one: being on
+    /// disk changes what it costs, not how capable it is.
+    ///
+    /// `recommendedForPhysicalRAMGB` is the RAM bucket for lanes that quote
+    /// the SSOT recommendation footprint, and `nil` for lanes that quote the
+    /// authored download size.
+    static func shortlistSizeText(
+        for choice: QuickstartModelChoice,
+        cached: ModelEntry?,
+        recommendedForPhysicalRAMGB physicalRAMGB: Double?
+    ) -> String {
+        let capability = physicalRAMGB.flatMap { gb in
+            RAMBucketedDefault.picks(forPhysicalRAMGB: gb)
+                .first { $0.alias == choice.alias }?
+                .capabilityPct
+        }
+        if let onDisk = cached?.sizeOnDisk, !onDisk.isEmpty {
+            guard let capability else { return onDisk }
+            return "\(onDisk) · \(capability)%"
+        }
+        // Cached, but we could not measure what it occupies. Falling through
+        // to the download estimate here is what codex caught on this PR: the
+        // caller has already decided this row is on this Mac, so the estimate
+        // would be rendered — and spoken — as an on-disk figure for a model
+        // that is not being downloaded at all. An unknown size is better said
+        // by saying nothing; the ON THIS MAC badge still carries the fact
+        // that matters, and the accessibility label already degrades to a
+        // bare "on disk" when the size text is empty.
+        // A percentage in the size slot would be spoken as "on disk 65%",
+        // which is the same defect one layer along, so say nothing at all.
+        if cached != nil { return "" }
+        guard let physicalRAMGB else { return sizeText(for: choice) }
+        return sizeText(forRecommended: choice, physicalRAMGB: physicalRAMGB)
     }
 
     /// Stable, bounded presentation for models already on disk. The catalogue
@@ -4300,16 +4468,27 @@ struct QuickstartView: View {
             message: message
         )
         let diagnosis = FailureDiagnoser.diagnosis(for: kind)
+        let startupFailure: SidecarStartupFailure? = {
+            guard case .crashed(let alias, _) = server.state,
+                  alias == coordinator.selection.alias else { return nil }
+            return server.startupFailure
+        }()
 
         OnboardingOutcomeBlock(
             glyph: Self.failureGlyph(for: kind),
             tone: kind.severity == .notice ? .amber : .error,
             kicker: Self.failureKicker(for: kind, origin: coordinator.step),
             title: Self.failureTitle(for: kind),
-            message: diagnosis.message
+            message: startupFailure?.message ?? diagnosis.message
         ) {
             OnboardingActionLane {
-                if let action = diagnosis.action {
+                if startupFailure != nil {
+                    Button("Open Startup Log") {
+                        showLogs = true
+                    }
+                    .buttonStyle(.onboardingPrimary)
+                    .accessibilityIdentifier("Quickstart.OpenStartupLog")
+                } else if let action = diagnosis.action {
                     Button(action.title) {
                         handleQuickstartFailureAction(action)
                     }
@@ -4527,22 +4706,34 @@ struct QuickstartView: View {
         switch action {
         case .switchDownloadSource:
             beginDownloadPhase()
+            let started: Bool
             if downloads.job(for: coordinator.selection.alias) != nil {
-                _ = downloads.retryDownload(
+                started = downloads.retryDownload(
                     alias: coordinator.selection.alias,
                     source: .huggingFace
                 )
             } else {
-                _ = downloads.startDownload(
+                started = downloads.startDownload(
                     alias: coordinator.selection.alias,
                     hfPath: coordinator.selection.hfRepo,
                     source: .huggingFace
                 )
             }
+            if started {
+                DesktopFunnelReporter.enqueue(
+                    .modelDownloadStarted,
+                    flowToken: activeFunnelFlowToken
+                )
+            }
         case .retry:
             if downloads.job(for: coordinator.selection.alias) != nil {
                 beginDownloadPhase()
-                _ = downloads.retryDownload(alias: coordinator.selection.alias)
+                if downloads.retryDownload(alias: coordinator.selection.alias) {
+                    DesktopFunnelReporter.enqueue(
+                        .modelDownloadStarted,
+                        flowToken: activeFunnelFlowToken
+                    )
+                }
             } else {
                 startQuickstart()
             }
@@ -4653,7 +4844,7 @@ struct QuickstartView: View {
         )
         Task { @MainActor in
             await coordinator.afterSkippingDownloadBeat(duration: Self.skippingDownloadBeat) {
-                await server.start(
+                await startFirstOnboardingEngine(
                     alias: cached.alias,
                     hfPath: cached.hfRepo,
                     catalogEntryHint: catalogEntryHint
@@ -4667,6 +4858,30 @@ struct QuickstartView: View {
     /// constant (rather than an inline literal) so the test suite can assert
     /// on it directly instead of re-deriving "long enough to read".
     static let skippingDownloadBeat: Duration = .milliseconds(650)
+
+    /// The only engine lifecycle eligible for funnel reporting is the first
+    /// start kicked off by onboarding itself. The causal token exists only for
+    /// this awaited call and is consumed by its first matching terminal state;
+    /// a later retry/restart/model switch therefore cannot inherit eligibility.
+    private func startFirstOnboardingEngine(
+        alias: String,
+        hfPath: String? = nil,
+        catalogEntryHint: ServerManager.CatalogEntryHint? = nil
+    ) async {
+        let token = DesktopFunnelReporter.armOnboardingEngineAttempt(
+            alias: alias,
+            flowToken: activeFunnelFlowToken
+        )
+        defer {
+            if let token { DesktopFunnelReporter.disarmOnboardingEngineAttempt(token) }
+        }
+        await server.start(
+            alias: alias,
+            hfPath: hfPath,
+            catalogEntryHint: catalogEntryHint,
+            onboardingEngineAttemptToken: token
+        )
+    }
 
     /// Pure adapter mapping a ``DiskSpaceProbe.Decision`` onto the
     /// Quickstart coordinator + kickoff closure. Lifted out of
@@ -4711,6 +4926,12 @@ struct QuickstartView: View {
             hfPath: coordinator.selection.hfRepo,
             totalBytes: coordinator.selection.downloadBytes
         )
+        if started {
+            DesktopFunnelReporter.enqueue(
+                .modelDownloadStarted,
+                flowToken: activeFunnelFlowToken
+            )
+        }
         // ``startDownload`` returns ``false`` either because the
         // binary is missing (the synthetic ``.failed`` job already
         // landed and our ``.task(id:)`` observer will pick it up) or
@@ -4727,6 +4948,10 @@ struct QuickstartView: View {
         case .running:
             return
         case .completed:
+            DesktopFunnelReporter.enqueue(
+                .modelDownloadCompleted,
+                flowToken: activeFunnelFlowToken
+            )
             // Codex r2 BLOCKING: if the server is already engaged with
             // a DIFFERENT alias (user used the still-visible picker
             // mid-download), don't fire ``server.start(gemma...)`` —
@@ -4759,7 +4984,7 @@ struct QuickstartView: View {
                 )
             }
             Task { @MainActor in
-                await server.start(
+                await startFirstOnboardingEngine(
                     alias: coordinator.selection.alias,
                     hfPath: coordinator.selection.hfRepo,
                     catalogEntryHint: catalogEntryHint
@@ -4777,6 +5002,10 @@ struct QuickstartView: View {
                 origin: .download
             )
         case .failed(let message):
+            DesktopFunnelReporter.enqueue(
+                .modelDownloadFailed,
+                flowToken: activeFunnelFlowToken
+            )
             enterRecovery(
                 kind: job.failureKind ?? FailureDiagnoser.downloadFailureKind(
                     raw: message,
@@ -4802,10 +5031,17 @@ struct QuickstartView: View {
     private func enterRecovery(
         kind: FailureDiagnosis.Kind,
         message: String,
-        origin: QuickstartCoordinator.FailureOrigin
+        origin: QuickstartCoordinator.FailureOrigin,
+        startupFailure: SidecarStartupFailure? = nil
     ) {
         coordinator.enterFailed(message: message, origin: origin)
-        VoiceOverAnnouncer.announce(Self.recoveryAnnouncement(for: kind))
+        if let startupFailure {
+            VoiceOverAnnouncer.announce(
+                "Quickstart didn't finish. \(startupFailure.message) Action: Open Startup Log."
+            )
+        } else {
+            VoiceOverAnnouncer.announce(Self.recoveryAnnouncement(for: kind))
+        }
     }
 
     private func handleServerStateChange() {
@@ -4862,8 +5098,10 @@ struct QuickstartView: View {
             // sending the user back through the download.
             enterRecovery(
                 kind: FailureDiagnoser.modelLoadFailureKind(raw: message),
-                message: QuickstartView.friendlyFailureMessage(raw: message),
-                origin: .start
+                message: server.startupFailure?.message
+                    ?? QuickstartView.friendlyFailureMessage(raw: message),
+                origin: .start,
+                startupFailure: server.startupFailure
             )
         }
     }

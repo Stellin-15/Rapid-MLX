@@ -5,10 +5,12 @@ import Testing
 /// Contracts for the built-in tool surface: what the registry exposes, what
 /// reaches the wire, and what is refused at dispatch.
 ///
-/// The three shipped tools (``web_search``, ``browse``, ``weather``) are all
+/// Three of the shipped tools (``web_search``, ``browse``, ``weather``) are
 /// network-facing, so the gates below are load-bearing rather than cosmetic:
 /// a tool stripped from the request body can STILL be named by a malformed
 /// model, and only the dispatch-side refusal stops it running.
+/// ``read_document`` reaches no network and no path — only documents the user
+/// attached — but is held to the same dispatch contract.
 @MainActor
 @Suite("Built-in tools")
 final class BuiltinToolsTests {
@@ -26,16 +28,20 @@ final class BuiltinToolsTests {
     private func makeRegistry() -> BuiltinToolRegistry {
         BuiltinToolRegistry(
             browseApproval: BrowseApprovalStore(defaults: freshDefaults()),
-            webSearch: WebSearchConfig(defaults: freshDefaults(), keychain: InMemoryKeychain())
+            webSearch: WebSearchConfig(defaults: freshDefaults(), keychain: InMemoryKeychain()),
+            localApproval: LocalToolApprovalStore(defaults: freshDefaults())
         )
     }
 
     // MARK: - Registry surface
 
-    @Test("Registry exposes exactly web_search, browse, and weather")
+    @Test("Registry exposes the online, attachment, and bounded local tools")
     func registryDefinitions() {
         let names = makeRegistry().definitions.map { $0.function.name }
-        #expect(names == ["web_search", "browse", "weather"])
+        #expect(names == [
+            "web_search", "browse", "weather", "read_document",
+            "local_search", "local_read", "local_write", "local_trash", "local_run",
+        ])
     }
 
     @Test("An unknown tool name returns an error result naming what IS available")
@@ -50,6 +56,7 @@ final class BuiltinToolsTests {
         #expect(result.content.contains("web_search"))
         #expect(result.content.contains("browse"))
         #expect(result.content.contains("weather"))
+        #expect(!result.executed)
     }
 
     @Test("Registry stamps the call id onto a result the tool produced without one")
@@ -82,6 +89,61 @@ final class BuiltinToolsTests {
         #expect(object["invented"] == nil)
     }
 
+    @Test("Native executor rejects unknown arguments for strict tool schemas")
+    func nativeExecutorEnforcesStrictSchema() {
+        let call = ToolCall(
+            id: "document_1",
+            name: "read_document",
+            arguments: #"{"document_id":"00000000-0000-0000-0000-000000000000","offset_len":117524}"#
+        )
+        #expect(NativeToolCallExecutor.normalized(
+            call,
+            for: ReadDocumentTool.definition
+        ) == nil)
+    }
+
+    /// A rejection the model cannot read is a rejection it repeats. The
+    /// executor used to answer every schema violation with "arguments must be
+    /// a JSON object matching the advertised schema", which names neither the
+    /// offending key nor the accepted ones — so a 4B model re-sent the same
+    /// `offset_len` call. Fail closed, but say what closed it.
+    @Test("A strict-schema rejection names the unknown key and the allowed ones")
+    func strictSchemaRejectionNamesKeys() throws {
+        switch NativeToolCallExecutor.normalize(
+            ToolCall(
+                id: "document_1",
+                name: "read_document",
+                arguments: #"{"document_id":"00000000-0000-0000-0000-000000000000","offset_len":117524}"#
+            ),
+            for: ReadDocumentTool.definition
+        ) {
+        case .success:
+            Issue.record("an unknown key must not normalize")
+        case .failure(let rejection):
+            #expect(rejection.reason.contains("offset_len"))
+            #expect(rejection.reason.contains("document_id, grep, mode, offset"))
+        }
+    }
+
+    @Test("An unbounded key list is truncated in the rejection text")
+    func strictSchemaRejectionBoundsItsEcho() throws {
+        let junk = (0..<9).map { "\"k\($0)\": 1" }.joined(separator: ",")
+        switch NativeToolCallExecutor.normalize(
+            ToolCall(
+                id: "document_2",
+                name: "read_document",
+                arguments: #"{"document_id":"x",\#(junk)}"#
+            ),
+            for: ReadDocumentTool.definition
+        ) {
+        case .success:
+            Issue.record("unknown keys must not normalize")
+        case .failure(let rejection):
+            #expect(rejection.reason.contains("…"))
+            #expect(!rejection.reason.contains("k8"))
+        }
+    }
+
     @Test("Native executor rejects non-object or malformed arguments generically")
     func nativeExecutorRejectsMalformedArguments() {
         #expect(NativeToolCallExecutor.normalized(
@@ -98,11 +160,13 @@ final class BuiltinToolsTests {
 
     @Test("A tool toggled off is stripped from the definitions sent to the model")
     func disabledToolIsStrippedFromWire() {
-        let vm = ChatViewModel(tools: makeRegistry(), toolDefaults: freshDefaults())
-        #expect(vm.enabledDefinitions.count == 3)
+        let registry = makeRegistry()
+        let total = registry.definitions.count
+        let vm = ChatViewModel(tools: registry, toolDefaults: freshDefaults())
+        #expect(vm.enabledDefinitions.count == total)
         vm.setToolEnabled("browse", false)
         #expect(!vm.enabledDefinitions.contains { $0.function.name == "browse" })
-        #expect(vm.enabledDefinitions.count == 2)
+        #expect(vm.enabledDefinitions.count == total - 1)
     }
 
     @Test("Tool toggles persist across a fresh view model on the same defaults")
@@ -120,6 +184,57 @@ final class BuiltinToolsTests {
     func unsetToolDefaultsToEnabled() {
         let vm = ChatViewModel(tools: makeRegistry(), toolDefaults: freshDefaults())
         #expect(vm.disabledTools.isEmpty)
+    }
+
+    @Test("Personal Intelligence projects only enabled agent-safe built-ins")
+    func personalIntelligenceToolProjection() {
+        let vm = ChatViewModel(tools: makeRegistry(), toolDefaults: freshDefaults())
+        #expect(vm.personalIntelligenceDefinitions.map { $0.function.name } == [
+            "web_search", "browse", "weather",
+            "local_search", "local_read", "local_write", "local_trash", "local_run",
+        ])
+
+        vm.setToolEnabled("browse", false)
+        #expect(vm.personalIntelligenceDefinitions.map { $0.function.name } == [
+            "web_search", "weather",
+            "local_search", "local_read", "local_write", "local_trash", "local_run",
+        ])
+    }
+
+    @Test("Personal Intelligence refuses invalid arguments before dispatch")
+    func personalIntelligenceRejectsInvalidArguments() async throws {
+        let vm = ChatViewModel(tools: makeRegistry(), toolDefaults: freshDefaults())
+        let action = try JSONDecoder().decode(
+            AgentPendingAction.self,
+            from: Data(#"{"call_id":"bad","name":"weather","arguments":{},"approval_summary":null,"risk":"read_only","approval_required":false}"#.utf8)
+        )
+
+        let result = await vm.executePersonalIntelligenceTool(
+            action,
+            advertised: vm.personalIntelligenceDefinitions
+        )
+
+        #expect(result.isError)
+        #expect(!result.executed)
+        #expect(result.content.contains("location"))
+    }
+
+    @Test("Personal Intelligence records a declined browse as unexecuted")
+    func personalIntelligenceRecordsDeclinedBrowse() async throws {
+        let registry = DeclinedBrowseRegistry()
+        let vm = ChatViewModel(tools: registry, toolDefaults: freshDefaults())
+        let action = try JSONDecoder().decode(
+            AgentPendingAction.self,
+            from: Data(#"{"call_id":"declined","name":"browse","arguments":{"url":"https://example.com"},"approval_summary":null,"risk":"read_only","approval_required":false}"#.utf8)
+        )
+
+        let result = await vm.executePersonalIntelligenceTool(
+            action,
+            advertised: registry.definitions
+        )
+
+        #expect(result.isError)
+        #expect(!result.executed)
     }
 
     // MARK: - Dispatch refusal
@@ -168,23 +283,40 @@ final class BuiltinToolsTests {
         let enabled = makeRegistry().definitions
         #expect(ChatViewModel.wireDefinitions(forAlias: "hermes3-8b-4bit", enabled: enabled).isEmpty)
         #expect(ChatViewModel.wireDefinitions(forAlias: "bonsai-8b-2bit", enabled: enabled).isEmpty)
-        #expect(ChatViewModel.wireDefinitions(forAlias: "qwen3.5-4b-4bit", enabled: enabled).count == 3)
+        // An alias outside the broken list passes every enabled tool through,
+        // whatever the registry's size (read_document joined the three web
+        // tools in this PR).
+        #expect(
+            ChatViewModel.wireDefinitions(forAlias: "qwen3.5-4b-4bit", enabled: enabled).count
+                == enabled.count
+        )
     }
 
     // MARK: - Ambient guidance
 
-    @Test("The anti-confabulation preamble rides along once a tool result is in play")
+    private static func toolTurn(_ text: String = "weather in Tokyo?") -> [ChatMessage] {
+        [
+            ChatMessage(role: .system, content: "[CURRENT DATE]\nToday is Friday.", status: .complete),
+            ChatMessage(role: .user, content: text, status: .complete),
+            ChatMessage(role: .assistant, toolCalls: [ToolCall(id: "w1", name: "weather", arguments: "{}")]),
+            ChatMessage(role: .tool, content: "{\"temp_c\": 29.2}", toolCallID: "w1"),
+        ]
+    }
+
+    @Test("The anti-confabulation guidance rides the newest user row once a tool result is in play")
     func ambientGuidanceGatedOnToolResult() {
-        let withResult = ChatViewModel.ambientSystemMessages(
-            historyOpensWithSystem: false,
-            toolsAdvertised: true,
-            toolResultPresent: true
-        )
-        #expect(withResult.count == 1)
-        #expect(withResult.first?.role == .system)
-        #expect(withResult.first?.content == ChatViewModel.toolGuidancePreamble)
-        #expect(withResult.first?.content.contains("state the reason written in that result") == true)
-        #expect(withResult.first?.content.contains("never claim the tool lacks a capability") == true)
+        let turn = Self.toolTurn()
+        let stamped = ChatViewModel.stampingToolGuidance(on: turn, toolsAdvertised: true)
+        // The system row is untouched: the guidance must never move the head
+        // of the prompt, or the engine re-prefills the whole conversation.
+        #expect(stamped[0] == turn[0])
+        #expect(stamped[1].content == "weather in Tokyo?")
+        #expect(stamped[1].wireSuffix == ChatViewModel.toolGuidance)
+        #expect(stamped[1].modelContent.hasSuffix(ChatViewModel.toolGuidance))
+        #expect(stamped[2] == turn[2])
+        #expect(stamped[3] == turn[3])
+        #expect(ChatViewModel.toolGuidance.contains("state the reason written in that result"))
+        #expect(ChatViewModel.toolGuidance.contains("never claim the tool lacks a capability"))
     }
 
     @Test("A tool merely being advertised does not summon the preamble (#1549)")
@@ -195,11 +327,8 @@ final class BuiltinToolsTests {
         // absent from "the tool result" was unknown to it — with no tool result
         // in context. The shipped starter answered "I don't have access to
         // current or external data" to *what is the capital of France?*.
-        #expect(ChatViewModel.ambientSystemMessages(
-            historyOpensWithSystem: false,
-            toolsAdvertised: true,
-            toolResultPresent: false
-        ).isEmpty)
+        let plain = Array(Self.toolTurn().prefix(2))
+        #expect(ChatViewModel.stampingToolGuidance(on: plain, toolsAdvertised: true) == plain)
     }
 
     @Test("A stale tool result cannot re-bind the model once the tool is gone")
@@ -208,11 +337,8 @@ final class BuiltinToolsTests {
         // tool in Settings. Re-asserting "your only source of truth is the tool
         // result" would then pin the model to a result it can no longer
         // refresh, which is the same failure wearing older evidence.
-        #expect(ChatViewModel.ambientSystemMessages(
-            historyOpensWithSystem: false,
-            toolsAdvertised: false,
-            toolResultPresent: true
-        ).isEmpty)
+        let turn = Self.toolTurn()
+        #expect(ChatViewModel.stampingToolGuidance(on: turn, toolsAdvertised: false) == turn)
     }
 
     @Test("A tool result only counts for the turn it belongs to")
@@ -248,14 +374,31 @@ final class BuiltinToolsTests {
         #expect(ChatViewModel.carriesToolResultForThisTurn([msg(.tool, "{}")]))
     }
 
-    @Test("No second system row is injected when the transcript already opens with one")
-    func ambientGuidanceDefersToExistingSystemRow() {
-        // Two competing system messages is a documented chat-template foot-gun.
-        #expect(ChatViewModel.ambientSystemMessages(
-            historyOpensWithSystem: true,
-            toolsAdvertised: true,
-            toolResultPresent: true
-        ).isEmpty)
+    @Test("The guidance never adds a row: the message count and the system row are unchanged")
+    func ambientGuidanceNeverAddsARow() {
+        // Two competing system messages is a documented chat-template
+        // foot-gun, and a new row anywhere would move the prompt bytes behind
+        // it. The guidance only extends the newest user row's wire trailer.
+        let turn = Self.toolTurn()
+        let stamped = ChatViewModel.stampingToolGuidance(on: turn, toolsAdvertised: true)
+        #expect(stamped.count == turn.count)
+        #expect(stamped.map(\.role) == turn.map(\.role))
+        #expect(stamped.filter { $0.role == .system } == turn.filter { $0.role == .system })
+    }
+}
+
+@MainActor
+private final class DeclinedBrowseRegistry: ToolRegistry {
+    let definitions = [BrowseTool.definition]
+
+    func run(_ call: ToolCall) async -> ToolCallResult {
+        ToolCallResult(
+            toolCallID: call.id,
+            content: "User declined to open this page.",
+            isError: true,
+            failureKind: .userDeclined,
+            executed: false
+        )
     }
 }
 
@@ -281,4 +424,28 @@ private final class InMemoryKeychain: KeychainStoring, @unchecked Sendable {
         store.removeValue(forKey: account)
         return true
     }
+    @Test("The rejected-key echo is bounded by scalars, not characters")
+    func rejectionEchoBoundsCombiningMarks() throws {
+        // Adversarial review round 11 (codex, blocking): `prefix(80)` counts
+        // grapheme clusters, so one cluster carrying thousands of combining
+        // marks was not bounded at all.
+        let zalgo = "k" + String(repeating: "\u{0301}", count: 20_000)
+        #expect(zalgo.count == 1)   // one grapheme cluster, 20_001 scalars
+        switch NativeToolCallExecutor.normalize(
+            ToolCall(
+                id: "document_1",
+                name: "read_document",
+                arguments: "{\"document_id\":\"00000000-0000-0000-0000-000000000000\",\"\(zalgo)\":1}"
+            ),
+            for: ReadDocumentTool.definition
+        ) {
+        case .success:
+            Issue.record("an unknown key must not normalize")
+        case .failure(let rejection):
+            // 80 scalars of key plus the surrounding copy — not 20 001.
+            #expect(rejection.reason.unicodeScalars.count < 400)
+            #expect(rejection.reason.contains("unknown argument(s)"))
+        }
+    }
+
 }

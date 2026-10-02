@@ -34,7 +34,7 @@ override used to measure the off baseline:
 
 ```bash
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
-python3.12 -m vllm_mlx.cli serve MODEL_SNAPSHOT \
+python3.12 -m rapid_mlx.cli serve MODEL_SNAPSHOT \
   --served-model-name qwen3.8-flash-next-4bit \
   --host 127.0.0.1 --port 8465 --no-thinking --no-mllm \
   --speculative-config '{"method":"mtp","disable_auto_k":true}'
@@ -100,3 +100,9 @@ number were rejected by the target and rolled back without changing output.
 This evidence does not qualify sampled/non-greedy PLD, other model families, or
 continuous multi-request speculation. Those routes remain on their existing
 decoders until they have independent correctness and performance evidence.
+
+Sampled PLD has since been qualified for a different family on its own
+evidence — see `2026-09-13-qwen38-copy-draft-sampled.md`. Qwen4 Flash-Next is
+unaffected and stays greedy-only: the policy above declares no sampled route,
+and that declaration is per family precisely so one family's measurements
+cannot enable another's.

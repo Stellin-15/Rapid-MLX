@@ -101,7 +101,7 @@ ROUTING_WRITE_ALLOWED_FUNCS: frozenset[str] = frozenset(
 # Codex round-D fix (PR #409): canonical module path(s) for each
 # non-constructor allowlist entry. A function may write routing
 # attributes only if it lives in one of the listed files (paths are
-# relative to ``vllm_mlx/``). Adding a new canonical location requires
+# relative to ``rapid_mlx/``). Adding a new canonical location requires
 # an explicit edit + PR review.
 ROUTING_WRITE_ALLOWED_LOCATIONS: dict[str, frozenset[str]] = {
     "load_model": frozenset({"server.py"}),
@@ -123,11 +123,21 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # interpreter is inspected; it does not route a request or mutate server
         # behavior. Invalid values are ignored by doctor.
         "RAPID_MLX_RUNTIME_PYTHON",
+        # Loopback-only test override for the telemetry endpoint. A non-loopback
+        # value is ignored, so it cannot route telemetry to a third party.
+        "RAPID_MLX_POSTHOG_URL",
+        # Process-internal readiness handoff: carries an inherited fd number for
+        # the one-shot readiness token. It is set only by the parent for its own
+        # child and is not user-facing.
+        "RAPID_MLX_LTX25_READY_FD",
         "RAPID_MLX_DISABLE_VERSION_CHECK",  # opt-out of version check
         "RAPID_MLX_PROFILE_VERBOSE",  # debug verbosity for profile logs
         # Local-only archive location for reproducible benchmark records. It
         # changes storage placement, never model/task/parser selection.
         "RAPID_MLX_BENCHMARK_HOME",
+        # Qualification-only destination for generated token-ID evidence.
+        # It changes audit storage, never model, parser, or serving-lane choice.
+        "RAPID_MLX_TENSORFOLD_AUDIT_PATH",
         # Security policy knobs, none of which selects a model, parser, tier,
         # or engine route. TRUST_REMOTE_CODE only constrains whether an
         # already-selected checkpoint may import repository Python;
@@ -137,6 +147,9 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         "RAPID_MLX_TRUST_REMOTE_CODE",
         "RAPID_MLX_TRUSTED_HOSTS",
         "RAPID_MLX_ALLOW_UNSAFE_SA3_PICKLE",
+        # Explicit opt-in for returning CUA screenshots to an authenticated
+        # client. This is a privacy boundary, not model or parser routing.
+        "RAPID_MLX_CUA_EXPOSE_SCREENSHOTS",
         # MLLM media policy controls. These constrain which already-selected
         # request media sources may be read; they do not select a model,
         # parser, tier, or engine route.
@@ -147,16 +160,32 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # toggle, not a routing decision. The math collapses to mlx-lm's
         # apply_top_p + apply_top_k + categorical_sampling chain when set;
         # which model loads, which parser fires, which tier engages — none
-        # of that changes. Read by ``vllm_mlx.scheduler._get_request_sampler``
+        # of that changes. Read by ``rapid_mlx.scheduler._get_request_sampler``
         # only, never by config / aliases / model_auto_config.
         "RAPID_MLX_DISABLE_FUSED_SAMPLER",
         # Opt-out of the MoE gate+up expert-projection fusion
-        # (vllm_mlx/moe_fusion.py). Same shape as DISABLE_FUSED_SAMPLER —
+        # (rapid_mlx/moe_fusion.py). Same shape as DISABLE_FUSED_SAMPLER —
         # a bit-exact launch-count optimization on an already-selected
         # model, not a routing decision: which model loads, which parser
         # fires, which tier engages — none of that changes. Read by
         # ``moe_fusion.fuse_gate_up()`` only.
         "RAPID_MLX_MOE_GATE_UP_FUSION",
+        # Opt-out of the bit-exact Qwen3.5-family MoE router-tail fusion.
+        # This changes only a launch-count optimization after model loading;
+        # it cannot select a model, parser, tier, or serving lane.
+        "RAPID_MLX_QWEN35_MOE_ROUTER",
+        # Opt-out of byte-exact whole-step replay for an already-selected
+        # Qwen3.6 model. This is a diagnostic/performance toggle only: it does
+        # not change model, parser, tier, or request-lane selection.
+        "RAPID_MLX_COMPILED_DECODE",
+        # Opt-out of the bit-exact Qwen3.5-family GDN decode kernel. It changes
+        # only the implementation of an already-selected model's recurrence.
+        "RAPID_MLX_QWEN35_FUSED_GDN_DECODE",
+        # Opt-out of eager decoder-layer submission for the qualified
+        # Qwen3.5-family 35B-A3B shape. It changes only when an already-built
+        # lazy graph is handed to Metal; model, parser, tier, and lane stay the
+        # same, and the returned array is unchanged.
+        "RAPID_MLX_QWEN35_EAGER_LAYER_DISPATCH",
         # Opt-in direct QSA block-sparse attention on an already-selected
         # Qwen4-Exp model. This changes only the prefill kernel after a measured
         # context crossover; model, parser, tier, and engine routing are
@@ -167,6 +196,22 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # unqualified query shapes, MLX builds, and Metal architectures remain
         # on the existing dense attention implementation.
         "RAPID_MLX_QSA_INDEXED_SPLITK",
+        # Opt-in exact radix selector for QSA stage one on an already-selected
+        # Qwen4-Exp model. It replaces only mx.argpartition after producing the
+        # same scores; model, parser, serving lane, and emitted block set remain
+        # unchanged. Unqualified shapes and machines retain the eager selector.
+        "RAPID_MLX_QSA_STAGE1",
+        # Opt-in row-invariant lane matmul for an already-selected dense
+        # model's projections (multi-row verify and batched decode). It swaps
+        # only the arithmetic of covered linear layers after load; model,
+        # parser, tier, spec-decode mode and serving lane are unchanged, and
+        # MoE models and unsupported formats keep the stock kernels.
+        "RAPID_MLX_LANE_MATMUL",
+        # Opt-out of exact CPU-side chat-render and tokenization reuse. This
+        # changes only whether immutable host results are retained in a bounded
+        # LRU after model selection; it cannot select a model, parser, tier, or
+        # serving lane.
+        "RAPID_MLX_PROMPT_HOST_CACHE",
         # Opt-in absorbed MLA factorization for short verification blocks on
         # an already-selected MLA model. This changes only the attention math
         # path after a measured cache crossover; it cannot select a model,
@@ -177,14 +222,14 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # This cannot change model or kernel selection.
         "RAPID_MLX_MLA_ABSORBED_VERIFY_STATS",
         # Opt-out of the blocked-seq GDN prefill Metal kernel
-        # (vllm_mlx/gdn_prefill.py). Same shape as DISABLE_FUSED_SAMPLER —
+        # (rapid_mlx/gdn_prefill.py). Same shape as DISABLE_FUSED_SAMPLER —
         # a kernel-selection perf toggle computing the exact same
         # recurrence, not a routing decision: which model loads, which
         # parser fires, which tier engages — none of that changes. Read by
         # ``gdn_prefill.install()`` only.
         "RAPID_MLX_GDN_PREFILL",
         # Opt-out of the GDN input-projection fusion
-        # (vllm_mlx/gdn_in_proj_fusion.py). Same shape as
+        # (rapid_mlx/gdn_in_proj_fusion.py). Same shape as
         # MOE_GATE_UP_FUSION — a bit-exact launch-count optimization on an
         # already-selected model, not a routing decision: which model
         # loads, which parser fires, which tier engages — none of that
@@ -198,9 +243,15 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # changes only the normalization implementation after model selection;
         # prefill and other model families retain their existing path.
         "RAPID_MLX_QWEN4_FAST_RMSNORM",
+        # Opt-in file-backed storage and bounded row-cache size for the PLE
+        # table of an already-selected Qwen4 checkpoint. The sidecar is bound
+        # to that checkpoint's exact index, geometry, and sampled contents; it
+        # cannot select a model, parser, tier, or serving lane.
+        "RAPID_MLX_QWEN4_PLE_NVME",
+        "RAPID_MLX_QWEN4_PLE_CACHE_BYTES",
         # Opt-in re-quantization of the lm_head when serving fp8-block
         # checkpoints through the load-time mxfp8 repack
-        # (vllm_mlx/fp8_repack.py). A precision/speed knob on an
+        # (rapid_mlx/fp8_repack.py). A precision/speed knob on an
         # already-selected model: which checkpoint loads, which parser
         # fires, which tier engages — none of that changes. Default off
         # keeps the load bit-faithful to the published weights.
@@ -211,7 +262,7 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # which parser fires, which tier engages — none of that changes,
         # and prompt-copy drafts are verified against the target model, so
         # these cannot alter emitted tokens either. Read only by
-        # ``vllm_mlx.spec_decode.mtp.generator``.
+        # ``rapid_mlx.spec_decode.mtp.generator``.
         #
         # ``RAPID_MLX_MIRROR_MIN_MBPS`` (#2015 / #2010) is the download
         # throughput floor: below it a shard's R2 attempt is abandoned and the
@@ -230,6 +281,21 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # token-lossless across verification chunk boundaries; the other
         # three size the n-gram match window.
         "RAPID_MLX_MTP_PROMPT_LOOKUP",
+        # Disable-only switch for the sampled half of the same opt-in: it can
+        # put a family's temperature > 0 requests back on the greedy-only
+        # route, and cannot put an unqualified family onto the sampled one.
+        # It selects a draft source inside an already-selected model's
+        # speculative decode, and the emitted distribution is the target's
+        # either way, so it cannot change which model, parser, tier or lane
+        # serves the request.
+        "RAPID_MLX_MTP_PROMPT_LOOKUP_SAMPLED",
+        # Prefix-cache tuning for hybrid models: how many recurrent-state
+        # checkpoints a stored entry keeps and how far apart they are. They
+        # only change how much of an already-selected model's cached prefix
+        # a divergent prompt can resume from, never which model, parser,
+        # tier or lane serves the request (0 disables recording).
+        "RAPID_MLX_HYBRID_CHECKPOINT_MAX",
+        "RAPID_MLX_HYBRID_CHECKPOINT_STRIDE",
         "RAPID_MLX_MTP_PROMPT_LOOKUP_MAX_TOKENS",
         "RAPID_MLX_MTP_PROMPT_LOOKUP_MIN_NGRAM",
         "RAPID_MLX_MTP_PROMPT_LOOKUP_MAX_NGRAM",
@@ -238,20 +304,9 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         "RAPID_MLX_BASE_URL",
         # Telemetry consent toggle (off/on), not engine routing.
         "RAPID_MLX_TELEMETRY",
-        # Telemetry debug log toggle (stderr trace of POST attempts to
-        # the collector). Pure observability, not engine routing.
+        # Telemetry debug log toggle (stderr trace of v2 internals). Pure
+        # observability, not engine routing.
         "RAPID_MLX_TELEMETRY_DEBUG",
-        # Telemetry collector endpoint override for Phase 2 dev rigs and
-        # local-Worker testing. Production stays on
-        # ``telemetry.rapidmlx.com``; never consulted by the engine.
-        "RAPID_MLX_TELEMETRY_ENDPOINT",
-        # Telemetry request-event sampling rate (0.0–1.0). Bounds the
-        # volume of high-frequency per-API-call ``request`` events so
-        # turning those call sites on doesn't flood the collector. Pure
-        # observability knob — read only by
-        # ``telemetry/emit.py::_request_sample_rate``; never chooses
-        # model / parser / tier / any routing decision.
-        "RAPID_MLX_TELEMETRY_REQUEST_SAMPLE",
         # Port for doctor harness probe checks, not engine routing.
         "RAPID_MLX_PORT",
         # Skip the [Y/n] confirmation prompt before large model downloads
@@ -280,6 +335,8 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # so the child's B2 download gate no-ops (parent already gated).
         # Pure UX flag — never read by the engine or scheduler.
         "RAPID_MLX_CHAT_SPAWN",
+        # Child-only telemetry context; never consulted by model routing.
+        "RAPID_MLX_AUTO_SELECTED",
         # ``rapid-mlx share`` control-plane endpoint override. Default points at
         # https://api.rapidmlx.com; dev sets this to a local docker-compose.
         # Read once at session-request time, never consulted by the engine.
@@ -299,7 +356,7 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # ``rapid-mlx share`` one-click chat-link override. Picks which
         # frontend URL the banner advertises (defaults to
         # https://chat.rapidmlx.com). Pure UX knob; consulted only by
-        # ``vllm_mlx/share/cli.py`` when rendering the banner.
+        # ``rapid_mlx/share/cli.py`` when rendering the banner.
         "RAPID_MLX_CHAT_FRONTEND",
         # Server-side: fallback for ``--api-key`` when the inline flag is
         # not provided. Used by ``rapid-mlx share`` to avoid exposing the
@@ -308,13 +365,13 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         "RAPID_MLX_API_KEY",
         # Server-side: fallback for ``--max-request-bytes`` (DoS defense,
         # rapid-desktop#273 / #463). Enforces the ASGI-layer body cap in
-        # ``vllm_mlx/middleware/body_size.py``. Pure wire-level size gate
+        # ``rapid_mlx/middleware/body_size.py``. Pure wire-level size gate
         # — never selects a model, parser, or routing tier; it only
         # decides whether a request body is admitted at all.
         "RAPID_MLX_MAX_REQUEST_BYTES",
         # Path to the MCP server config file (formerly VLLM_MLX_MCP_CONFIG).
         # Plumbs ``--mcp-config`` from the CLI to the FastAPI lifespan and is
-        # consumed only by ``vllm_mlx/mcp/config.py`` to discover MCP tool
+        # consumed only by ``rapid_mlx/mcp/config.py`` to discover MCP tool
         # servers. It selects external tool endpoints, never which model /
         # parser / tier the engine routes a request to.
         "RAPID_MLX_MCP_CONFIG",
@@ -322,14 +379,14 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # doesn't pass ``--model``, the launch dispatcher reads this env var
         # before falling back to the built-in ``qwen3.5-4b-4bit`` default.
         # Pure UX-default knob consumed only by
-        # ``vllm_mlx/launch/cli.py:_resolve_default_model`` to decide which
+        # ``rapid_mlx/launch/cli.py:_resolve_default_model`` to decide which
         # alias to write into the patched IDE-client config (Cline / Claude
         # Code / Continue / Cursor). Never consulted by the engine,
         # scheduler, or any routing layer — the actual model that loads is
         # chosen by ``rapid-mlx serve <model>``.
         "RAPID_MLX_DEFAULT_MODEL",
         # User-configured HTTP base URL for a weight mirror (R2/S3/any HTTP
-        # host) consumed by ``_try_mirror_prefetch`` in ``vllm_mlx/cli.py``.
+        # host) consumed by ``_try_mirror_prefetch`` in ``rapid_mlx/cli.py``.
         # Pre-populates the HF cache layout (``snapshots/<sha>/<file>``) from
         # ``${mirror}/<owner>/<repo>/<file>`` before falling back to
         # huggingface_hub on any miss. This selects *where the bytes come
@@ -339,7 +396,7 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # Never consulted by the engine, scheduler, or routing layer.
         "RAPID_MLX_MODEL_MIRROR",
         # SIGTERM-grace budget (seconds, float) for the lifespan prefix-cache
-        # flush in ``vllm_mlx/runtime/cache.py``. Defaults to 3.5s so a
+        # flush in ``rapid_mlx/runtime/cache.py``. Defaults to 3.5s so a
         # multi-GB save commits its partial snapshot before downstream
         # supervisors (rapid-desktop's 5s grace, systemd / Docker / launchd
         # equivalents) escalate to SIGKILL and orphan ``<cache_dir>.new/``.
@@ -381,7 +438,7 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # sweep against a booted server. ``tier_runner._resolve_harness_
         # profiles_filter`` consumes it to whittle the harness loop down
         # to just the picked names. Test/CI knob — never consulted by the
-        # engine, scheduler, or any routing layer. ``vllm_mlx.cli``
+        # engine, scheduler, or any routing layer. ``rapid_mlx.cli``
         # refuses ``--submit`` while it's set so a scoped sweep can't
         # silently produce a schema-incomplete community-bench payload.
         "RAPID_MLX_HARNESS_PROFILES_FILTER",
@@ -409,7 +466,7 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # ``Access-Control-*`` response headers look like. Pure
         # wire-level browser-security knobs paired with the existing
         # ``--cors-origins`` CLI flag. See
-        # ``vllm_mlx/server.py::configure_cors_from_env`` for the
+        # ``rapid_mlx/server.py::configure_cors_from_env`` for the
         # default-deny stance (unset → no middleware, preflight 405).
         "RAPID_MLX_CORS_ALLOW_ORIGINS",
         "RAPID_MLX_CORS_ALLOW_METHODS",
@@ -429,7 +486,7 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # ``RAPID_MLX_REASONING_RESCUE=off`` (or ``0`` / ``false`` /
         # ``no`` / ``disabled``). Never selects a model, parser, or
         # routing tier; consumed only by
-        # ``vllm_mlx.service.helpers._cutoff_notice_enabled`` to decide
+        # ``rapid_mlx.service.helpers._cutoff_notice_enabled`` to decide
         # whether the rescue payload is surfaced. See PR
         # fix/r12-8-reasoning-content-rescue.
         "RAPID_MLX_REASONING_RESCUE",
@@ -447,14 +504,14 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # 500s at first request would otherwise look healthy on the
         # listing). Pure observability/health knob — never selects a
         # model, parser, or routing tier. Consumed only by
-        # ``vllm_mlx/server.py``'s lifespan to decide whether to fire
+        # ``rapid_mlx/server.py``'s lifespan to decide whether to fire
         # the deep probe at boot.
         "RAPID_MLX_AUDIO_DEEP_PROBE",
         # R12-4 strict ``response_format.json_schema`` enforcement
         # escape hatch (``off`` falls through to legacy silent-pass-
         # through; default is on). Pure behaviour-policy knob —
         # never selects a model, parser, or routing tier; consumed
-        # only by ``vllm_mlx.api.strict_json_schema`` to decide
+        # only by ``rapid_mlx.api.strict_json_schema`` to decide
         # whether the post-generate validation gate fires. See PR
         # fix/r12-4-strict-json-schema-enforcement.
         "RAPID_MLX_STRICT_JSON_SCHEMA",
@@ -474,7 +531,7 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # to size the violation-detection buffer. Default 2 MiB.
         "RAPID_MLX_STRICT_BUFFER_BYTES",
         # PID of the supervising parent process for the parent-watchdog
-        # graceful-exit path (``vllm_mlx/_parent_watchdog.py``). The
+        # graceful-exit path (``rapid_mlx/_parent_watchdog.py``). The
         # supervising process injects its own PID before spawning the
         # serve subprocess; the child polls and self-terminates when
         # the parent disappears. Pure liveness signal — never selects a
@@ -482,6 +539,16 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # loop in ``_parent_watchdog.py`` and the wire-up at
         # ``cli.py``, ``bench/_server.py``, ``share/cli.py``.
         "RAPID_MLX_WATCHDOG_PPID",
+        # Declared process role for the telemetry v2 consent wiring
+        # (``rapid_mlx/telemetry/consent_runtime.py``). A supervisor —
+        # the desktop app's sidecar spawn, in T12 — sets it to
+        # ``desktop-sidecar`` so the consent runtime classifies the
+        # process as a SIDECAR (never writes the shared consent file,
+        # never emits the disclosure). Pure role signal — never selects
+        # a model, parser, tier, or engine route; any other value is
+        # ignored and detection falls through to the watchdog-ppid /
+        # tty checks.
+        "RAPID_MLX_PROCESS_ROLE",
         # Disk KV cache checkpoint size ceiling (bytes). Bounds the
         # serialized snapshot ``runtime/disk_kv_checkpoint.py`` writes
         # to disk on graceful shutdown so an oversize cache can't
@@ -490,7 +557,7 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         "RAPID_MLX_KV_CHECKPOINT_MAX_BYTES",
         # F-K-WHISPER-961 anti-hallucination VAD pre-trim opt-out
         # (accepts ``0`` / ``false`` / ``no`` / ``off``). Consumed by
-        # ``vllm_mlx.audio.stt._vad_pretrim_disabled_by_env`` only to
+        # ``rapid_mlx.audio.stt._vad_pretrim_disabled_by_env`` only to
         # decide whether ``STTEngine.transcribe`` runs Silero VAD
         # before Whisper for silence-hallucination suppression on
         # pure-silence and trailing-silence clips (issue #961). Pure
@@ -501,7 +568,7 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # 0.9.13 PR-A codex round-G BLOCKING #3: bounded wait for the
         # executor-side MTP dispatch call (``--spec-decode mtp
         # --mtp-sidecar <path>``). Read by
-        # ``vllm_mlx.engine.batched._get_mtp_dispatch_timeout_sec``
+        # ``rapid_mlx.engine.batched._get_mtp_dispatch_timeout_sec``
         # only, once per boot, to convert a stuck sidecar load / HF
         # Hub outage / corp-proxy hang into a clean startup abort
         # instead of an indefinite block. Default 600s; ``0``
@@ -550,7 +617,7 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # only). Same shape as DISABLE_VERSION_CHECK: it never selects a
         # model, parser, tier, or engine route — it only suppresses a
         # print() in cli.main() when stdout is a TTY. Read by
-        # vllm_mlx/cli.py's banner gate (--no-banner flag is the primary
+        # rapid_mlx/cli.py's banner gate (--no-banner flag is the primary
         # mechanism; the env var exists for non-interactive launchers).
         "RAPID_MLX_NO_BANNER",
     }
@@ -630,12 +697,12 @@ def _field_type_is_str(t: object) -> bool:
 
 def _pkg_root() -> pathlib.Path:
     return pathlib.Path(
-        str(importlib.resources.files("vllm_mlx").joinpath(""))
+        str(importlib.resources.files("rapid_mlx").joinpath(""))
     ).resolve()
 
 
 def _iter_module_files() -> list[pathlib.Path]:
-    """Every .py file under vllm_mlx/, excluding __pycache__ and vendored
+    """Every .py file under rapid_mlx/, excluding __pycache__ and vendored
     upstream files. Vendored files (deepseek_v4.py) are explicitly
     excluded because they're upstream code held as-is for clean sync."""
     root = _pkg_root()
@@ -1195,8 +1262,8 @@ def test_no_routing_shaped_pydantic_fields_in_api():
     invisible to SOP §10.
 
     This test forbids routing-shaped field names anywhere in
-    ``vllm_mlx/api/`` (Pydantic request/response models) and
-    ``vllm_mlx/routes/`` (handler-local fields). Catches the field
+    ``rapid_mlx/api/`` (Pydantic request/response models) and
+    ``rapid_mlx/routes/`` (handler-local fields). Catches the field
     declaration regardless of where the handler reads it.
     """
     pkg_root = _pkg_root()
@@ -1249,8 +1316,8 @@ def test_no_routing_setter_methods_on_engine():
     method names.
 
     This test forbids method names matching ``set_(force_|no_|enable_|
-    disable_|is_)`` on any class in ``vllm_mlx/engine/``,
-    ``vllm_mlx/engine_core.py``, or ``vllm_mlx/server.py``. The
+    disable_|is_)`` on any class in ``rapid_mlx/engine/``,
+    ``rapid_mlx/engine_core.py``, or ``rapid_mlx/server.py``. The
     setter-method shape is the entire signal — read-only properties
     and getters are fine.
     """
@@ -1302,7 +1369,7 @@ def test_no_routing_shaped_request_headers():
     Round-5 subagent 2 expanded scope: previously the scan was limited
     to ``middleware/`` and ``routes/``; an attacker writing the same
     header in ``server.py`` or ``api/`` slipped. Now scans every file
-    under ``vllm_mlx/`` because ``X-Rapid-MLX-`` is OUR namespace and
+    under ``rapid_mlx/`` because ``X-Rapid-MLX-`` is OUR namespace and
     the routing-shape inside it has no legitimate use anywhere.
     """
     pkg_root = _pkg_root()
@@ -1450,7 +1517,7 @@ def test_alias_profile_str_fields_are_explicitly_listed():
     """
     import dataclasses
 
-    from vllm_mlx.model_aliases import AliasProfile
+    from rapid_mlx.model_aliases import AliasProfile
 
     # Explicit allowlist of AliasProfile string-typed fields. Every
     # entry needs a 1-line reason describing the field's value space.
@@ -1480,10 +1547,19 @@ def test_alias_profile_str_fields_are_explicitly_listed():
             # cannot select an engine lane; _coerce requires full 40-char pins.
             "dflash_target_revision",
             "dflash_draft_revision",
+            "tensorfold_target_revision",  # immutable target artifact SHA
+            "tensorfold_runtime_revision",  # immutable runtime source SHA
             # Closed runtime identity receipt validated against
             # VALID_DFLASH_ALGORITHMS before the DFlash lane can start.
             "dflash_algorithm",
+            # Closed provider identity for a pinned DFlash pair. _coerce accepts
+            # only "tensorfold"; aliases without it retain the existing backend.
+            "dflash_backend",
             "ddtree_draft_model",  # HF path for the DDTree/DFlash drafter
+            # HF org/repo path for the isolated serial native-MTP sidecar.
+            # Open-ended artifact identity, not a lane enum; _coerce requires
+            # org/repo syntax and supports_native_mtp=true.
+            "native_mtp_draft_model",
             "mtp_draft_model",  # HF 'org/repo' path for the MTP drafter (#1987);
             # validated as non-empty org/repo at JSON load in model_aliases.py,
             # open-ended like the other *_draft_model paths, not a routing enum
@@ -1716,7 +1792,7 @@ def test_os_environ_composed_key_is_detected():
 
     # Negative control: literal Constant + module-level Name reference
     # must NOT be flagged (these are legitimate patterns used in
-    # vllm_mlx/mcp/config.py and vllm_mlx/telemetry/state.py).
+    # rapid_mlx/mcp/config.py and rapid_mlx/telemetry/state.py).
     benign_sources = (
         "import os\nos.environ.get('VLLM_MLX_MCP_CONFIG')\n",
         "import os\nENV_VAR = 'RAPID_MLX_TELEMETRY'\nos.environ.get(ENV_VAR)\n",
@@ -1745,7 +1821,7 @@ def test_routing_write_allowed_locations_pins_canonical_paths():
       1. Every non-constructor entry in ``ROUTING_WRITE_ALLOWED_FUNCS``
          has a corresponding entry in ``ROUTING_WRITE_ALLOWED_LOCATIONS``
          (no name slips through unlocated).
-      2. Each pinned path actually exists in the vllm_mlx/ tree.
+      2. Each pinned path actually exists in the rapid_mlx/ tree.
     """
     CONSTRUCTOR_NAMES = {"__init__", "model_post_init"}
     non_constructor = ROUTING_WRITE_ALLOWED_FUNCS - CONSTRUCTOR_NAMES
@@ -1762,6 +1838,6 @@ def test_routing_write_allowed_locations_pins_canonical_paths():
         for rel in paths:
             assert (pkg_root / rel).exists(), (
                 f"ROUTING_WRITE_ALLOWED_LOCATIONS[{name!r}] pins to "
-                f"`{rel}` but that file does not exist in vllm_mlx/. "
+                f"`{rel}` but that file does not exist in rapid_mlx/. "
                 "Stale pin — fix or remove."
             )

@@ -20,13 +20,14 @@ These tests pin the public CLI contract:
 
 from __future__ import annotations
 
+import socket
 import sys
 from types import ModuleType
 from unittest.mock import patch
 
 import pytest
 
-from vllm_mlx import cli
+from rapid_mlx import cli
 
 # ---------------------------------------------------------------------------
 # Helpers — mirror the chat-command test style: drive ``cli.main()`` and
@@ -194,13 +195,18 @@ def test_run_uvicorn_passes_fd_when_listen_fd_set(monkeypatch):
 
     monkeypatch.setattr(uvicorn, "run", fake_run)
 
-    ns = _minimal_serve_ns(listen_fd=7, port=9000, host="127.0.0.1")
-    sentinel_app = object()
-    cli._run_uvicorn(sentinel_app, ns, "info")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener_fd = listener.fileno()
+        ns = _minimal_serve_ns(listen_fd=listener_fd, port=9000, host="127.0.0.1")
+        sentinel_app = object()
+        cli._run_uvicorn(sentinel_app, ns, "info")
 
     assert captured_kwargs.get("app") is sentinel_app
-    assert captured_kwargs.get("fd") == 7, (
-        f"expected fd=7 in uvicorn.run kwargs, got {captured_kwargs!r}"
+    assert captured_kwargs.get("fd") == listener_fd, (
+        "expected the inherited listener in uvicorn.run kwargs, "
+        f"got {captured_kwargs!r}"
     )
     assert "host" not in captured_kwargs, (
         f"host must NOT be passed when fd is set, got {captured_kwargs!r}"
@@ -241,6 +247,167 @@ def test_run_uvicorn_passes_host_port_when_listen_fd_unset(monkeypatch):
     assert captured_kwargs.get("timeout_keep_alive") == 30
 
 
+def _assert_unsupported_lane_rejects_before_bind(
+    monkeypatch,
+    capsys,
+    *,
+    lane: str,
+    speculative_config: str | None = None,
+    model: str | None = None,
+    assert_preflight_lifecycle: bool = False,
+) -> None:
+    """Drive the shared serve entry and prove no port resolution/bind follows."""
+
+    def unexpected_work(*_args, **_kwargs):
+        pytest.fail("unsupported --listen-fd lane continued toward model load/bind")
+
+    monkeypatch.setattr(cli, "_resolve_serve_port", unexpected_work)
+    monkeypatch.setattr(cli, "_ensure_model_downloaded", unexpected_work)
+    monkeypatch.setattr(cli, "_check_alias_min_memory", lambda *_args: None)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        args = _minimal_serve_ns(listen_fd=listener.fileno())
+        if speculative_config is not None:
+            args.speculative_config = speculative_config
+        if model is not None:
+            args._original_alias = model
+            args.model = model
+        if assert_preflight_lifecycle:
+            from rapid_mlx.telemetry import server_start
+
+            events: list[tuple[str, str | None]] = []
+            monkeypatch.setattr(
+                "rapid_mlx.telemetry.track._upload_allowed", lambda: True
+            )
+            monkeypatch.setattr(
+                "rapid_mlx.telemetry.posthog_sender.install_atexit", lambda: None
+            )
+
+            def capture(accepted) -> bool:
+                props = dict(accepted.props)
+                events.append((props["state"], props.get("failure_stage")))
+                return True
+
+            monkeypatch.setattr("rapid_mlx.telemetry.track._enqueue_accepted", capture)
+            server_start._reset_for_tests()
+            server_start.attempted(args.model, load_policy="eager")
+            server_start.set_failure_stage("preflight")
+            guarded_serve = cli._capture_start_failures(cli.serve_command)
+            try:
+                with pytest.raises(SystemExit) as excinfo:
+                    guarded_serve(args)
+            finally:
+                server_start._reset_for_tests()
+            assert events == [("attempted", None), ("failed", "preflight")]
+        else:
+            with pytest.raises(SystemExit) as excinfo:
+                cli.serve_command(args)
+
+    assert excinfo.value.code == 2
+    assert capsys.readouterr().err == (
+        f"--listen-fd is not supported with the {lane} lane; "
+        "omit --listen-fd or pass --host/--port.\n"
+    )
+
+
+def test_native_mtp_lane_rejects_listen_fd_before_second_bind(monkeypatch, capsys):
+    _assert_unsupported_lane_rejects_before_bind(
+        monkeypatch,
+        capsys,
+        lane="Native MTP",
+        speculative_config='{"method":"mtp","backend":"native"}',
+        assert_preflight_lifecycle=True,
+    )
+
+
+def test_dspark_k4_lane_rejects_listen_fd_before_second_bind(monkeypatch, capsys):
+    from rapid_mlx.models.deepseek_v41_native.artifacts import TARGET_REPO
+
+    _assert_unsupported_lane_rejects_before_bind(
+        monkeypatch, capsys, lane="DSpark K4", model=TARGET_REPO
+    )
+
+
+def test_dflash_lane_rejects_listen_fd_before_second_bind(monkeypatch, capsys):
+    _assert_unsupported_lane_rejects_before_bind(
+        monkeypatch,
+        capsys,
+        lane="DFlash",
+        speculative_config='{"method":"dflash","model":"drafter"}',
+    )
+
+
+def test_ddtree_lane_rejects_listen_fd_before_second_bind(monkeypatch, capsys):
+    _assert_unsupported_lane_rejects_before_bind(
+        monkeypatch,
+        capsys,
+        lane="DDTree",
+        speculative_config='{"method":"ddtree"}',
+    )
+
+
+@pytest.mark.requires_mlx
+def test_serve_command_hard_exits_immediately_after_uvicorn_returns(
+    stub_heavy_serve_deps,
+):
+    """Behavioral pin for #3495 (codex round-1 BLOCKING): the hard exit
+    must actually RUN, AFTER the uvicorn dispatch returns — not merely
+    be referenced (a co_names/AST check cannot see reachability or
+    ordering). Drive the real ``serve_command`` through its stubbed
+    prologue and record the event order.
+    """
+    import uvicorn
+
+    events: list[str] = []
+    captured: dict = {}
+
+    def fake_run(app, **kwargs):
+        events.append("uvicorn")
+        captured["app"] = app
+        captured.update(kwargs)
+
+    stub_heavy_serve_deps.setattr(uvicorn, "run", fake_run)
+    stub_heavy_serve_deps.setattr(
+        cli, "_hard_exit_after_serve", lambda: events.append("hard_exit")
+    )
+
+    ns = _minimal_serve_ns(port=_free_tcp_port())
+    cli.serve_command(ns)
+
+    assert events == ["uvicorn", "hard_exit"], (
+        f"expected exactly ['uvicorn', 'hard_exit'], got {events!r} — "
+        "the #3495 hard exit must run after the uvicorn dispatch returns"
+    )
+
+
+def test_explicit_port_preflight_precedes_model_download(
+    stub_heavy_serve_deps,
+):
+    """A busy listener must fail before a model download can begin."""
+
+    failure = SystemExit(1)
+    events: list[str] = []
+
+    def fail_model_download(_model):
+        events.append("download")
+
+    def resolve_port(*_args, **_kwargs):
+        events.append("port")
+        raise failure
+
+    stub_heavy_serve_deps.setattr(cli, "_ensure_model_downloaded", fail_model_download)
+    stub_heavy_serve_deps.setattr(cli, "_resolve_serve_port", resolve_port)
+
+    ns = _minimal_serve_ns(port=0)
+    with pytest.raises(SystemExit) as excinfo:
+        cli.serve_command(ns)
+
+    assert excinfo.value is failure
+    assert events == ["port"]
+    assert ns.port == 0
+
+
 @pytest.fixture
 def stub_heavy_serve_deps(monkeypatch):
     """Stub the heavyweight prologue of ``serve_command`` so a behavioral
@@ -253,26 +420,27 @@ def stub_heavy_serve_deps(monkeypatch):
     the tests below; extend this fixture rather than working around it
     so the test stays faithful to the real execution path.
     """
-    from vllm_mlx import _version_check
-    from vllm_mlx import server as server_mod
+    from rapid_mlx import _version_check
+    from rapid_mlx import server as server_mod
 
     monkeypatch.setattr(_version_check, "prompt_upgrade_if_available", lambda: False)
     monkeypatch.setattr(
         _version_check, "print_staleness_warning_if_any", lambda **_kwargs: None
     )
     # Patch the exact module object this test file calls. Earlier suites may
-    # deliberately reload ``vllm_mlx.cli`` and replace the package attribute;
+    # deliberately reload ``rapid_mlx.cli`` and replace the package attribute;
     # re-importing it here would patch that new object while the file-level
     # ``cli`` reference below still invokes the old one.
     monkeypatch.setattr(cli, "_ensure_model_downloaded", lambda model: None)
     monkeypatch.setattr(cli, "_check_memory_capacity", lambda *a, **kw: None)
     monkeypatch.setattr(cli, "_check_disk_space", lambda *a, **kw: None)
+    monkeypatch.setattr(cli, "_listen_fd_port", lambda _fd: 8000)
     monkeypatch.setattr(server_mod, "configure_logging", lambda level: "info")
     monkeypatch.setattr(server_mod, "load_model", lambda *a, **kw: None)
     # ``serve_command`` calls ``server.configure_cors`` which does an
     # ``app.add_middleware``. That fails with "Cannot add middleware
     # after an application has started" if a prior test in the suite
-    # has already booted a ``TestClient`` against ``vllm_mlx.server.app``
+    # has already booted a ``TestClient`` against ``rapid_mlx.server.app``
     # — order-dependent flake. Stub it to a no-op for these tests; the
     # CORS plumbing has its own dedicated tests.
     # ``configure_cors_from_env`` now always calls ``configure_cors`` with
@@ -281,17 +449,52 @@ def stub_heavy_serve_deps(monkeypatch):
     # the stub keeps matching the real signature.
     monkeypatch.setattr(server_mod, "configure_cors", lambda *a, **kw: None)
     # Some serve_command branches touch the rate-limiter wiring.
-    from vllm_mlx.middleware import auth as auth_mod
+    from rapid_mlx.middleware import auth as auth_mod
 
     monkeypatch.setattr(auth_mod, "configure_rate_limiter", lambda *a, **kw: None)
     # ``install_request_logging_middleware`` also calls ``app.add_middleware``
     # — same "after an application has started" failure as CORS (#1167).
-    from vllm_mlx.middleware import request_logging as reqlog_mod
+    from rapid_mlx.middleware import request_logging as reqlog_mod
 
     monkeypatch.setattr(
         reqlog_mod, "install_request_logging_middleware", lambda *a: None
     )
     return monkeypatch
+
+
+def test_serve_load_failure_emits_v2_model_failure(
+    stub_heavy_serve_deps, monkeypatch, scheduler_config_stub
+):
+    from rapid_mlx import server as server_mod
+    from rapid_mlx.telemetry import model_events
+
+    failure = RuntimeError("unsupported architecture")
+    calls: list[tuple[BaseException, dict[str, object]]] = []
+    stub_heavy_serve_deps.setattr(
+        server_mod,
+        "load_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+    monkeypatch.setattr(
+        model_events,
+        "emit_model_serve_failed",
+        lambda exc, **kwargs: calls.append((exc, kwargs)),
+    )
+    ns = _minimal_serve_ns(listen_fd=7)
+    ns._telemetry_auto_selected = True
+    with pytest.raises(SystemExit) as excinfo:
+        cli.serve_command(ns)
+    assert excinfo.value.code == 1
+    assert calls == [
+        (
+            failure,
+            {
+                "engine": server_mod._engine,
+                "alias_or_path": ns._original_alias or ns.model,
+                "auto_selected": True,
+            },
+        )
+    ]
 
 
 def _free_tcp_port(host: str = "127.0.0.1") -> int:
@@ -310,6 +513,12 @@ def _free_tcp_port(host: str = "127.0.0.1") -> int:
 def _capture_uvicorn_run(monkeypatch):
     """Patch ``uvicorn.run`` to record kwargs and return without
     actually starting a server. Returns the dict the test asserts on.
+
+    Also stubs ``cli._hard_exit_after_serve`` (#3495): on the real
+    success path uvicorn.run returning flows into the post-serve
+    ``os._exit`` that skips interpreter finalization — in-process tests
+    must not die there. Tests that assert on the hard-exit contract
+    override this stub explicitly.
     """
     captured: dict = {}
 
@@ -320,6 +529,7 @@ def _capture_uvicorn_run(monkeypatch):
     import uvicorn
 
     monkeypatch.setattr(uvicorn, "run", fake_run)
+    monkeypatch.setattr(cli, "_hard_exit_after_serve", lambda: None)
     return captured
 
 
@@ -351,7 +561,7 @@ def test_serve_command_dispatches_uvicorn_with_fd_when_listen_fd_set(
         f"port must NOT be passed in the listen-fd branch, got {captured!r}"
     )
     # And the Ready-banner source of truth must be wired up.
-    from vllm_mlx.config import get_config
+    from rapid_mlx.config import get_config
 
     cfg = get_config()
     assert cfg.bind_listen_fd == 7
@@ -391,16 +601,16 @@ def test_dflash_memory_check_receives_original_alias(
         lambda model, *, alias=None: calls.append((model, alias)),
     )
 
-    dflash_server = ModuleType("vllm_mlx.speculative.dflash.server")
+    dflash_server = ModuleType("rapid_mlx.speculative.dflash.server")
     dflash_server.run_dflash_server = lambda **_kwargs: None
     monkeypatch.setitem(
-        sys.modules, "vllm_mlx.speculative.dflash.server", dflash_server
+        sys.modules, "rapid_mlx.speculative.dflash.server", dflash_server
     )
 
     ns = _minimal_serve_ns()
     ns.enable_dflash = True
     ns._original_alias = "qwen3.5-27b-8bit"
-    from vllm_mlx.speculative.dflash import eligibility
+    from rapid_mlx.speculative.dflash import eligibility
 
     monkeypatch.setattr(eligibility, "have_runtime", lambda: True)
 
@@ -409,12 +619,131 @@ def test_dflash_memory_check_receives_original_alias(
     assert calls == [(ns.model, ns._original_alias)]
 
 
+def test_serve_command_preflights_tensorfold_mtp_before_dispatch(
+    stub_heavy_serve_deps, monkeypatch, scheduler_config_stub
+):
+    calls: list[object] = []
+    monkeypatch.setattr(
+        cli,
+        "_preflight_tensorfold_qwen27_or_exit",
+        lambda args=None: calls.append(args),
+    )
+    monkeypatch.setattr(
+        cli, "_serve_tensorfold_mtp_if_requested", lambda *_a, **_k: True
+    )
+    ns = _minimal_serve_ns()
+    ns.speculative_config = '{"method":"mtp","backend":"tensorfold"}'
+
+    cli.serve_command(ns)
+
+    assert calls == [ns]
+
+
+def test_serve_command_downloads_qualified_glm_tensorfold_target(
+    stub_heavy_serve_deps, monkeypatch, scheduler_config_stub
+):
+    from rapid_mlx.speculative import tensorfold_glm53
+
+    disk_checks: list[tuple[str, bool, str | None]] = []
+    monkeypatch.setattr(cli, "_check_alias_min_memory", lambda *_a, **_k: None)
+    monkeypatch.setattr(cli, "_preflight_tensorfold_qwen27_or_exit", lambda _args: None)
+    monkeypatch.setattr(
+        cli,
+        "_check_disk_space",
+        lambda repo, *, force=False, revision_override=None, **_kwargs: (
+            disk_checks.append((repo, force, revision_override))
+        ),
+    )
+    monkeypatch.setattr(
+        tensorfold_glm53,
+        "download_qualified_target",
+        lambda: "/pinned/glm-target",
+    )
+    monkeypatch.setattr(
+        cli, "_serve_tensorfold_mtp_if_requested", lambda *_a, **_k: True
+    )
+    ns = _minimal_serve_ns()
+    ns.model = "Vontra/GLM-5.3-Flash-MLX-4bit-MTP"
+    ns._original_alias = "glm5.3-flash-tensorfold"
+    ns.mtp_backend = "tensorfold"
+    ns.force_disk_check = True
+
+    cli.serve_command(ns)
+
+    profile = cli._tensorfold_mtp_profile(ns._original_alias)
+    assert profile is not None
+    assert disk_checks == [(profile.hf_path, True, profile.tensorfold_target_revision)]
+    assert ns.model == "/pinned/glm-target"
+
+
+def test_tensorfold_alias_preflights_downloads_pair_and_dispatches_server(
+    stub_heavy_serve_deps, monkeypatch, scheduler_config_stub
+):
+    """The qualified alias owns its pinned pair and dedicated server lane."""
+    from types import SimpleNamespace
+
+    from rapid_mlx.speculative import tensorfold_qwen27, tensorfold_qwen27_server
+
+    events: list[object] = []
+    disk_checks: list[tuple[str, str | None]] = []
+    artifacts = SimpleNamespace(
+        target_path="/qualified/target", drafter_path="/qualified/drafter"
+    )
+
+    monkeypatch.setattr(
+        cli,
+        "_preflight_tensorfold_qwen27_or_exit",
+        lambda: events.append("preflight"),
+    )
+    monkeypatch.setattr(cli, "_check_alias_min_memory", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cli,
+        "_check_disk_space",
+        lambda model, **kwargs: disk_checks.append(
+            (model, kwargs.get("revision_override"))
+        ),
+    )
+    monkeypatch.setattr(
+        tensorfold_qwen27,
+        "download_qualified_pair",
+        lambda: events.append("download") or artifacts,
+    )
+    monkeypatch.setattr(
+        tensorfold_qwen27_server,
+        "run_tensorfold_qwen27_server",
+        lambda **kwargs: events.append(("server", kwargs)),
+    )
+
+    ns = _minimal_serve_ns()
+    ns.model = "Vontra/Qwen3.8-27B-MLX-4bit"
+    ns._original_alias = "qwen3.8-27b-tensorfold"
+    ns._dflash_experimental = True
+    ns.speculative_config = (
+        '{"method":"dflash","backend":"tensorfold","model":"z-lab/Qwen3.8-27B-DFlash2"}'
+    )
+
+    cli.serve_command(ns)
+
+    assert events[0:2] == ["preflight", "download"]
+    assert disk_checks[0][0] == "Vontra/Qwen3.8-27B-MLX-4bit"
+    assert disk_checks[0][1]
+    assert disk_checks[1][0] == "z-lab/Qwen3.8-27B-DFlash2"
+    assert disk_checks[1][1]
+    kind, kwargs = events[-1]
+    assert kind == "server"
+    assert kwargs["main_model_repo"] == artifacts.target_path
+    assert kwargs["drafter_repo"] == artifacts.drafter_path
+    assert kwargs["main_model_revision"] is None
+    assert kwargs["drafter_revision"] is None
+    assert kwargs["experimental_opt_in"] is True
+
+
 def test_serve_command_threads_auto_detected_hybrid_into_cache_admission(
     stub_heavy_serve_deps, monkeypatch, scheduler_config_stub
 ):
     """The unified serve entrypoint must consume its one resolved profile."""
-    from vllm_mlx import server as server_mod
-    from vllm_mlx.model_profile import ModelProfile
+    from rapid_mlx import server as server_mod
+    from rapid_mlx.model_profile import ModelProfile
 
     captured = {}
     detected_models = []
@@ -435,7 +764,7 @@ def test_serve_command_threads_auto_detected_hybrid_into_cache_admission(
         )
 
     monkeypatch.setattr(
-        "vllm_mlx.model_auto_config.detect_model_config", detect_model_config
+        "rapid_mlx.model_auto_config.detect_model_config", detect_model_config
     )
     _capture_uvicorn_run(monkeypatch)
     ns = _minimal_serve_ns(port=_free_tcp_port())
@@ -455,8 +784,8 @@ def test_serve_command_detects_defaults_from_pulled_variant_checkpoint(
     stub_heavy_serve_deps, monkeypatch, scheduler_config_stub
 ):
     """CLI defaults follow the marker-resolved checkpoint, not the repo root."""
-    from vllm_mlx import server as server_mod
-    from vllm_mlx.model_profile import ModelProfile
+    from rapid_mlx import server as server_mod
+    from rapid_mlx.model_profile import ModelProfile
 
     checkpoint = "/cache/snapshots/revision/8bit"
     resolved: list[str] = []
@@ -466,7 +795,7 @@ def test_serve_command_detects_defaults_from_pulled_variant_checkpoint(
         return checkpoint
 
     monkeypatch.setattr(
-        "vllm_mlx.utils.tokenizer._resolve_subfolder_checkpoint",
+        "rapid_mlx.utils.tokenizer._resolve_subfolder_checkpoint",
         resolve_checkpoint,
     )
     detected: list[str] = []
@@ -479,7 +808,7 @@ def test_serve_command_detects_defaults_from_pulled_variant_checkpoint(
         )
 
     monkeypatch.setattr(
-        "vllm_mlx.model_auto_config.detect_model_config", detect_model_config
+        "rapid_mlx.model_auto_config.detect_model_config", detect_model_config
     )
     monkeypatch.setattr(server_mod, "load_model", lambda *_args, **_kwargs: None)
     _capture_uvicorn_run(monkeypatch)
@@ -499,8 +828,8 @@ def test_serve_command_cache_is_first_metadata_consumer(
     stub_heavy_serve_deps, monkeypatch, scheduler_config_stub
 ):
     """Fully pinned adjacent defaults leave cache admission as first reader."""
-    from vllm_mlx import server as server_mod
-    from vllm_mlx.model_profile import ModelProfile
+    from rapid_mlx import server as server_mod
+    from rapid_mlx.model_profile import ModelProfile
 
     captured = {}
     monkeypatch.setattr(
@@ -511,7 +840,7 @@ def test_serve_command_cache_is_first_metadata_consumer(
         ),
     )
     monkeypatch.setattr(
-        "vllm_mlx.model_auto_config.detect_model_config",
+        "rapid_mlx.model_auto_config.detect_model_config",
         lambda _name: ModelProfile(is_hybrid=True, is_hybrid_explicit=True),
     )
     _capture_uvicorn_run(monkeypatch)
@@ -535,7 +864,7 @@ def test_serve_command_missing_auto_config_module_degrades_to_no_default(
     """A partial install keeps the pre-existing optional-default fallback."""
     import builtins
 
-    from vllm_mlx import server as server_mod
+    from rapid_mlx import server as server_mod
 
     captured = {}
     monkeypatch.setattr(
@@ -566,8 +895,8 @@ def test_serve_command_missing_auto_config_module_degrades_to_no_default(
 def test_serve_command_explicit_zero_wins_over_auto_detected_hybrid(
     stub_heavy_serve_deps, monkeypatch, scheduler_config_stub
 ):
-    from vllm_mlx import server as server_mod
-    from vllm_mlx.model_profile import ModelProfile
+    from rapid_mlx import server as server_mod
+    from rapid_mlx.model_profile import ModelProfile
 
     captured = {}
 
@@ -576,7 +905,7 @@ def test_serve_command_explicit_zero_wins_over_auto_detected_hybrid(
 
     monkeypatch.setattr(server_mod, "load_model", capture_load_model)
     monkeypatch.setattr(
-        "vllm_mlx.model_auto_config.detect_model_config",
+        "rapid_mlx.model_auto_config.detect_model_config",
         lambda _name: ModelProfile(
             is_hybrid=True,
             is_hybrid_explicit=True,
@@ -615,7 +944,7 @@ def test_serve_command_all_explicit_defaults_skip_model_detection(
         raise AssertionError("fully explicit serve must not detect model metadata")
 
     monkeypatch.setattr(
-        "vllm_mlx.model_auto_config.detect_model_config", unexpected_detection
+        "rapid_mlx.model_auto_config.detect_model_config", unexpected_detection
     )
     _capture_uvicorn_run(monkeypatch)
     ns = _minimal_serve_ns(port=_free_tcp_port())
@@ -653,7 +982,7 @@ def test_strict_auto_default_retries_failed_nonfatal_parser_detection(
         raise RuntimeError("broken checkpoint metadata")
 
     monkeypatch.setattr(
-        "vllm_mlx.model_auto_config.detect_model_config", broken_detection
+        "rapid_mlx.model_auto_config.detect_model_config", broken_detection
     )
     _capture_uvicorn_run(monkeypatch)
     ns = _minimal_serve_ns()
@@ -688,7 +1017,7 @@ def test_serve_command_dispatches_uvicorn_with_host_port_when_listen_fd_unset(
     assert captured.get("port") == port
     assert "fd" not in captured
 
-    from vllm_mlx.config import get_config
+    from rapid_mlx.config import get_config
 
     cfg = get_config()
     assert cfg.bind_host == "127.0.0.1"
@@ -703,7 +1032,7 @@ def test_serve_command_default_max_tokens_does_not_mutate_args(
     """Omitted --max-tokens should stay omitted on args, while load_model
     receives the operational default.
     """
-    from vllm_mlx import server as server_mod
+    from rapid_mlx import server as server_mod
 
     captured_load: dict = {}
 
@@ -784,7 +1113,7 @@ def test_serve_command_resets_stale_bind_fields_between_invocations(
     # First call: host/port.
     port_a = _free_tcp_port()
     cli.serve_command(_minimal_serve_ns(host="127.0.0.1", port=port_a))
-    from vllm_mlx.config import get_config
+    from rapid_mlx.config import get_config
 
     cfg = get_config()
     assert (cfg.bind_host, cfg.bind_port, cfg.bind_listen_fd) == (

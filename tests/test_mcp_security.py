@@ -11,14 +11,14 @@ from unittest.mock import patch
 
 import pytest
 
-from vllm_mlx.mcp.security import (
+from rapid_mlx.mcp.security import (
     ALLOWED_COMMANDS,
     MCPCommandValidator,
     MCPSecurityError,
     ToolExecutionAudit,
     ToolSandbox,
 )
-from vllm_mlx.mcp.types import MCPServerConfig, MCPTransport
+from rapid_mlx.mcp.types import MCPServerConfig, MCPTransport
 
 
 class TestMCPCommandValidator:
@@ -810,7 +810,7 @@ class TestConfigDiscoveryNoCWD:
     """
 
     def test_cwd_mcp_json_not_auto_discovered(self, tmp_path, monkeypatch):
-        from vllm_mlx.mcp.config import CONFIG_SEARCH_PATHS, load_mcp_config
+        from rapid_mlx.mcp.config import CONFIG_SEARCH_PATHS, load_mcp_config
 
         monkeypatch.chdir(tmp_path)
         # Isolate HOME too. The assertion below is "CWD was not searched", and
@@ -837,7 +837,7 @@ class TestConfigDiscoveryNoCWD:
 
     def test_explicit_path_still_works(self, tmp_path):
         """Explicit --mcp-config path is the only way to load a CWD-local file."""
-        from vllm_mlx.mcp.config import load_mcp_config
+        from rapid_mlx.mcp.config import load_mcp_config
 
         cfg_file = tmp_path / "mcp.json"
         # skip_security_validation bypasses the PATH check so the test runs
@@ -858,13 +858,13 @@ class TestAllowedHighRiskToolsConfig:
     """Plumbing: allowed_high_risk_tools flows from config into MCPConfig."""
 
     def test_default_empty(self):
-        from vllm_mlx.mcp.types import MCPConfig
+        from rapid_mlx.mcp.types import MCPConfig
 
         cfg = MCPConfig()
         assert cfg.allowed_high_risk_tools == []
 
     def test_from_dict_reads_allowlist(self):
-        from vllm_mlx.mcp.types import MCPConfig
+        from rapid_mlx.mcp.types import MCPConfig
 
         cfg = MCPConfig.from_dict(
             {
@@ -878,13 +878,159 @@ class TestAllowedHighRiskToolsConfig:
         ]
 
     def test_validate_config_rejects_non_list(self):
-        from vllm_mlx.mcp.config import validate_config
+        from rapid_mlx.mcp.config import validate_config
 
         with pytest.raises(ValueError, match="allowed_high_risk_tools"):
             validate_config({"servers": {}, "allowed_high_risk_tools": "not_a_list"})
 
     def test_validate_config_rejects_non_strings(self):
-        from vllm_mlx.mcp.config import validate_config
+        from rapid_mlx.mcp.config import validate_config
 
         with pytest.raises(ValueError, match="allowed_high_risk_tools"):
             validate_config({"servers": {}, "allowed_high_risk_tools": [1, 2, 3]})
+
+
+class TestAgentReadOnlyToolsConfig:
+    """Only explicit namespaced declarations may bypass agent approval."""
+
+    def test_default_empty(self):
+        from rapid_mlx.mcp.types import MCPConfig
+
+        assert MCPConfig().agent_read_only_tools == []
+
+    def test_existing_positional_constructor_order_is_preserved(self):
+        from rapid_mlx.mcp.types import MCPConfig, MCPRejectedServer
+
+        rejected = [MCPRejectedServer(name="bad", error="invalid")]
+        cfg = MCPConfig({}, 12.0, ["shell__execute"], rejected)
+
+        assert cfg.rejected is rejected
+        assert cfg.agent_read_only_tools == []
+
+    def test_validate_config_reads_exact_namespaced_tools(self):
+        from rapid_mlx.mcp.config import validate_config
+
+        cfg = validate_config(
+            {
+                "servers": {
+                    "files": {
+                        "command": "npx",
+                        "args": ["safe-package"],
+                        "agent_read_only_tools": ["files__read_file"],
+                    }
+                }
+            }
+        )
+
+        assert cfg.agent_read_only_tools == ["files__read_file"]
+
+    @pytest.mark.parametrize("value", ["files__read_file", ["read_file"], [1]])
+    def test_validate_config_rejects_ambiguous_or_malformed_values(self, value):
+        from rapid_mlx.mcp.config import validate_config
+
+        with pytest.raises(ValueError, match="agent_read_only_tools"):
+            validate_config(
+                {
+                    "servers": {
+                        "files": {
+                            "command": "npx",
+                            "args": ["safe-package"],
+                            "agent_read_only_tools": value,
+                        }
+                    }
+                }
+            )
+
+    @pytest.mark.parametrize(
+        "value", ["prefix-files__read_file-suffix", ["read_file"], [1]]
+    )
+    def test_from_dict_applies_the_same_read_only_validation(self, value):
+        from rapid_mlx.mcp.types import MCPConfig
+
+        with pytest.raises(ValueError, match="agent_read_only_tools"):
+            MCPConfig.from_dict(
+                {
+                    "servers": {
+                        "files": {
+                            "command": "npx",
+                            "args": ["safe-package"],
+                            "agent_read_only_tools": value,
+                        }
+                    }
+                }
+            )
+
+    def test_legacy_server_named_agent_read_only_tools_is_not_reserved(self):
+        from rapid_mlx.mcp.config import validate_config
+
+        cfg = validate_config(
+            {
+                "servers": {
+                    "agent_read_only_tools": {
+                        "command": "npx",
+                        "args": ["safe-package"],
+                    }
+                }
+            }
+        )
+
+        assert "agent_read_only_tools" in cfg.servers
+
+    def test_read_only_declaration_must_match_owning_server_namespace(self):
+        from rapid_mlx.mcp.config import validate_config
+
+        with pytest.raises(ValueError, match="files__"):
+            validate_config(
+                {
+                    "servers": {
+                        "files": {
+                            "command": "npx",
+                            "args": ["safe-package"],
+                            "agent_read_only_tools": ["other__read_file"],
+                        }
+                    }
+                }
+            )
+
+    def test_legacy_top_level_server_named_agent_remains_a_server(self):
+        from rapid_mlx.mcp.config import validate_config
+
+        cfg = validate_config({"agent": {"command": "npx", "args": ["safe-package"]}})
+
+        assert "agent" in cfg.servers
+
+    def test_local_change_declaration_is_aggregated_separately(self):
+        from rapid_mlx.mcp.config import validate_config
+
+        cfg = validate_config(
+            {
+                "servers": {
+                    "files": {
+                        "command": "npx",
+                        "args": ["safe-package"],
+                        "agent_read_only_tools": ["files__read_file"],
+                        "agent_local_change_tools": ["files__write_file"],
+                    }
+                }
+            }
+        )
+
+        assert cfg.agent_read_only_tools == ["files__read_file"]
+        assert cfg.agent_local_change_tools == ["files__write_file"]
+
+    def test_tool_cannot_have_two_agent_risk_declarations(self):
+        from rapid_mlx.mcp.config import validate_config
+
+        with pytest.raises(ValueError, match="overlap"):
+            validate_config(
+                {
+                    "servers": {
+                        "files": {
+                            "command": "npx",
+                            "args": ["safe-package"],
+                            "agent_read_only_tools": ["files__read_file"],
+                            "agent_local_change_tools": ["files__read_file"],
+                        }
+                    }
+                }
+            )

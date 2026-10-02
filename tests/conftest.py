@@ -1,32 +1,141 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pytest configuration and shared fixtures."""
 
+import importlib.util
 import ipaddress
 import os
 import socket
 import sys
+from pathlib import Path
 
 import pytest
 
-# One-time, session-scoped availability probe for the Apple-only ``mlx``
-# runtime. This is the ONLY place conftest imports it (and even then under
-# try/except); nothing else here should import mlx at module scope, because
-# this file is loaded by the no-MLX Linux CI leg where mlx is absent by design.
-#
-# We probe once up front and remember the result in a module global rather than
-# re-importing mlx per collection/modifyitems call — importing is comparatively
-# expensive and the answer cannot change mid-run. The ``except Exception`` (not
-# just ``ImportError``) also swallows a version that imports but fails at
-# import time (e.g. an unsupported ABI), treating it the same as absent: a test
-# that needs mlx cannot run there anyway. See the ``requires_mlx`` marker
-# documentation in pytest.ini and the auto-skip in ``pytest_collection_modifyitems``
-# below for how this flips the no-MLX leg onto the marker mechanism.
-try:
-    import mlx.core as _mlx_core  # noqa: F401  (probe only)
+_HUB_GUIDANCE_CLI_MODULES: set[object] = set()
 
-    HAS_MLX = True
-except Exception:  # noqa: BLE001 - mlx is optional; absent/failing == unavailable
-    HAS_MLX = False
+
+@pytest.fixture
+def stub_serve_port_resolution(monkeypatch):
+    """Keep non-collision serve tests independent of host port availability."""
+    from rapid_mlx import cli
+
+    def resolve_requested_port(
+        _host,
+        port,
+        *,
+        model,
+        listen_fd=None,
+        port_explicit=None,
+        scan_base=cli.DEFAULT_SERVE_PORT,
+        scan_count=cli.DEFAULT_SERVE_PORT_CANDIDATES,
+    ):
+        del model, listen_fd, port_explicit, scan_count
+        return scan_base if port is None else port
+
+    monkeypatch.setattr(cli, "_resolve_serve_port", resolve_requested_port)
+
+
+def _assert_no_uninjected_posthog_posts(calls: list[str]) -> None:
+    """Check that the session transport guard observed no production calls."""
+    assert calls == [], f"uninjected PostHog calls reached default_post: {calls!r}"
+
+
+@pytest.fixture
+def _posthog_transport_guard_assertion():
+    """Expose the session guard assertion for its self-check."""
+    return _assert_no_uninjected_posthog_posts
+
+
+@pytest.fixture(autouse=True)
+def _reset_hub_guidance_latch():
+    """Keep process-wide Hub guidance state isolated between every test."""
+    try:
+        from rapid_mlx import cli
+    except ImportError:
+        cli = None
+
+    if cli is not None:
+        _HUB_GUIDANCE_CLI_MODULES.add(cli)
+    for loaded_cli in _HUB_GUIDANCE_CLI_MODULES:
+        loaded_cli._hub_guidance_rendered = False
+    yield
+    for loaded_cli in _HUB_GUIDANCE_CLI_MODULES:
+        loaded_cli._hub_guidance_rendered = False
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _forbid_uninjected_posthog_default_post():
+    """Fail the suite if a test sender reaches the production transport seam."""
+    try:
+        from rapid_mlx.telemetry import posthog_sender
+    except ImportError:
+        yield
+        return
+
+    calls: list[str] = []
+
+    def forbidden(url: str, body: bytes, timeout: float) -> int:
+        calls.append(url)
+        raise AssertionError("tests must inject PostHogSender(post=...)")
+
+    posthog_sender.default_post = forbidden
+    yield
+    _assert_no_uninjected_posthog_posts(calls)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_v2_telemetry_process_state(monkeypatch, tmp_path):
+    """Keep telemetry state and lifecycle singletons isolated per test."""
+    try:
+        from rapid_mlx.telemetry import (
+            build_gate,
+            consent_runtime,
+            model_events,
+            posthog_sender,
+            server_start,
+            state,
+            track,
+        )
+    except ImportError:
+        yield
+        return
+
+    process_home = Path.home()
+
+    def telemetry_dir():
+        # Module-local telemetry fixtures and individual tests sometimes use
+        # HOME to exercise a specific filesystem shape. Preserve those
+        # explicit overrides while keeping every other test away from the
+        # process's real telemetry state.
+        current_home = Path.home()
+        if current_home != process_home:
+            return current_home / ".rapid-mlx"
+        return tmp_path / ".rapid-mlx"
+
+    monkeypatch.setattr(state, "_default_telemetry_dir", telemetry_dir)
+    posthog_sender._reset_for_tests()
+    build_gate._reset_for_tests()
+    track._reset_for_tests()
+    model_events._reset_for_tests()
+    server_start._reset_for_tests()
+    consent_runtime._reset_runtime_state_for_tests()
+    monkeypatch.setattr(posthog_sender, "install_atexit", lambda: None)
+    yield
+    posthog_sender._reset_for_tests()
+    track._reset_for_tests()
+    model_events._reset_for_tests()
+    server_start._reset_for_tests()
+    consent_runtime._reset_runtime_state_for_tests()
+
+
+# One-time availability probe for the Apple-only ``mlx`` runtime. Nothing
+# outside the standard library and pytest is imported at module scope because
+# this file is also loaded by minimal CI jobs that install pytest alone.
+#
+# Snapshot the installed package before collection can place test doubles in
+# ``sys.modules``. ``find_spec`` avoids importing mlx and keeps the minimal CI
+# environment dependency-free.
+_HAS_MLX = importlib.util.find_spec("mlx") is not None
+
 
 # Environment variables that point at the host's real, machine-specific HF
 # cache. Every non-opted-in test gets these redirected to a fresh ``tmp_path``
@@ -53,9 +162,13 @@ _NETWORK_OPT_IN_MARKER = "requires_network"
 @pytest.fixture(autouse=True)
 def _isolate_model_performance_registry():
     """Keep process-owned per-model ledgers isolated between unit tests."""
-    from vllm_mlx.runtime.model_performance import (
-        _reset_model_performance_registry_for_tests,
-    )
+    try:
+        from rapid_mlx.runtime.model_performance import (
+            _reset_model_performance_registry_for_tests,
+        )
+    except ImportError:
+        yield
+        return
 
     _reset_model_performance_registry_for_tests()
     yield
@@ -210,9 +323,9 @@ def _sync_hf_offline_with_env(monkeypatch) -> None:
 #
 # Readers, for reference (all read ``os.environ`` at call time, so a run-time
 # override takes effect):
-#   * ``RAPID_MLX_STATE_DIR``  — ``vllm_mlx/first_run.py::_state_dir``
-#   * ``RAPID_MLX_HOME``       — ``vllm_mlx/community_bench/*``
-#   * ``RAPID_MLX_DDTREE_PATCH_CACHE`` — ``vllm_mlx/speculative/ddtree/runtime.py``
+#   * ``RAPID_MLX_STATE_DIR``  — ``rapid_mlx/first_run.py::_state_dir``
+#   * ``RAPID_MLX_HOME``       — ``rapid_mlx/community_bench/*``
+#   * ``RAPID_MLX_DDTREE_PATCH_CACHE`` — ``rapid_mlx/speculative/ddtree/runtime.py``
 #   * ``RAPID_MLX_CONFIG_HOME`` — allowlisted; no current reader, kept for parity
 _RAPID_MLX_DIR_ENV_VARS = (
     "RAPID_MLX_STATE_DIR",
@@ -285,7 +398,10 @@ def _hermetic_hf_and_config_dirs(tmp_path, monkeypatch, request):
 
     # Application state is independent of the HF cache opt-in. A test that
     # reads real cached weights must still never read or mutate the developer's
-    # first-run/config/bench state under ~/.rapid-mlx.
+    # first-run/config/bench state under ~/.rapid-mlx. Telemetry's shared state
+    # root is isolated by ``_isolate_v2_telemetry_process_state`` above without
+    # changing HOME, so lazy HF/Transformers imports keep the documented real
+    # cache when a test opts in with ``real_hf_cache``.
     for var in _RAPID_MLX_DIR_ENV_VARS:
         monkeypatch.setenv(var, str(tmp_path / var.lower()))
 
@@ -369,7 +485,7 @@ _SCRIPT_ONLY_MODULES = {"regression_suite.py"}
 """Files inside ``tests/`` that define ``test_*`` symbols but are
 actually standalone scripts invoked by the doctor harness via
 subprocess against a live server (see
-``vllm_mlx/doctor/checks/api.py``). pytest must not run them as
+``rapid_mlx/doctor/checks/api.py``). pytest must not run them as
 unit tests — every call would fail with ``URLError`` and the
 diff-aware ``targeted_tests`` step in ``scripts/pr_validate``
 would flag any newly-added test in such a file as a regression.
@@ -387,14 +503,14 @@ def scheduler_config_stub(monkeypatch):
     import sys
     import types
 
-    turboquant_was_loaded = "vllm_mlx.turboquant" in sys.modules
+    turboquant_was_loaded = "rapid_mlx.turboquant" in sys.modules
     if importlib.util.find_spec("mlx") is None:
         # Import the server/tool-parser surface before installing the narrow
         # array shim, otherwise optional-dependency discovery could mistake
         # the shim for a complete MLX runtime.
         import numpy as np
 
-        import vllm_mlx.server  # noqa: F401
+        import rapid_mlx.server  # noqa: F401
 
         mlx = types.ModuleType("mlx")
         mlx.__path__ = []
@@ -407,7 +523,7 @@ def scheduler_config_stub(monkeypatch):
         monkeypatch.setitem(sys.modules, "mlx", mlx)
         monkeypatch.setitem(sys.modules, "mlx.core", mlx_core)
 
-    scheduler = types.ModuleType("vllm_mlx.scheduler")
+    scheduler = types.ModuleType("rapid_mlx.scheduler")
 
     class SchedulerConfig:
         def __init__(self, **kwargs):
@@ -421,10 +537,10 @@ def scheduler_config_stub(monkeypatch):
                 self.spec_decode = "mtp"
 
     scheduler.SchedulerConfig = SchedulerConfig
-    monkeypatch.setitem(sys.modules, "vllm_mlx.scheduler", scheduler)
+    monkeypatch.setitem(sys.modules, "rapid_mlx.scheduler", scheduler)
     yield SchedulerConfig
     if not turboquant_was_loaded:
-        sys.modules.pop("vllm_mlx.turboquant", None)
+        sys.modules.pop("rapid_mlx.turboquant", None)
 
 
 @pytest.fixture(autouse=True)
@@ -432,9 +548,9 @@ def _reset_global_parser_state_after_each_test():
     """Keep the process-global parser state hermetic across tests.
 
     Effective parser resolution reads TWO process-global sources (see
-    ``vllm_mlx/routes/models.py`` ``effective_parsers_for``): the
+    ``rapid_mlx/routes/models.py`` ``effective_parsers_for``): the
     ``ServerConfig`` singleton (``cfg.tool_call_parser``) AND the
-    ``vllm_mlx.server`` module-level ``_tool_call_parser`` fallback. Several
+    ``rapid_mlx.server`` module-level ``_tool_call_parser`` fallback. Several
     suites mutate either one directly and never restore it:
 
     * ``test_orphan_tool_validation`` / ``test_r12_reasoning_sanitizer_required``
@@ -459,16 +575,16 @@ def _reset_global_parser_state_after_each_test():
 
     # Reset only the parser state a test actually loaded. Guarding on
     # ``sys.modules`` (a) skips work for a module no test imported — it cannot
-    # have leaked — and (b) avoids importing ``vllm_mlx.server`` here, which
+    # have leaked — and (b) avoids importing ``rapid_mlx.server`` here, which
     # pulls ``uvicorn``: the lightweight "no-MLX" CI test job does not install
     # it, so an unconditional import ERRORs every test's teardown.
     import sys
 
-    _config_mod = sys.modules.get("vllm_mlx.config.server_config")
+    _config_mod = sys.modules.get("rapid_mlx.config.server_config")
     if _config_mod is not None:
         _config_mod.reset_config()
 
-    _server = sys.modules.get("vllm_mlx.server")
+    _server = sys.modules.get("rapid_mlx.server")
     if _server is not None:
         _server._tool_call_parser = None
         _server._reasoning_parser = None
@@ -523,7 +639,7 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "requires_mlx: mark a test that imports or otherwise needs mlx; it is "
-        "auto-skipped on the no-MLX CI leg (see HAS_MLX in this module and the "
+        "auto-skipped on the no-MLX CI leg (see _HAS_MLX in this module and the "
         "auto-skip in ``pytest_collection_modifyitems``). Deliberately NOT in "
         "the addopts ``-m`` default, so local dev still runs these when mlx is "
         "present.",
@@ -562,7 +678,7 @@ def pytest_collection_modifyitems(config, items):
     # is what lets a CI step run the whole suite and have mlx-bound tests drop
     # out on their own instead of being hand-curated into an exclusion roster.
     #
-    # Guard on ``not HAS_MLX`` so a dev machine WITH mlx (i.e. the current
+    # Guard on ``not _HAS_MLX`` so a dev machine WITH mlx (i.e. the current
     # host, or the Apple leg) runs these tests normally — the marker only bites
     # when mlx genuinely cannot be imported. We run this in
     # ``pytest_collection_modifyitems`` rather than an autouse fixture so the
@@ -574,7 +690,7 @@ def pytest_collection_modifyitems(config, items):
     # collection time (before modifyitems), which a marker cannot prevent — that
     # is exactly the shape the contract test tests/test_no_mlx_marker_contract.py
     # polices on the no-MLX leg.
-    if not HAS_MLX:
+    if not _HAS_MLX:
         skip_no_mlx = pytest.mark.skip(
             reason="requires mlx (not installed on this host)"
         )
@@ -592,7 +708,7 @@ def server_url(request):
 @pytest.fixture
 def clean_doctor_runtime_state(monkeypatch):
     """Reset every doctor runtime selection and probe cache around a test."""
-    from vllm_mlx.doctor import env_health
+    from rapid_mlx.doctor import env_health
 
     monkeypatch.setitem(sys.modules, "psutil", None)
     monkeypatch.setattr(env_health, "_SELECTED_RUNTIME", None)
@@ -631,7 +747,7 @@ def _telemetry_tests_run_off_the_build_machine(request, monkeypatch):
     """
     if "test_telemetry" not in request.node.fspath.basename:
         return
-    from vllm_mlx.telemetry.state import CI_ENV_VARS, DO_NOT_TRACK_ENV
+    from rapid_mlx.telemetry.state import CI_ENV_VARS, DO_NOT_TRACK_ENV
 
     for name in (DO_NOT_TRACK_ENV, *CI_ENV_VARS):
         monkeypatch.delenv(name, raising=False)

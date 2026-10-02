@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import sys
+import threading
 from types import ModuleType
 
 import pytest
@@ -34,15 +35,15 @@ import pytest
 @pytest.fixture(autouse=True)
 def _stub_apple_only_bench_runtime(monkeypatch):
     """Keep these CLI-order tests runnable in the Linux no-MLX lane."""
-    engine_core = ModuleType("vllm_mlx.engine_core")
+    engine_core = ModuleType("rapid_mlx.engine_core")
     engine_core.AsyncEngineCore = object
     engine_core.EngineConfig = object
     engine_core._init_mlx_step_thread = lambda: None
-    monkeypatch.setitem(sys.modules, "vllm_mlx.engine_core", engine_core)
+    monkeypatch.setitem(sys.modules, "rapid_mlx.engine_core", engine_core)
 
-    scheduler = ModuleType("vllm_mlx.scheduler")
+    scheduler = ModuleType("rapid_mlx.scheduler")
     scheduler.SchedulerConfig = object
-    monkeypatch.setitem(sys.modules, "vllm_mlx.scheduler", scheduler)
+    monkeypatch.setitem(sys.modules, "rapid_mlx.scheduler", scheduler)
 
 
 def _patch_mlx_lm_load(monkeypatch, fake_load) -> None:
@@ -51,7 +52,7 @@ def _patch_mlx_lm_load(monkeypatch, fake_load) -> None:
     ``bench_command`` and ``_run_submit_flow`` bind
     ``from .utils.tokenizer import load_model_with_fallback as load`` at
     call time — that's
-    ``getattr(sys.modules['vllm_mlx.utils.tokenizer'],
+    ``getattr(sys.modules['rapid_mlx.utils.tokenizer'],
     'load_model_with_fallback')`` resolved fresh each call. They used to
     bind ``mlx_lm.load`` directly, but that loader has no
     ``gemma4_unified`` architecture, so every ``gemma-4-12b-*`` alias
@@ -60,7 +61,7 @@ def _patch_mlx_lm_load(monkeypatch, fake_load) -> None:
     imports (``mlx_lm.generate``, ``mlx_lm.utils``…) the engine triggers
     during setup stay intact.
     """
-    from vllm_mlx.utils import tokenizer as _tokenizer_mod
+    from rapid_mlx.utils import tokenizer as _tokenizer_mod
 
     monkeypatch.setattr(
         _tokenizer_mod, "load_model_with_fallback", fake_load, raising=True
@@ -82,7 +83,7 @@ def _make_freeform_bench_args(model: str) -> argparse.Namespace:
         submit=False,
         force_disk_check=False,
         # PFlash knobs — all required by ``config_from_args``. Values
-        # match the CLI defaults (see ``vllm_mlx/args.py``).
+        # match the CLI defaults (see ``rapid_mlx/args.py``).
         pflash="off",
         pflash_threshold=1024,
         pflash_keep_ratio=0.20,
@@ -110,7 +111,7 @@ def test_bench_command_prefetches_via_mirror_before_hf_load(monkeypatch) -> None
     mirror at ``models.rapidmlx.com`` — the exact bypass that also
     hit ``jlens`` before PR #1045 and ``serve`` before #651.
     """
-    cli = importlib.import_module("vllm_mlx.cli")
+    cli = importlib.import_module("rapid_mlx.cli")
 
     order: list[str] = []
 
@@ -134,7 +135,7 @@ def test_bench_command_prefetches_via_mirror_before_hf_load(monkeypatch) -> None
     # Bypass the pflash alias-tier lookup (would touch aliases.json /
     # detect_model_config). The order test doesn't depend on it.
     monkeypatch.setattr(
-        "vllm_mlx.pflash.resolve_pflash_mode_default",
+        "rapid_mlx.pflash.resolve_pflash_mode_default",
         lambda args, *, model_name, is_multimodal=False, **_kw: "off",
     )
     # Route the ``from mlx_lm import load`` inside bench_command to
@@ -166,7 +167,7 @@ def test_bench_command_proceeds_when_mirror_prefetch_is_silent_noop(
     bench proceeds to ``mlx_lm.load`` which falls through to HF. Bench
     MUST NOT raise from the prefetch call site.
     """
-    cli = importlib.import_module("vllm_mlx.cli")
+    cli = importlib.import_module("rapid_mlx.cli")
 
     load_called: list[str] = []
 
@@ -183,7 +184,7 @@ def test_bench_command_proceeds_when_mirror_prefetch_is_silent_noop(
     monkeypatch.setattr(cli, "_check_memory_capacity", lambda *a, **kw: None)
     monkeypatch.setattr(cli, "_ensure_model_downloaded", _silent_prefetch)
     monkeypatch.setattr(
-        "vllm_mlx.pflash.resolve_pflash_mode_default",
+        "rapid_mlx.pflash.resolve_pflash_mode_default",
         lambda args, *, model_name, is_multimodal=False, **_kw: "off",
     )
     _patch_mlx_lm_load(monkeypatch, _fake_load)
@@ -214,7 +215,7 @@ def test_bench_command_loads_weights_on_mlx_step_worker(monkeypatch) -> None:
     """
     import threading
 
-    cli = importlib.import_module("vllm_mlx.cli")
+    cli = importlib.import_module("rapid_mlx.cli")
 
     load_thread: dict[str, str] = {}
 
@@ -228,7 +229,7 @@ def test_bench_command_loads_weights_on_mlx_step_worker(monkeypatch) -> None:
     monkeypatch.setattr(cli, "_check_memory_capacity", lambda *a, **kw: None)
     monkeypatch.setattr(cli, "_ensure_model_downloaded", lambda name: None)
     monkeypatch.setattr(
-        "vllm_mlx.pflash.resolve_pflash_mode_default",
+        "rapid_mlx.pflash.resolve_pflash_mode_default",
         lambda args, *, model_name, is_multimodal=False, **_kw: "off",
     )
     _patch_mlx_lm_load(monkeypatch, _fake_load)
@@ -247,6 +248,79 @@ def test_bench_command_loads_weights_on_mlx_step_worker(monkeypatch) -> None:
     )
 
 
+def test_bench_success_emits_model_served(monkeypatch) -> None:
+    """A successful weight load must twin bench's load-failure event."""
+    cli = importlib.import_module("rapid_mlx.cli")
+    scheduler = importlib.import_module("rapid_mlx.scheduler")
+    from rapid_mlx.telemetry import model_events, store
+
+    class ServedObservedError(Exception):
+        pass
+
+    model = object()
+    monkeypatch.setattr(cli, "_check_disk_space", lambda *a, **kw: None)
+    monkeypatch.setattr(cli, "_check_memory_capacity", lambda *a, **kw: None)
+    monkeypatch.setattr(cli, "_ensure_model_downloaded", lambda _name: None)
+    monkeypatch.setattr(
+        "rapid_mlx.pflash.resolve_pflash_mode_default",
+        lambda args, *, model_name, is_multimodal=False, **_kw: "off",
+    )
+    _patch_mlx_lm_load(monkeypatch, lambda _name: (model, object()))
+
+    events = []
+    rows = []
+    model_served_observed = threading.Event()
+
+    def note_model_served(model_id):
+        rows.append(model_id)
+        return 1
+
+    def observe(event, props, **kwargs):
+        events.append((event, props, kwargs))
+        model_served_observed.set()
+        raise ServedObservedError
+
+    monkeypatch.setattr(store, "note_model_served", note_model_served)
+    monkeypatch.setattr(
+        model_events,
+        "_submit_model_served",
+        lambda callback: (callback(), True)[1],
+    )
+    monkeypatch.setattr("rapid_mlx.telemetry.track._upload_allowed", lambda: True)
+    monkeypatch.setattr("rapid_mlx.telemetry.track.track", observe)
+    monkeypatch.setattr(
+        scheduler,
+        "SchedulerConfig",
+        lambda **_kwargs: (_ for _ in ()).throw(ServedObservedError()),
+    )
+
+    args = _make_freeform_bench_args("sdxl-base")
+    vars(args).update(
+        max_num_seqs=1,
+        prefill_batch_size=1,
+        completion_batch_size=1,
+        prefix_cache_size=1,
+        no_memory_aware_cache=True,
+        cache_memory_mb=0,
+        cache_memory_percent=0,
+        use_paged_cache=False,
+        paged_cache_block_size=16,
+        max_cache_blocks=1,
+        kv_cache_quantization=False,
+        kv_cache_quantization_bits=8,
+        kv_cache_quantization_group_size=64,
+        kv_cache_min_quantize_tokens=0,
+    )
+    with pytest.raises(ServedObservedError):
+        cli.bench_command(args)
+
+    assert model_served_observed.wait(timeout=5.0), "model_served was not emitted"
+    assert events[0][0] == "model_served"
+    assert events[0][1]["model"] == "sdxl-base"
+    assert events[0][1]["model"] != "<custom>"
+    assert rows == ["sdxl-base"]
+
+
 def _capture_bench_lane_signals(monkeypatch, cli):
     """Wire the bench PFlash default + validation seams to record the
     ``is_multimodal`` / ``is_mllm`` they receive, and abort before the heavy
@@ -260,8 +334,10 @@ def _capture_bench_lane_signals(monkeypatch, cli):
     def _capture_validate(config, *, model_name, is_mllm):
         seen["validate_is_mllm"] = is_mllm
 
-    monkeypatch.setattr("vllm_mlx.pflash.resolve_pflash_mode_default", _capture_default)
-    monkeypatch.setattr("vllm_mlx.pflash.validate_model_support", _capture_validate)
+    monkeypatch.setattr(
+        "rapid_mlx.pflash.resolve_pflash_mode_default", _capture_default
+    )
+    monkeypatch.setattr("rapid_mlx.pflash.validate_model_support", _capture_validate)
     monkeypatch.setattr(cli, "_check_disk_space", lambda *a, **kw: None)
     monkeypatch.setattr(cli, "_check_memory_capacity", lambda *a, **kw: None)
     monkeypatch.setattr(cli, "_ensure_model_downloaded", lambda name: None)
@@ -282,8 +358,8 @@ def test_bench_command_hybrid_vlm_benches_on_text_lane(monkeypatch, capsys) -> N
     the text lane (``is_mllm=False``) and the auto-downgrade is surfaced to the
     user for lane attribution (#352).
     """
-    cli = importlib.import_module("vllm_mlx.cli")
-    from vllm_mlx.api import utils as api_utils
+    cli = importlib.import_module("rapid_mlx.cli")
+    from rapid_mlx.api import utils as api_utils
 
     # Hybrid VLM: resolver returns (is_mllm_lane=False, auto_text_fallback=True).
     monkeypatch.setattr(
@@ -311,8 +387,8 @@ def test_bench_command_genuine_vlm_validates_on_text_lane(monkeypatch, capsys) -
     never rejecting a PFlash option as if an MLLM lane were in use. No
     auto-downgrade note fires for a genuine VLM (it is not a #352 downgrade).
     """
-    cli = importlib.import_module("vllm_mlx.cli")
-    from vllm_mlx.api import utils as api_utils
+    cli = importlib.import_module("rapid_mlx.cli")
+    from rapid_mlx.api import utils as api_utils
 
     # Genuine VLM: resolver returns (is_mllm_lane=True, auto_text_fallback=False).
     monkeypatch.setattr(
@@ -342,7 +418,7 @@ def _install_submit_flow_stubs(monkeypatch, cli, *, alias: str, hf_path: str):
     # so the ``is_apple_silicon`` gate would exit 2 before our mocks
     # get to observe anything.
     monkeypatch.setattr(
-        "vllm_mlx.community_bench.hardware.is_apple_silicon", lambda: True
+        "rapid_mlx.community_bench.hardware.is_apple_silicon", lambda: True
     )
 
     # Whitelist lookup: return a stub profile with our controlled hf_path
@@ -352,7 +428,7 @@ def _install_submit_flow_stubs(monkeypatch, cli, *, alias: str, hf_path: str):
             self.hf_path = hf_path
 
     monkeypatch.setattr(
-        "vllm_mlx.model_aliases.resolve_profile",
+        "rapid_mlx.model_aliases.resolve_profile",
         lambda name: _Profile(hf_path),
     )
 
@@ -371,7 +447,7 @@ def test_run_submit_flow_prefetches_via_mirror_before_hf_load(
     print on the contributor's terminal; deferring to the executor would
     hide them behind the ``Loading model …`` line above.
     """
-    cli = importlib.import_module("vllm_mlx.cli")
+    cli = importlib.import_module("rapid_mlx.cli")
 
     order: list[str] = []
 
@@ -413,6 +489,251 @@ def test_run_submit_flow_prefetches_via_mirror_before_hf_load(
     ], f"order violation: {order}"
 
 
+def test_submit_refuses_unbenchmarked_dedicated_runtime_before_download(
+    monkeypatch, capsys
+) -> None:
+    cli = importlib.import_module("rapid_mlx.cli")
+    from rapid_mlx.community_bench import workspace
+
+    _install_submit_flow_stubs(
+        monkeypatch,
+        cli,
+        alias="deepseek-v41-flash-reap-2bit",
+        hf_path="rapid-mlx/DeepSeek-V4.1-Flash-REAP-2bit-MLX",
+    )
+    monkeypatch.setattr(
+        workspace,
+        "benchmark_runtime_readiness",
+        lambda _alias, _task: {
+            "status": "unavailable",
+            "message": "dedicated runtime is not benchmarkable",
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "_ensure_model_downloaded",
+        lambda *_args, **_kwargs: pytest.fail("download must not start"),
+    )
+
+    args = argparse.Namespace(
+        model="deepseek-v41-flash-reap-2bit",
+        submit=True,
+        sampled=False,
+        notes=None,
+        force_disk_check=False,
+    )
+    assert cli._run_submit_flow(args) == 2
+    assert "dedicated runtime is not benchmarkable" in capsys.readouterr().out
+
+
+def test_submit_retries_architecture_rejection_with_serving_runtime(
+    monkeypatch, capsys
+) -> None:
+    cli = importlib.import_module("rapid_mlx.cli")
+    from rapid_mlx.community_bench import local_runner
+    from rapid_mlx.engine import batched
+
+    events: list[str] = []
+    _install_submit_flow_stubs(
+        monkeypatch,
+        cli,
+        alias="future-text-4bit",
+        hf_path="vendor/Future-Text-4bit",
+    )
+    monkeypatch.setattr(cli, "_ensure_model_downloaded", lambda _name: None)
+    monkeypatch.setattr(local_runner, "_uses_serving_benchmark_engine", lambda _: False)
+    _patch_mlx_lm_load(
+        monkeypatch,
+        lambda _name: (_ for _ in ()).throw(
+            ValueError("Model type future_text not supported.")
+        ),
+    )
+    monkeypatch.setattr(
+        sys.modules["rapid_mlx.scheduler"],
+        "SchedulerConfig",
+        lambda **_kwargs: object(),
+    )
+
+    class FakeServingEngine:
+        def __init__(self, *_args, **_kwargs):
+            events.append("serving:init")
+
+        async def start(self):
+            events.append("serving:start")
+            raise RuntimeError("stop after proving fallback")
+
+        async def stop(self):
+            events.append("serving:stop")
+            raise RuntimeError("cleanup must not mask startup failure")
+
+    monkeypatch.setattr(batched, "BatchedEngine", FakeServingEngine)
+
+    args = argparse.Namespace(
+        model="future-text-4bit",
+        submit=True,
+        sampled=False,
+        notes=None,
+        force_disk_check=False,
+    )
+    assert cli._run_submit_flow(args) == 2
+    assert events == ["serving:init", "serving:start", "serving:stop"]
+    assert "stop after proving fallback" in capsys.readouterr().out
+
+
+def _install_successful_serving_submit_stubs(monkeypatch, cli):
+    from rapid_mlx.community_bench import hardware, local_runner, runner, submission
+    from rapid_mlx.engine import batched
+
+    events = []
+    _install_submit_flow_stubs(
+        monkeypatch,
+        cli,
+        alias="glm5.3-flash-4bit",
+        hf_path="vendor/GLM-5.3-Flash-4bit",
+    )
+    monkeypatch.setattr(cli, "_ensure_model_downloaded", lambda _name: None)
+    monkeypatch.setattr(local_runner, "_uses_serving_benchmark_engine", lambda _: True)
+    monkeypatch.setattr(
+        "rapid_mlx.community_bench.workspace.benchmark_runtime_readiness",
+        lambda *_args: {"status": "ready"},
+    )
+
+    class SchedulerConfig:
+        mtp_max_k = None
+
+        def __init__(self, **_kwargs):
+            pass
+
+    class EngineConfig:
+        def __init__(self, **_kwargs):
+            pass
+
+    class Engine:
+        def __init__(self, *_args, **_kwargs):
+            self.tokenizer = object()
+
+        async def start(self):
+            events.append("start")
+
+        async def stop(self):
+            events.append("stop")
+
+    monkeypatch.setattr(
+        sys.modules["rapid_mlx.scheduler"], "SchedulerConfig", SchedulerConfig
+    )
+    monkeypatch.setattr(
+        sys.modules["rapid_mlx.engine_core"], "EngineConfig", EngineConfig
+    )
+    monkeypatch.setattr(batched, "BatchedEngine", Engine)
+    monkeypatch.setattr(
+        hardware,
+        "collect",
+        lambda: (
+            argparse.Namespace(chip="M3 Ultra", ram_gb=256, cpu_cores=32, gpu_cores=80),
+            argparse.Namespace(
+                macos="26", rapid_mlx="0.14.2", mlx="0.32", python="3.12"
+            ),
+        ),
+    )
+    monkeypatch.setattr(submission, "build_submission_payload", lambda **kwargs: kwargs)
+    return events, runner, submission
+
+
+def _serving_submit_args(**overrides):
+    values = {
+        "model": "glm5.3-flash-4bit",
+        "submit": True,
+        "sampled": False,
+        "notes": None,
+        "force_disk_check": False,
+        "spec_decode": "none",
+        "run_group": None,
+        "repo_root": None,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def test_submit_serving_runtime_runs_all_modes_and_reaps_engine(
+    monkeypatch, capsys
+) -> None:
+    cli = importlib.import_module("rapid_mlx.cli")
+    from rapid_mlx.community_bench.runner import BenchResult, BucketResult, RoundResult
+
+    events, runner, submission = _install_successful_serving_submit_stubs(
+        monkeypatch, cli
+    )
+    rounds = [RoundResult(100, 200, 10, prompt_tokens=512, output_tokens=128)] * 5
+    result = BenchResult(
+        short=BucketResult(rounds),
+        long=BucketResult(rounds),
+        peak_ram_mb=1,
+        prompt_hash="hash",
+        sampling="greedy",
+    )
+    modes = []
+
+    async def run_bench(*_args, **kwargs):
+        modes.append(kwargs["sampling"])
+        return result
+
+    returns = iter((0, 7))
+    monkeypatch.setattr(runner, "run_standardized_bench", run_bench)
+    monkeypatch.setattr(submission, "submit_interactive", lambda *_args: next(returns))
+
+    assert cli._run_submit_flow(_serving_submit_args(sampled=True)) == 7
+    assert modes == ["greedy", "sampled"]
+    assert events == ["start", "stop"]
+    assert "short: decode=" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("standardized bench requires exactly 512 tokens. got 3", 1),
+        ("unrelated benchmark failure", None),
+    ],
+)
+def test_submit_serving_runtime_reports_exact_length_failure_and_propagates_other_errors(
+    monkeypatch, message, expected
+) -> None:
+    cli = importlib.import_module("rapid_mlx.cli")
+    events, runner, _submission = _install_successful_serving_submit_stubs(
+        monkeypatch, cli
+    )
+
+    async def fail(*_args, **_kwargs):
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(runner, "run_standardized_bench", fail)
+    if expected is None:
+        with pytest.raises(RuntimeError, match=message):
+            cli._run_submit_flow(_serving_submit_args())
+    else:
+        assert cli._run_submit_flow(_serving_submit_args()) == expected
+    assert events == ["start", "stop"]
+
+
+def test_submit_native_loader_os_error_reaps_executor(monkeypatch) -> None:
+    cli = importlib.import_module("rapid_mlx.cli")
+    from rapid_mlx.community_bench import local_runner
+
+    _install_submit_flow_stubs(
+        monkeypatch,
+        cli,
+        alias="qwen3.5-9b-4bit",
+        hf_path="vendor/qwen",
+    )
+    monkeypatch.setattr(cli, "_ensure_model_downloaded", lambda _name: None)
+    monkeypatch.setattr(local_runner, "_uses_serving_benchmark_engine", lambda _: False)
+    _patch_mlx_lm_load(
+        monkeypatch,
+        lambda _name: (_ for _ in ()).throw(OSError("checkpoint missing")),
+    )
+
+    assert cli._run_submit_flow(_serving_submit_args(model="qwen3.5-9b-4bit")) == 2
+
+
 def test_run_submit_flow_proceeds_when_mirror_prefetch_is_silent_noop(
     monkeypatch,
 ) -> None:
@@ -420,7 +741,7 @@ def test_run_submit_flow_proceeds_when_mirror_prefetch_is_silent_noop(
     ``_ensure_model_downloaded`` returns None (cached / mirror miss /
     disabled mirror), ``_run_submit_flow`` MUST proceed to
     ``mlx_lm.load``, which then completes the pull via HF."""
-    cli = importlib.import_module("vllm_mlx.cli")
+    cli = importlib.import_module("rapid_mlx.cli")
 
     load_called: list[str] = []
 

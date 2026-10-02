@@ -50,6 +50,22 @@ struct FailureDiagnosis: Equatable, Sendable {
         case downloadCancelled
         case downloadSourceUnavailable
         case requestFailed
+        /// The conversation (or a single message) is longer than the model's
+        /// context window. Distinct from ``requestFailed`` because the remedy
+        /// is specific and a plain "Try again" is actively wrong — resending
+        /// the same too-long prompt fails identically. The engine emits
+        /// ``context_length_exceeded``; the copy names the real fixes.
+        case promptTooLong
+        /// The requested model isn't available on the server. Engine code
+        /// ``model_not_found``. Distinct from ``modelLoadFailed`` (a model that
+        /// exists but couldn't start): here the name simply isn't served, so
+        /// the destination is Model Management, not a file check.
+        case modelUnavailable
+        /// The primary model was replaced under a running request, so the
+        /// engine cancelled it (code ``model_replacement``). Not a fault — a
+        /// ``.notice`` — so it must not wear the alarming failure lane; the
+        /// only recovery is to ask again against the new model.
+        case requestSuperseded
 
         /// Forward-tolerant decode, matching ``ChatMessage/Role`` and
         /// ``ChatMessage/Status``: a raw value this build doesn't know (a
@@ -88,6 +104,12 @@ struct FailureDiagnosis: Equatable, Sendable {
             // rather than by nobody having tried it.
             case .downloadCancelled:
                 return .downloadFailed
+            // Added after the same release, so each carries the downgrade
+            // hazard: ``.requestFailed`` is the honest generic ancestor an
+            // older build already knows — a chat that stopped short reads as
+            // "couldn't finish that request", which is true for all three.
+            case .promptTooLong, .modelUnavailable, .requestSuperseded:
+                return .requestFailed
             case .modelOutOfMemory, .modelLoadFailed, .engineNotRunning,
                  .webSearchOffline, .webSearchUnavailable,
                  .commandPermissionDenied, .commandFailed,
@@ -221,7 +243,11 @@ extension FailureDiagnosis.Kind {
         // declines a permission prompt, the other stops a transfer already
         // running. Painting either red tells somebody their own decision
         // broke something.
-        case .userDeclined, .downloadCancelled:
+        // A model swap under a running request cancelled it: the engine did
+        // exactly what was asked (load the new model) and nothing malfunctioned,
+        // so this is a calm notice, not a red fault. The recovery is simply to
+        // ask again against the model that is now loaded.
+        case .userDeclined, .downloadCancelled, .requestSuperseded:
             return .notice
         // A throttled backend is something that went wrong out in the world,
         // not something the user picked — it stays on the error lane, and its
@@ -233,7 +259,8 @@ extension FailureDiagnosis.Kind {
              .browsePageTooLarge,
              .commandPermissionDenied, .commandFailed,
              .fileNotFound, .filePermissionDenied, .toolFailed,
-             .downloadFailed, .downloadSourceUnavailable, .requestFailed:
+             .downloadFailed, .downloadSourceUnavailable, .requestFailed,
+             .promptTooLong, .modelUnavailable:
             return .error
         }
     }
@@ -314,7 +341,12 @@ enum FailureDiagnoser {
             message = "Rapid doesn't have access to that file."
             action = nil
         case .toolFailed:
-            message = "The tool couldn't finish. Check its input, then try again."
+            // "Check its input" pointed the user at the one thing they do not
+            // control: the arguments are written by the model, and a user
+            // reading "check its input" over an invented `{"url": ""}` has
+            // nothing to check (0.14.1 mini dogfood). State whose step failed
+            // and leave the recovery — asking again — on the button.
+            message = "A tool step didn't go through. The model can usually recover if you ask again."
             action = .retry
         case .userDeclined:
             // Nothing went wrong, so the copy states the outcome and stops.
@@ -347,6 +379,22 @@ enum FailureDiagnoser {
             action = .switchDownloadSource
         case .requestFailed:
             message = "Rapid couldn't finish that request. Try again, or restart the model."
+            action = .retry
+        case .promptTooLong:
+            // No plain "Try again": resending the same over-long prompt fails
+            // identically. Name the two fixes the user owns (shorten / new
+            // chat) and offer the one this app can carry out — pick a
+            // larger-context model — as the button.
+            message = "This conversation is longer than the model's context window. Shorten your message or start a new chat, or switch to a model with a larger context window."
+            action = .openModelManagement
+        case .modelUnavailable:
+            message = "That model isn't available on the server. Open Model Management to choose or start one."
+            action = .openModelManagement
+        case .requestSuperseded:
+            // A ``.notice`` (see ``severity``): the model was switched on
+            // purpose, so state what happened plainly and offer to ask again
+            // against the model that is now loaded.
+            message = "The model was switched, so this request stopped. Ask again to continue."
             action = .retry
         }
         return FailureDiagnosis(kind: kind, message: message, action: action)
@@ -452,9 +500,68 @@ enum FailureDiagnoser {
         return .engineNotRunning
     }
 
+    /// Stable server error-code -> diagnosis kind. The engine emits a
+    /// machine-readable ``error.code`` in its OpenAI-shaped envelope
+    /// (rapid-mlx #3564) precisely so the GUI can classify a failure by
+    /// CATEGORY without substring-matching a message the engine has already
+    /// sanitised (a generation-time OOM reaches the client as a bare
+    /// ``"Internal server error"`` -- no keyword can recover it). Unknown or
+    /// absent codes return ``nil`` so the caller falls back to the keyword +
+    /// status heuristics (older engines, or codes this build doesn't know yet).
+    nonisolated static func kind(forEngineCode code: String?) -> FailureDiagnosis.Kind? {
+        switch code {
+        case "insufficient_memory", "model_out_of_memory":
+            return .modelOutOfMemory
+        case "model_load_failed":
+            return .modelLoadFailed
+        case "engine_aborted":
+            // A genuine transient engine abort: retrying is the right recovery,
+            // which is exactly what ``.requestFailed`` offers. OOM is split out
+            // above so it gets the memory-specific card instead of a retry that
+            // would fail identically.
+            return .requestFailed
+        case "context_length_exceeded":
+            // The prompt/conversation is past the window. A retry of the same
+            // input fails identically, so this must NOT collapse to the
+            // generic retry card.
+            return .promptTooLong
+        case "model_not_found":
+            return .modelUnavailable
+        case "model_replacement":
+            // Cooperative cancel from a model swap — a calm notice, not a
+            // fault. Kept off ``.requestFailed`` so it isn't painted red.
+            return .requestSuperseded
+        default:
+            return nil
+        }
+    }
+
+    /// Decode the stable ``error.code`` from a rapid-mlx OpenAI-shaped error
+    /// body, or ``nil`` when the body isn't that shape. Reuses
+    /// ``Wire.ErrorEnvelope`` -- the same decoder ``ChatStreamClient`` uses for
+    /// attachment-rejection codes -- so the app has ONE on-the-wire error
+    /// schema, not two.
+    nonisolated static func engineErrorCode(fromBody body: String) -> String? {
+        guard let data = body.data(using: .utf8),
+              let envelope = try? JSONDecoder().decode(
+                Wire.ErrorEnvelope.self, from: data
+              ),
+              let code = envelope.error.code?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+              ),
+              !code.isEmpty
+        else { return nil }
+        return code
+    }
+
     nonisolated static func chatFailureKind(raw: String) -> FailureDiagnosis.Kind {
+        // Structured code first -- it survives the engine's message
+        // sanitisation (#3564), unlike the keyword scan below.
+        if let mapped = kind(forEngineCode: engineErrorCode(fromBody: raw)) {
+            return mapped
+        }
         let value = raw.lowercased()
-        if containsAny(value, ["out of memory", "more memory", "memory than your mac"]) {
+        if containsAny(value, memorySignals) {
             return .modelOutOfMemory
         }
         if containsAny(value, [
@@ -472,6 +579,14 @@ enum FailureDiagnoser {
             case .streamTruncated:
                 return .engineNotRunning
             case .httpStatus(_, let body), .transport(let body):
+                // Prefer the engine's stable, machine-readable error.code
+                // (#3564): it survives the engine's message sanitisation, so
+                // it is the only reliable category signal on a sanitised 5xx
+                // body (a generation-time OOM arrives as "Internal server
+                // error" with no keyword to match).
+                if let mapped = kind(forEngineCode: engineErrorCode(fromBody: body)) {
+                    return mapped
+                }
                 if modelLoadFailureKind(raw: body) == .modelOutOfMemory {
                     return .modelOutOfMemory
                 }
@@ -534,6 +649,11 @@ enum FailureDiagnoser {
     nonisolated private static let memorySignals = [
         "out of memory", "insufficient memory", "memory pressure", "metal-cap",
         "gpu_memory_utilization", "projected kv", "metal active",
+        // User-facing phrasings the chat lane historically matched (#3564:
+        // folded into the shared list so every diagnosis path — chat, load,
+        // and 5xx body — recognises the same memory signals, not two divergent
+        // sets).
+        "more memory", "memory than your mac",
     ]
 
     nonisolated private static let modelLoadSignals = [

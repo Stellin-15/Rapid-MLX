@@ -6,6 +6,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -13,8 +14,8 @@ from PIL import Image
 
 mx = pytest.importorskip("mlx.core", reason="requires Apple MLX")
 
-from vllm_mlx.patches import glm5_next_processor as processor_patch
-from vllm_mlx.patches.glm5_next_processor import (
+from rapid_mlx.patches import glm5_next_processor as processor_patch
+from rapid_mlx.patches.glm5_next_processor import (
     Glm5NextImageProcessor,
     Glm5NextProcessor,
     smart_resize,
@@ -468,7 +469,7 @@ import sys
 from pathlib import Path
 
 model_path = Path(sys.argv[1])
-from vllm_mlx.patches import glm5_next_processor as patch
+from rapid_mlx.patches import glm5_next_processor as patch
 patch.Glm5NextProcessor.from_pretrained = classmethod(
     lambda cls, path, **kwargs: ("glm5-next", str(path))
 )
@@ -491,10 +492,10 @@ assert MODEL_CONFIG["glm5_next"] is MessageFormat.LIST_WITH_IMAGE_FIRST
 
 def test_mllm_load_installs_processor_before_runtime_load() -> None:
     script = """
-from vllm_mlx.models import mllm
-from vllm_mlx.patches import glm5_next_forget_gate_quant as quant_patch
-from vllm_mlx.patches import glm5_next_processor as patch
-from vllm_mlx.patches import glm5_next_runtime as runtime_patch
+from rapid_mlx.models import mllm
+from rapid_mlx.patches import glm5_next_forget_gate_quant as quant_patch
+from rapid_mlx.patches import glm5_next_processor as patch
+from rapid_mlx.patches import glm5_next_runtime as runtime_patch
 
 events = []
 patch.install_glm5_next_processor_patch = lambda: events.append("processor")
@@ -503,6 +504,8 @@ runtime_patch.install_glm5_next_runtime_fix = lambda: events.append("runtime")
 mllm._require_mlx_vlm = lambda: None
 
 import mlx_vlm
+import mlx_vlm.utils
+mlx_vlm.utils.load_config = lambda *args, **kwargs: {}
 mlx_vlm.load = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stop"))
 
 try:
@@ -519,3 +522,38 @@ assert events == ["runtime", "processor", "quant"]
         capture_output=True,
         text=True,
     )
+
+
+def test_mllm_load_enables_moe_fusion_for_glm5(monkeypatch) -> None:
+    import mlx_vlm
+    import mlx_vlm.utils
+
+    from rapid_mlx import moe_fusion
+    from rapid_mlx.models import mllm
+    from rapid_mlx.utils import tokenizer as tokenizer_utils
+
+    model = SimpleNamespace(config=SimpleNamespace())
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    fused = []
+    monkeypatch.setattr(mllm, "_require_mlx_vlm", lambda: None)
+    monkeypatch.setattr(mlx_vlm, "load", lambda *args, **kwargs: (model, processor))
+    monkeypatch.setattr(
+        mlx_vlm.utils,
+        "load_config",
+        lambda *args, **kwargs: {"model_type": "glm5_next"},
+    )
+    monkeypatch.setattr(moe_fusion, "fuse_gate_up", fused.append)
+    monkeypatch.setattr(
+        tokenizer_utils,
+        "augment_eos_token_ids_from_generation_config",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        tokenizer_utils,
+        "repair_byte_level_decoder",
+        lambda *args, **kwargs: None,
+    )
+
+    mllm.MLXMultimodalLM("local/glm5-next").load()
+
+    assert fused == [model]

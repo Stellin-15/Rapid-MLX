@@ -44,8 +44,11 @@ pytestmark = pytest.mark.requires_mlx
 import json
 import sys
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
-from vllm_mlx.models import gemma4_text
+from rapid_mlx.model_load_errors import QuantizationMismatch
+from rapid_mlx.models import gemma4_text
+from rapid_mlx.telemetry.model_events import serve_error_class
 
 
 def _write_config(tmp_path: Path, model_type: str) -> Path:
@@ -137,8 +140,8 @@ def test_load_plan_rejects_unknown_object_config(tmp_path):
 
 
 def test_unified_shared_kv_resolver_forces_metadata_preserving_classes():
-    from vllm_mlx.models.gemma4_vendored.config import TextConfig
-    from vllm_mlx.models.gemma4_vendored.language import LanguageModel
+    from rapid_mlx.models.gemma4_vendored.config import TextConfig
+    from rapid_mlx.models.gemma4_vendored.language import LanguageModel
 
     assert gemma4_text._resolve_gemma4_unified_text_classes(
         {"num_kv_shared_layers": 1}
@@ -292,8 +295,8 @@ def test_unified_resolver_falls_back_to_vendored_without_mlx_vlm(monkeypatch):
     ``rapid-mlx serve gemma-4-12b`` died on a missing mlx-vlm."""
     _block_mlx_vlm(monkeypatch)
     tc, lm = gemma4_text._resolve_gemma4_unified_text_classes()
-    assert tc.__module__ == "vllm_mlx.models.gemma4_vendored.config"
-    assert lm.__module__ == "vllm_mlx.models.gemma4_vendored.language"
+    assert tc.__module__ == "rapid_mlx.models.gemma4_vendored.config"
+    assert lm.__module__ == "rapid_mlx.models.gemma4_vendored.language"
 
 
 def test_base_resolver_falls_back_to_vendored_without_mlx_vlm(monkeypatch):
@@ -301,8 +304,8 @@ def test_base_resolver_falls_back_to_vendored_without_mlx_vlm(monkeypatch):
     mlx-vlm (existing 0.10.1 contract, re-pinned)."""
     _block_mlx_vlm(monkeypatch)
     tc, lm = gemma4_text._resolve_gemma4_text_classes()
-    assert tc.__module__ == "vllm_mlx.models.gemma4_vendored.config"
-    assert lm.__module__ == "vllm_mlx.models.gemma4_vendored.language"
+    assert tc.__module__ == "rapid_mlx.models.gemma4_vendored.config"
+    assert lm.__module__ == "rapid_mlx.models.gemma4_vendored.language"
 
 
 def test_unified_loader_reaches_weight_check_without_mlx_vlm(tmp_path, monkeypatch):
@@ -361,7 +364,7 @@ def test_dispatch_routes_to_matching_loader(
     We force the "native mlx-lm load failed" branch (so the explicit
     loaders run) by making the ``load`` symbol the dispatch calls raise,
     and stub both loaders to record which one fired. This exercises the
-    real routing decision in ``vllm_mlx/utils/tokenizer.py`` without any
+    real routing decision in ``rapid_mlx/utils/tokenizer.py`` without any
     weight download.
 
     ``_load_model_with_fallback_impl`` rebinds ``load`` locally via
@@ -371,7 +374,7 @@ def test_dispatch_routes_to_matching_loader(
     coincidence via a native load that happened to succeed or a different
     rejection path.
     """
-    from vllm_mlx.utils import tokenizer as tok
+    from rapid_mlx.utils import tokenizer as tok
 
     d = _write_config(tmp_path, model_type)
 
@@ -428,7 +431,7 @@ def test_dispatch_shared_kv_uses_metadata_preserving_loader(
     tmp_path, monkeypatch, model_type, expected_loader
 ):
     """Shared-KV checkpoints must not enter the native loader first."""
-    from vllm_mlx.utils import tokenizer as tok
+    from rapid_mlx.utils import tokenizer as tok
 
     d = _write_config(tmp_path, model_type)
     (d / "config.json").write_text(
@@ -496,3 +499,140 @@ def test_wrapper_reports_routed_model_type(routed, inner, expected):
 
     wrapper = gemma4_text.Gemma4TextWrapper(_FakeLM(), routed_model_type=routed)
     assert wrapper.model_type == expected
+
+
+@pytest.mark.parametrize("mixed_quantization", [False, True])
+def test_loader_routes_quantization_and_checked_weight_load(
+    tmp_path, monkeypatch, mixed_quantization
+):
+    """Exercise both checkpoint quantization paths through their typed wrappers."""
+
+    quantization = {"bits": 4, "group_size": 64}
+    if mixed_quantization:
+        quantization["language_model.model.layers.0.proj"] = {
+            "bits": 8,
+            "group_size": 64,
+        }
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "gemma4",
+                "num_kv_shared_layers": 0,
+                "quantization": quantization,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "model.safetensors").write_bytes(b"fixture")
+
+    class TextConfig:
+        @classmethod
+        def from_dict(cls, _config):
+            return cls()
+
+    class LanguageModel:
+        def __init__(self, config):
+            self.config = config
+            self.model = SimpleNamespace(embed_tokens=object())
+            self.model_type = "gemma4_text"
+            self.layers = []
+
+    utils = ModuleType("mlx_lm.utils")
+    expected_tokenizer = object()
+    utils.load_tokenizer = lambda *_args, **_kwargs: expected_tokenizer
+    mlx_lm = ModuleType("mlx_lm")
+    mlx_lm.utils = utils
+    monkeypatch.setitem(sys.modules, "mlx_lm", mlx_lm)
+    monkeypatch.setitem(sys.modules, "mlx_lm.utils", utils)
+    monkeypatch.setattr(gemma4_text, "_check_kv_share_config", lambda *_args: None)
+    weight = object()
+    monkeypatch.setattr(gemma4_text.mx, "load", lambda _path: {"weight": weight})
+    monkeypatch.setattr(gemma4_text, "_bare_fp_weight_paths", lambda _weights: set())
+
+    quantize_calls = []
+
+    def checked_quantize(_quantizer, _model, **kwargs):
+        quantize_calls.append(kwargs)
+        predicate = kwargs["class_predicate"]
+        module = SimpleNamespace(to_quantized=True)
+        if mixed_quantization:
+            assert predicate("model.layers.0.proj", module) == {
+                "bits": 8,
+                "group_size": 64,
+            }
+        else:
+            assert predicate("model.layers.0.proj", module) is True
+
+    weight_calls = []
+    monkeypatch.setattr(gemma4_text, "quantize_checked", checked_quantize)
+    monkeypatch.setattr(
+        gemma4_text,
+        "load_weights_checked",
+        lambda model, weights, *, strict: weight_calls.append((model, weights, strict)),
+    )
+
+    model, tokenizer = gemma4_text._load_gemma4_text_impl(
+        tmp_path,
+        resolve_classes=lambda _config: (TextConfig, LanguageModel),
+        default_model_type="gemma4",
+    )
+
+    assert tokenizer is expected_tokenizer
+    assert len(quantize_calls) == 1
+    assert weight_calls == [(model, {"language_model.weight": weight}, False)]
+
+
+def test_shared_loader_quantization_failure_is_typed(tmp_path, monkeypatch):
+    """Keep Gemma 4's shared-KV loader on the concrete quantization boundary."""
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "gemma4",
+                "num_kv_shared_layers": 1,
+                "quantization": {"bits": 4, "group_size": 64},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "model.safetensors").write_bytes(b"fixture")
+
+    class TextConfig:
+        @classmethod
+        def from_dict(cls, _config):
+            return cls()
+
+    class LanguageModel:
+        def __init__(self, config):
+            self.config = config
+            self.model = SimpleNamespace(embed_tokens=object())
+            self.model_type = "gemma4_text"
+            self.layers = []
+
+    utils = ModuleType("mlx_lm.utils")
+    utils.load_tokenizer = lambda *_args, **_kwargs: object()
+    mlx_lm = ModuleType("mlx_lm")
+    mlx_lm.utils = utils
+    monkeypatch.setitem(sys.modules, "mlx_lm", mlx_lm)
+    monkeypatch.setitem(sys.modules, "mlx_lm.utils", utils)
+    monkeypatch.setattr(gemma4_text, "_check_kv_share_config", lambda *_args: None)
+    monkeypatch.setattr(gemma4_text.mx, "load", lambda _path: {"weight": object()})
+    monkeypatch.setattr(gemma4_text, "_bare_fp_weight_paths", lambda _weights: set())
+
+    def fail_quantization(*_args, **_kwargs):
+        raise ValueError(
+            "[quantized_matmul] The weight matrix should be uint32 "
+            "but received bfloat16"
+        )
+
+    monkeypatch.setattr(gemma4_text.nn, "quantize", fail_quantization)
+
+    with pytest.raises(QuantizationMismatch) as raised:
+        gemma4_text._load_gemma4_text_impl(
+            tmp_path,
+            resolve_classes=lambda _config: (TextConfig, LanguageModel),
+            default_model_type="gemma4",
+        )
+
+    assert isinstance(raised.value.__cause__, ValueError)
+    assert serve_error_class(raised.value) == "quantization_mismatch"

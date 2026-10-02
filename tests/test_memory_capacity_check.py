@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from vllm_mlx.cli import _check_memory_capacity
+from rapid_mlx.cli import _check_memory_capacity
 
 
 def _fake_psutil(total_gb: float, used_gb: float = 0.0):
@@ -191,6 +191,46 @@ def test_lower_tier_pick_keeps_measured_policy_on_a_larger_mac(monkeypatch, caps
     assert capsys.readouterr().out == ""
 
 
+def test_qwen_image_q4_uses_measured_working_set_on_busy_32gb_mac(capsys):
+    """The curated low-memory image pack must not use disk-size x1.5.
+
+    The M2 Pro dogfood host had 22 GiB already in use. Its measured 6 GiB
+    working set projects to 87.5%, below the supported-pick advisory floor;
+    treating the 8.9 GiB download as a generic model projects to 111% and
+    falsely warns about a kernel panic before a successful 6.2 GiB-peak run.
+    """
+    with patch.dict("sys.modules", {"psutil": _fake_psutil(32.0, used_gb=22.0)}):
+        _check_memory_capacity(
+            "mlx-community/Qwen-Image-2.1-mflux-q4", alias="qwen-image-2.1"
+        )
+    assert capsys.readouterr().out == ""
+
+
+def test_qwen_image_q4_still_warns_when_8gb_host_is_already_busy(capsys):
+    """The 8 GB catalog floor does not suppress genuine live pressure."""
+    with patch.dict("sys.modules", {"psutil": _fake_psutil(8.0, used_gb=3.0)}):
+        _check_memory_capacity(
+            "mlx-community/Qwen-Image-2.1-mflux-q4", alias="qwen-image-2.1"
+        )
+    out = capsys.readouterr().out
+    assert "Catalog working set:        6.0 GB" in out
+    assert "likely too large" in out
+
+
+def test_catalog_lookup_failure_uses_disk_fallback(monkeypatch, capsys):
+    """Catalog failures must keep the best-effort disk-size fallback working."""
+    _patch_size_bytes(monkeypatch, size_gb=2.0)
+    with (
+        patch.dict("sys.modules", {"psutil": _fake_psutil(32.0)}),
+        patch(
+            "rapid_mlx.model_aliases.resolve_profile",
+            side_effect=RuntimeError("catalog unavailable"),
+        ),
+    ):
+        _check_memory_capacity("/local/path/to/model", alias="unknown-alias")
+    assert capsys.readouterr().out == ""
+
+
 def test_silent_when_psutil_unavailable(monkeypatch, capsys):
     """Best-effort: if psutil can't be imported, fall through silently
     rather than blocking startup.
@@ -302,7 +342,7 @@ def test_check_is_wired_into_serve_and_bench():
     on stale comments containing the literal symbol. Bytecode loads
     don't include comments — only real references survive compilation.
     """
-    from vllm_mlx import cli
+    from rapid_mlx import cli
 
     assert _function_loads_global(cli.serve_command, "_check_memory_capacity"), (
         "serve_command must call _check_memory_capacity"

@@ -129,6 +129,9 @@ final class ChatViewModel {
     /// UUID on launch (opens to an empty "Ask anything"); ``persistActive``
     /// upserts under this id once the user sends.
     private(set) var activeConversationID = UUID()
+    /// Set only by the local New Chat command. Restore/import/sync paths never
+    /// populate it, so UI preferences cannot infer consent from a list delta.
+    private(set) var locallyCreatedConversationID: UUID?
 
     /// User-authored instructions for the open conversation. They are kept
     /// outside the visible transcript and merged into the wire-only system row.
@@ -159,6 +162,11 @@ final class ChatViewModel {
     /// a user wait through a long local-model loop. After the budget is spent
     /// we give the model one tools-disabled round to synthesize what it has.
     private let maxToolExecutions: Int = 3
+
+    /// Local document paging does not consume the general external-tool budget.
+    private let maxDocumentReads: Int = 12
+
+    nonisolated static let documentToolNames: Set<String> = ["read_document"]
 
     nonisolated private static let toolBudgetSynthesisPreamble = """
     The tool-use budget for this turn is exhausted. Do not request or describe any more tool calls. Answer the user's question now using the evidence already present in the conversation. If that evidence is insufficient, say what remains uncertain.
@@ -238,6 +246,26 @@ final class ChatViewModel {
 
     private var inflight: Task<Void, Never>?
 
+    /// A server-owned Agent Runtime turn projected into this transcript.
+    /// Chat remains the sole owner of message/history state while the runtime
+    /// owns planning, approvals, tools, and execution. The cancellation hook
+    /// lets every existing conversation transition stop the remote run through
+    /// the same ``cancelInflightWork`` funnel used by ordinary streaming.
+    private struct ExternalTurn {
+        let placeholderID: UUID
+        let epoch: Int
+        let alias: String
+        let cancel: @MainActor () -> Void
+    }
+
+    private var externalTurn: ExternalTurn?
+
+    /// Transcript ownership is distinct from the observed server phase. A
+    /// terminal server update can arrive one SwiftUI delivery turn before the
+    /// view projects it into Chat, so teardown must consult this source of
+    /// truth rather than only `AgentSessionController.isActive`.
+    var hasActiveAgentTurn: Bool { externalTurn != nil }
+
     /// The title / follow-up completions. One handle for both arms, so one
     /// `cancel()` stops everything this model started on its own account.
     private var backgroundAssist: Task<Void, Never>?
@@ -294,6 +322,8 @@ final class ChatViewModel {
     /// App-owned lifecycle signal for a real, visible assistant completion.
     /// Kept as a callback so chat has no dependency on telemetry policy.
     private let onProductValueDelivered: @MainActor (ProductValueKind) -> Void
+    /// Injectable so conversation deletion can remove extracts in isolated tests.
+    private let documentCache: DocumentContentCache
 
     init(
         client: ChatStreamClient = ChatStreamClient(),
@@ -305,7 +335,8 @@ final class ChatViewModel {
         server: ServerManager? = nil,
         persistsConversations: Bool = true,
         conversationStoreURL: URL? = nil,
-        onProductValueDelivered: @escaping @MainActor (ProductValueKind) -> Void = { _ in }
+        onProductValueDelivered: @escaping @MainActor (ProductValueKind) -> Void = { _ in },
+        documentCache: DocumentContentCache = .shared
     ) {
         self.client = client
         self.tools = tools
@@ -317,6 +348,7 @@ final class ChatViewModel {
         self.persistsConversations = persistsConversations
         self.conversationStoreURL = conversationStoreURL
         self.onProductValueDelivered = onProductValueDelivered
+        self.documentCache = documentCache
         // Seed disabledTools from the persistent store. Anything explicitly set
         // to ``false`` in UserDefaults goes in; unknown keys default to enabled.
         var disabled = Set<String>()
@@ -360,6 +392,177 @@ final class ChatViewModel {
     /// the next turn without re-initialising the chat loop.
     var enabledDefinitions: [ToolDefinition] {
         tools.definitions.filter { !disabledTools.contains($0.function.name) }
+    }
+
+    /// The small, built-in tool surface Personal Intelligence may project to
+    /// the server-owned loop. Keep connector tools and attachment-only reads
+    /// out until their permission/context contracts are represented by that
+    /// loop. The snapshot is frozen by ChatView for the lifetime of one run.
+    var personalIntelligenceDefinitions: [ToolDefinition] {
+        let supported: Set<String> = [
+            "web_search", "browse", "weather",
+            "local_search", "local_read", "local_write", "local_trash", "local_run",
+        ]
+        return builtinDefinitions.filter {
+            supported.contains($0.function.name)
+                && !disabledTools.contains($0.function.name)
+        }
+    }
+
+    /// User-authored instruction layers remain instructions in Personal
+    /// Intelligence; they must not be mixed into quoted memory/transcript data.
+    func personalIntelligenceTrustedInstructions() -> String? {
+        let global = customInstructions.global.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        let conversation = conversationInstructions.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+
+        func section(_ tag: String, _ content: String, budget: Int) -> String? {
+            guard !content.isEmpty else { return nil }
+            let opening = "<\(tag)>\n"
+            let closing = "\n</\(tag)>"
+            let overhead = opening.unicodeScalars.count + closing.unicodeScalars.count
+            guard budget > overhead else { return nil }
+            let kept = String(
+                String.UnicodeScalarView(content.unicodeScalars.prefix(budget - overhead))
+            )
+            return opening + kept + closing
+        }
+
+        // Reserve the wire budget for the higher-priority conversation layer
+        // first, but serialize global first so normal precedence remains clear.
+        var remaining = 8_192
+        let conversationSection = section(
+            "conversation_instructions", conversation, budget: remaining
+        )
+        remaining -= conversationSection?.unicodeScalars.count ?? 0
+        if conversationSection != nil, !global.isEmpty {
+            remaining = max(0, remaining - 2) // The section separator on the wire.
+        }
+        let globalSection = section("global_user_instructions", global, budget: remaining)
+        let sections = [globalSection, conversationSection].compactMap { $0 }
+        return sections.isEmpty ? nil : sections.joined(separator: "\n\n")
+    }
+
+    /// Bounded, transient quoted context for the server-owned loop. Recent
+    /// turns win the budget from newest to oldest so a follow-up never keeps
+    /// stale history at the expense of the immediately preceding answer.
+    func personalIntelligenceLocalContext() -> String? {
+        let maximumCharacters = 24_000
+        let recentPrefix = "<recent_conversation>\n"
+        let recentSuffix = "\n</recent_conversation>"
+        var recentRemaining = maximumCharacters
+            - recentPrefix.unicodeScalars.count
+            - recentSuffix.unicodeScalars.count
+        var recentRows: [String] = []
+        for message in messages.reversed() {
+            guard recentRemaining > 0, recentRows.count < 8 else { break }
+            guard message.status == .complete,
+                  message.role == .user || message.role == .assistant else { continue }
+            let content = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !content.isEmpty else { continue }
+            let rowPrefix = "\(message.role.rawValue): "
+            let separatorSize = recentRows.isEmpty ? 0 : 2
+            let fixedSize = separatorSize + rowPrefix.unicodeScalars.count
+            guard recentRemaining > fixedSize else { break }
+            let keptContent = String(String.UnicodeScalarView(
+                content.unicodeScalars.prefix(recentRemaining - fixedSize)
+            ))
+            recentRows.append(rowPrefix + keptContent)
+            recentRemaining -= fixedSize + keptContent.unicodeScalars.count
+        }
+
+        let recentSection: String? = recentRows.isEmpty ? nil :
+            recentPrefix + recentRows.reversed().joined(separator: "\n\n") + recentSuffix
+        var sections: [String] = []
+        if let memory = memoryStore?.formattedForPrompt() {
+            let memorySize = memory.unicodeScalars.count
+            let recentSize = recentSection?.unicodeScalars.count ?? 0
+            let separatorSize = recentSection == nil ? 0 : 2
+            // Never cut through the memory wrapper or a durable fact. Recent
+            // conversation owns the budget; memory is included only if its
+            // complete, separately labelled block still fits.
+            if memorySize + recentSize + separatorSize <= maximumCharacters {
+                sections.append(memory)
+            }
+        }
+        if let recentSection { sections.append(recentSection) }
+
+        guard !sections.isEmpty else { return nil }
+        let context = sections.joined(separator: "\n\n")
+        assert(context.unicodeScalars.count <= maximumCharacters)
+        return context
+    }
+
+    /// Structured user-authored history for intent routing. This travels next
+    /// to the quoted model context so assistant text cannot forge a `user:`
+    /// delimiter and grant itself a local follow-up tool.
+    func personalIntelligenceRecentUserMessages() -> [String] {
+        let maximumCharacters = 24_000
+        var remaining = maximumCharacters
+        var recent: [String] = []
+        for message in messages.reversed() {
+            guard remaining > 0, recent.count < 8 else { break }
+            guard message.status == .complete, message.role == .user else { continue }
+            let content = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !content.isEmpty else { continue }
+            let kept = String(String.UnicodeScalarView(
+                content.unicodeScalars.prefix(remaining)
+            ))
+            recent.append(kept)
+            remaining -= kept.unicodeScalars.count
+        }
+        return recent.reversed()
+    }
+
+    /// Execute one server-issued client action through the same schema and
+    /// registry boundary ordinary Chat uses. `executed` means dispatch crossed
+    /// into the concrete built-in tool, not merely that Desktop handled it.
+    func executePersonalIntelligenceTool(
+        _ action: AgentPendingAction,
+        advertised definitions: [ToolDefinition]
+    ) async -> AgentClientToolResult {
+        guard let definition = definitions.first(where: {
+            $0.function.name == action.name
+        }) else {
+            return AgentClientToolResult(
+                content: "The requested tool is not available in this Personal Intelligence run.",
+                isError: true,
+                executed: false
+            )
+        }
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(CodableJSON.object(action.arguments)),
+              let arguments = String(data: data, encoding: .utf8) else {
+            return AgentClientToolResult(
+                content: "The tool arguments could not be encoded.",
+                isError: true,
+                executed: false
+            )
+        }
+        let call = ToolCall(id: action.callID, name: action.name, arguments: arguments)
+        let normalized: ToolCall
+        switch NativeToolCallExecutor.normalize(call, for: definition) {
+        case .success(let value):
+            normalized = value
+        case .failure(let rejection):
+            return AgentClientToolResult(
+                content: "tool '\(action.name)' error: \(rejection.reason)",
+                isError: true,
+                executed: false
+            )
+        }
+        let result = await tools.run(normalized)
+        return AgentClientToolResult(
+            content: result.content,
+            isError: result.isError,
+            executed: result.executed,
+            declined: result.failureKind == .userDeclined
+        )
     }
 
     /// Just the built-in tools, for Settings → Tools.
@@ -461,6 +664,7 @@ final class ChatViewModel {
     private func cancelInflightWork() {
         inflight?.cancel()
         inflight = nil
+        cancelExternalTurn(requestRemoteCancellation: true)
         backgroundAssist?.cancel()
         backgroundAssist = nil
         // The rail belongs to the assist, so it is torn down with it. Keeping
@@ -907,6 +1111,7 @@ final class ChatViewModel {
     /// currently open first. Cancels any in-flight stream.
     func selectConversation(_ id: UUID) {
         guard id != activeConversationID else { return }
+        locallyCreatedConversationID = nil
         cancelInflightWork()
         conversationEpoch &+= 1
         // Archive + unstick BEFORE swapping buffers, so the old transcript
@@ -926,9 +1131,16 @@ final class ChatViewModel {
         lastFailureAlias = nil
     }
 
-    /// Delete a saved conversation. If it was the open one, drop to a fresh
-    /// empty transcript.
+    /// Deletes a conversation and all document extracts in its full branch tree.
     func deleteConversation(_ id: UUID) {
+        var attachmentIDs: Set<UUID> = []
+        if id == activeConversationID {
+            attachmentIDs.formUnion(liveTree().flatMap { $0.fileAttachments.map(\.id) })
+        }
+        if let stored = conversations.first(where: { $0.id == id }) {
+            attachmentIDs.formUnion(stored.allMessages.flatMap { $0.fileAttachments.map(\.id) })
+        }
+
         // If deleting the OPEN conversation, tear down the live transcript
         // FIRST — otherwise the `isStreaming = false` below fires
         // persistActive() via didSet while the deleted messages + id are
@@ -949,6 +1161,7 @@ final class ChatViewModel {
         }
         conversations.removeAll { $0.id == id }
         saveConversations()
+        documentCache.remove(contentsOf: attachmentIDs)
     }
 
     // MARK: - In-memory message storage
@@ -1103,6 +1316,7 @@ final class ChatViewModel {
         branchChoices.removeAll()
         conversationInstructions = ""
         activeConversationID = UUID()
+        locallyCreatedConversationID = activeConversationID
         lastError = nil
         lastFailureKind = nil
         lastFailureAlias = nil
@@ -1243,6 +1457,115 @@ final class ChatViewModel {
             supportsImageInput: resolvedImageCapability,
             imageMessageID: imageAttachments.isEmpty ? nil : user.id
         )
+    }
+
+    /// Open one transcript turn whose execution is owned by the Python Agent
+    /// Runtime. This intentionally mirrors only Chat's message lifecycle; it
+    /// does not duplicate the runtime state machine in Swift.
+    @discardableResult
+    func beginAgentTurn(
+        _ text: String,
+        alias: String,
+        onCancel: @escaping @MainActor () -> Void
+    ) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !isStreaming else { return false }
+
+        cancelInflightWork()
+        let user = ChatMessage(role: .user, content: trimmed, status: .complete)
+        _ = appendMessage(user)
+        persistActive()
+
+        let placeholder = ChatMessage(role: .assistant, status: .streaming)
+        _ = appendMessage(placeholder)
+        lastError = nil
+        lastFailureKind = nil
+        lastFailureAlias = nil
+        lastTurnAlias = alias
+        externalTurn = ExternalTurn(
+            placeholderID: placeholder.id,
+            epoch: conversationEpoch,
+            alias: alias,
+            cancel: onCancel
+        )
+        isStreaming = true
+        return true
+    }
+
+    /// Commit the server-owned run's final answer into the existing assistant
+    /// placeholder, preserving the same persistence and background-memory
+    /// behavior as an ordinary local chat completion.
+    func completeAgentTurn(_ output: String) {
+        guard let turn = currentExternalTurn() else { return }
+        guard let index = messages.firstIndex(where: { $0.id == turn.placeholderID }) else {
+            externalTurn = nil
+            isStreaming = false
+            return
+        }
+        var message = messages[index]
+        message.content = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        if message.content.isEmpty { message.content = "Task completed." }
+        message.status = .complete
+        updateMessage(at: index, with: message)
+        externalTurn = nil
+        onProductValueDelivered(.chatReply)
+        isStreaming = false
+    }
+
+    /// Surface a runtime/transport failure on the placeholder belonging to the
+    /// same conversation epoch. Raw tool output stays server-side.
+    func failAgentTurn(_ message: String) {
+        guard let turn = currentExternalTurn() else { return }
+        let display = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallback = "The agent task could not be completed."
+        if let index = messages.firstIndex(where: { $0.id == turn.placeholderID }) {
+            var placeholder = messages[index]
+            // The failed row already owns the recovery copy through
+            // `errorMessage`. Leaving the same string in `content` rendered it
+            // once as Markdown, once as the failure caption, and once again in
+            // the compose banner during physical Agent dogfood.
+            placeholder.content = ""
+            placeholder.errorMessage = display.isEmpty ? fallback : display
+            placeholder.status = .failed
+            updateMessage(at: index, with: placeholder)
+        }
+        // Agent failures are retained on their transcript row. Do not mirror
+        // them into the composer-level turn banner.
+        lastError = nil
+        lastFailureKind = nil
+        lastFailureAlias = nil
+        externalTurn = nil
+        isStreaming = false
+    }
+
+    /// Finalize a server-originated cancellation without sending another
+    /// cancellation request. User-initiated Stop enters through
+    /// ``cancelInflightWork`` and requests remote cancellation exactly once.
+    func cancelAgentTurnFromServer() {
+        cancelExternalTurn(requestRemoteCancellation: false)
+    }
+
+    private func currentExternalTurn() -> ExternalTurn? {
+        guard let turn = externalTurn else { return nil }
+        guard turn.epoch == conversationEpoch else {
+            externalTurn = nil
+            turn.cancel()
+            return nil
+        }
+        return turn
+    }
+
+    private func cancelExternalTurn(requestRemoteCancellation: Bool) {
+        guard let turn = externalTurn else { return }
+        externalTurn = nil
+        if turn.epoch == conversationEpoch,
+           let index = messages.firstIndex(where: { $0.id == turn.placeholderID }) {
+            var placeholder = messages[index]
+            Self.finaliseCancellation(message: &placeholder)
+            updateMessage(at: index, with: placeholder)
+        }
+        if turn.epoch == conversationEpoch { isStreaming = false }
+        if requestRemoteCancellation { turn.cancel() }
     }
 
     /// Test seam for lifecycle assertions that need the current turn to be
@@ -1427,7 +1750,16 @@ final class ChatViewModel {
             event: .abandoned,
             epoch: conversationEpoch
         )
-        let message = "Couldn't start \(alias). Try again, or pick a different model in the box below."
+        let genericMessage = "Couldn't start \(alias). Try again, or pick a different model in the box below."
+        let message: String
+        if let server,
+           let startupFailure = server.startupFailure,
+           case .crashed(let failedAlias, _) = server.state,
+           failedAlias == alias {
+            message = startupFailure.message
+        } else {
+            message = genericMessage
+        }
         if var placeholder = currentMessage(index: placeholderIndex) {
             placeholder.status = .failed
             if placeholder.content.isEmpty { placeholder.content = message }
@@ -1657,6 +1989,38 @@ final class ChatViewModel {
         return ""
     }
 
+    /// True when the user message that opened the turn ending at
+    /// True when the request for this turn carried at least one file
+    /// attachment's extracted text.
+    ///
+    /// Feeds ``ChatMessage.shouldFlagToolNotCalled``'s
+    /// ``promptHadAttachment`` gate: an answer read off a document the
+    /// user attached is grounded in the prompt, so the "didn't call a
+    /// tool" caution is wrong on it (see that method's Gate 1c).
+    ///
+    /// Takes the history that actually went on the wire, NOT the
+    /// transcript, and scans EVERY user row in it rather than only the
+    /// newest. Both choices are corrections of an earlier version of
+    /// this helper, which walked back to the nearest user row and
+    /// stopped:
+    ///
+    ///   * **Every row**, because ``ChatMessage/modelContent`` re-sends
+    ///     each attachment's extracted text on every follow-up. So
+    ///     "what was the invoice total?" two turns after the invoice
+    ///     was attached IS answered from a document in front of the
+    ///     model, and the earlier helper captioned it as a guess.
+    ///   * **The wire history**, because
+    ///     ``trimMessagesForContextWindow`` drops the oldest rows on a
+    ///     long conversation. A document that was trimmed away is no
+    ///     longer grounding anything, and scanning the transcript would
+    ///     claim it still is — silencing the caption exactly when the
+    ///     evidence is gone, which is the worst moment to silence it.
+    nonisolated static func historyCarriesAttachmentGrounding(
+        _ messages: [ChatMessage]
+    ) -> Bool {
+        messages.contains { $0.role == .user && !$0.fileAttachments.isEmpty }
+    }
+
     /// True when the assistant turn ending at ``placeholderIndex`` was
     /// preceded — since the most recent user message — by a tool that
     /// SUCCEEDED (a ``.tool`` result message with status ``.complete``).
@@ -1696,36 +2060,8 @@ final class ChatViewModel {
         return false
     }
 
-    /// v0.5.11: silent sliding-window trim. ChatGPT / Claude desktop
-    /// don't show users a token meter — they drop oldest turns behind
-    /// the scenes when the conversation would exceed the model's
-    /// context window. The previous "9.3k / 8k red chip" was both
-    /// confusing (users don't know what 8k means) and useless (no
-    /// affordance to fix the overflow). rapid-mlx's server doesn't
-    /// enforce a window either — it just hands the full prompt to
-    /// mlx-lm, which RoPE-extrapolates past training context and
-    /// degrades quality silently. So the client has to do it.
-    ///
-    /// Contract:
-    ///   * If ``contextWindow`` is ``nil`` or estimated tokens fit
-    ///     under ``keepFraction * contextWindow``, return unchanged.
-    ///   * Otherwise: split off a leading system row, walk the body
-    ///     newest-to-oldest accumulating ``content.count / 4`` tokens,
-    ///     stop when adding the next row would exceed the budget, and
-    ///     drop everything before that cut point.
-    ///   * The most recent message (the current user turn) is always
-    ///     kept — even if it alone overshoots the budget, since
-    ///     dropping it would mean sending no question at all.
-    ///   * After cutting, drop leading non-user rows so the kept tail
-    ///     never starts mid-tool-chain (a bare ``tool`` or
-    ///     ``assistant(tool_calls)`` row at the head of a wire body is
-    ///     a 400 with most chat templates).
-    ///   * Re-attach the system row at index 0 if one was present.
-    ///
-    /// Token estimate is ``content.count / 4`` per message —
-    /// OpenAI's published English rule-of-thumb. Order-of-magnitude
-    /// is enough; the goal is keeping quality high, not hitting a
-    /// precise count.
+    /// Keeps the system row and latest complete user/tool turn, then fills the
+    /// remaining context newest-first. Oversized tool bodies are shortened in place.
     static func trimMessagesForContextWindow(
         _ messages: [ChatMessage],
         contextWindow: Int?,
@@ -1734,23 +2070,13 @@ final class ChatViewModel {
         guard let ctx = contextWindow, ctx > 0 else { return messages }
         guard !messages.isEmpty else { return messages }
         let budget = max(1, Int(Double(ctx) * keepFraction))
-        // Codex audit r1 (ChatViewModel.swift:282): the pre-audit
-        // shape only counted ``content.count`` and ignored
-        // ``toolCalls.arguments`` — a model that emits a 50 KB JSON
-        // tool argument blob (e.g. a stringified web-search payload)
-        // would slip past the budget because the trimming logic
-        // saw a near-empty assistant turn. Fold the serialized
-        // tool-call arguments into the per-row cost so the budget
-        // reflects the actual wire body. ``modelContent`` includes locally
-        // extracted document text while keeping it out of the visible chat
-        // bubble. Images use multimodal content parts and
-        // are excluded here (token-count-per-image is model-specific
-        // and not estimable from byte count alone).
+        // Count wire-only attachment text and tool arguments as well as prose.
         let perRowCost: (ChatMessage) -> Int = { msg in
-            let contentChars = msg.modelContent.count
-            let toolArgsChars = (msg.toolCalls ?? [])
-                .reduce(0) { $0 + $1.function.arguments.count }
-            return max(1, (contentChars + toolArgsChars) / 4)
+            let toolArgs = (msg.toolCalls ?? [])
+                .map(\.function.arguments)
+                .joined()
+            return max(1, TokenEstimate.tokens(in: msg.modelContent)
+                + (toolArgs.isEmpty ? 0 : TokenEstimate.tokens(in: toolArgs)))
         }
         let totalTokens = max(1, messages.reduce(0) { $0 + perRowCost($1) })
         if totalTokens <= budget { return messages }
@@ -1763,32 +2089,167 @@ final class ChatViewModel {
         let systemTokens = system.map(perRowCost) ?? 0
         let bodyBudget = max(1, budget - systemTokens)
 
-        var keep: [ChatMessage] = []
-        var running = 0
-        for msg in body.reversed() {
+        guard let currentTurnStart = body.lastIndex(where: { $0.role == .user }) else {
+            return system.map { [$0] } ?? []
+        }
+        var keep = Array(body[currentTurnStart...])
+        keep = Self.elidingOldestToolResults(keep, within: bodyBudget, cost: perRowCost)
+        var running = keep.reduce(0) { $0 + perRowCost($1) }
+        for msg in body[..<currentTurnStart].reversed() {
             let cost = perRowCost(msg)
-            if keep.isEmpty {
-                keep.append(msg)
-                running += cost
-                continue
-            }
             if running + cost > bodyBudget { break }
-            keep.append(msg)
+            keep.insert(msg, at: 0)
             running += cost
         }
-        keep.reverse()
 
         while let first = keep.first, first.role != .user {
             keep.removeFirst()
-        }
-        if keep.isEmpty, let last = body.last {
-            keep = [last]
         }
         if let sys = system {
             keep.insert(sys, at: 0)
         }
         return keep
     }
+
+    /// Explicit replacement for evidence removed by context trimming.
+    nonisolated static let elidedToolResultBody = """
+    [This tool result was dropped from the request because the conversation \
+    exceeded the model's context window. Its contents are no longer available. \
+    Do not answer from it — call the tool again if you still need it, and say \
+    so if the answer depends on evidence you can no longer see.]
+    """
+
+    /// Appended when real evidence is shortened rather than removed.
+    nonisolated static let truncatedToolResultSuffix = """
+
+
+    [This tool result was cut off here to fit the model's context window. The \
+    text above is the beginning of the result and can be used; everything \
+    after the cut is not available in this request. Do not treat the cut as \
+    the end of the source — call the tool again for a smaller range (for \
+    read_document, a later 'offset') if you need more.]
+    """
+
+    nonisolated static let minRetainedToolResultTokens = 512
+
+    /// Shrinks oldest tool bodies first while preserving assistant/tool row pairs.
+    /// The newest result is truncated when possible because it drives the next step.
+    nonisolated static func elidingOldestToolResults(
+        _ tail: [ChatMessage],
+        within budget: Int,
+        cost: (ChatMessage) -> Int
+    ) -> [ChatMessage] {
+        var result = tail
+        var total = result.reduce(0) { $0 + cost($1) }
+        guard total > budget else { return result }
+
+        let newest = result.lastIndex { $0.role == .tool }
+        for index in result.indices
+        where result[index].role == .tool && index != newest {
+            guard total > budget else { break }
+            let before = cost(result[index])
+            var candidate = result[index]
+            candidate.content = elidedToolResultBody
+            let after = cost(candidate)
+            guard after < before else { continue }
+            result[index] = candidate
+            total -= before - after
+        }
+
+        guard total > budget, let newest else { return result }
+        let before = cost(result[newest])
+        let allowance = budget - (total - before)
+        var candidate = result[newest]
+        let bodyCost: (String) -> Int = { body in
+            var probe = result[newest]
+            probe.content = body
+            return cost(probe)
+        }
+        if allowance >= minRetainedToolResultTokens,
+           let shortened = truncatingToolResultBody(
+               candidate.content,
+               withinTokens: allowance,
+               cost: bodyCost
+           ) {
+            candidate.content = shortened
+        } else {
+            candidate.content = elidedToolResultBody
+        }
+        guard cost(candidate) < before else { return result }
+        result[newest] = candidate
+        return result
+    }
+
+    /// Shortens the largest JSON string while preserving cursor fields, or falls
+    /// back to a marked plain-text prefix. Returns nil when no useful body fits.
+    nonisolated static func truncatingToolResultBody(
+        _ body: String,
+        withinTokens tokenBudget: Int,
+        cost: (String) -> Int
+    ) -> String? {
+        guard tokenBudget > 0 else { return nil }
+
+        func fit(_ build: (Int) -> String?) -> String? {
+            var headTokens = tokenBudget
+            for _ in 0..<3 {
+                guard headTokens > 0, let candidate = build(headTokens) else { return nil }
+                let actual = cost(candidate)
+                if actual <= tokenBudget { return candidate }
+                headTokens = headTokens * tokenBudget / max(1, actual) - 1
+            }
+            return nil
+        }
+
+        guard let data = body.data(using: .utf8),
+              let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let field = payload
+                .compactMap({ key, value in (value as? String).map { (key, $0) } })
+                .max(by: { $0.1.count < $1.1.count }),
+              field.1.count > 512
+        else {
+            return fit { headTokens in
+                let suffixTokens = TokenEstimate.tokens(in: truncatedToolResultSuffix)
+                guard headTokens > suffixTokens else { return nil }
+                return TokenEstimate.prefix(body, withinTokens: headTokens - suffixTokens)
+                    + truncatedToolResultSuffix
+            }
+        }
+
+        return fit { headTokens in
+            var envelope = payload
+            envelope[field.0] = ""
+            envelope["\(field.0)_truncated"] = true
+            envelope["truncation_note"] = truncatedToolResultNote
+            guard let envelopeData = try? JSONSerialization.data(
+                withJSONObject: envelope, options: [.sortedKeys]
+            ), let envelopeString = String(data: envelopeData, encoding: .utf8) else { return nil }
+            let headRoom = headTokens - cost(envelopeString)
+            guard headRoom > 0 else { return nil }
+
+            let head = TokenEstimate.prefix(field.1, withinTokens: headRoom)
+            guard !head.isEmpty else { return nil }
+            var truncated = envelope
+            truncated[field.0] = head
+            // Advance from retained content, not the original full slice —
+            // and only when `content` is the field that was truncated.
+            // Rewriting the cursor because some other long string (a note)
+            // was cut would desynchronize it from the retained text.
+            if field.0 == "content", let offset = payload["offset"] as? Int {
+                truncated["next_offset"] = offset + head.count
+                truncated["has_more"] = true
+            }
+            guard let data = try? JSONSerialization.data(
+                withJSONObject: truncated, options: [.sortedKeys]
+            ) else { return nil }
+            return String(data: data, encoding: .utf8)
+        }
+    }
+
+    nonisolated static let truncatedToolResultNote = """
+    This result was shortened to fit the model's context window. The text it \
+    carries is real and can be used, but it stops early — do not treat its end \
+    as the end of the source. Continue from 'next_offset' if you need more.
+    """
 
     /// v0.4.35: classify a terminal stream as a soft failure when it
     /// produced no visible text and no tool calls. Lifted out of
@@ -2235,6 +2696,13 @@ final class ChatViewModel {
         } ?? MessageTree.defaultLeaf(in: remaining, preferring: branchChoices)
         adoptTree(MessageTree.promotingOrphans(remaining), activeLeafID: leaf)
         persistActive()
+        // Preserve extracts still referenced by a surviving branch.
+        let stillReferenced = Set(remaining.flatMap { $0.fileAttachments.map(\.id) })
+        let orphaned = tree
+            .filter { doomed.contains($0.id) }
+            .flatMap { $0.fileAttachments.map(\.id) }
+            .filter { !stillReferenced.contains($0) }
+        documentCache.remove(contentsOf: Set(orphaned))
         return true
     }
 
@@ -2316,6 +2784,14 @@ final class ChatViewModel {
             }
         }
         var toolExecutionsLeft = maxToolExecutions
+        var documentReadsLeft = maxDocumentReads
+        // Over-budget calls append an error row and consume NEITHER counter,
+        // so a model that keeps naming an exhausted tool could otherwise loop
+        // forever: the while condition stays satisfiable through the other
+        // counter and synthesis requires both at zero. This round cap is the
+        // termination backstop independent of both budgets.
+        let maxToolRounds = maxToolExecutions + maxDocumentReads + 2
+        var toolRounds = 0
         let toolExecutor = NativeToolCallExecutor(registry: tools)
         var appGroundingSources: [GroundingSource] = []
         var isFinalSynthesisRound = false
@@ -2329,8 +2805,22 @@ final class ChatViewModel {
         // is cancelled, or comes back empty — a wrong-but-present answer beats
         // a blank message.
         var draftBeforeCorrection: String?
+        // ONE instant for the whole turn, shared by the date row and the
+        // clock trailer of every round. codex caught that two `Date()` calls
+        // can straddle local midnight, which would have the same request
+        // asserting "Today is the 11th" in its system row and "sent … the
+        // 12th" on its newest message. Taking it once per TURN rather than
+        // per round matters for the prefix cache too: the clock stamp is
+        // minute-granular, and a tool loop whose rounds straddle a minute
+        // boundary would otherwise grow an "answering now" line on the
+        // newest user row mid-loop and re-prefill everything behind it
+        // (measured on Qwen3.8-27B: the third round resumed from the 1547-
+        // token boundary instead of the 2054-token entry of the round before).
+        let requestInstant = Date()
 
-        while toolExecutionsLeft > 0 || isFinalSynthesisRound {
+        while toolExecutionsLeft > 0 || documentReadsLeft > 0 || isFinalSynthesisRound {
+            toolRounds += 1
+            if toolRounds > maxToolRounds { isFinalSynthesisRound = true }
             // History for this request: everything BEFORE the streaming
             // placeholder. The placeholder itself is excluded because the
             // assistant hasn't said anything yet.
@@ -2350,30 +2840,43 @@ final class ChatViewModel {
             // ``servingAlias`` is the protected startup/default engine and is
             // no longer authoritative once secondary models are resident.
             let wireAlias = alias
-            let definitions = isFinalSynthesisRound ? [] : ChatViewModel.wireDefinitions(
-                forAlias: wireAlias,
-                enabled: enabledDefinitions
-            )
-            // Ambient anti-confabulation guidance, prepended for the wire body
-            // only (never appended to the transcript) so the user's history
-            // stays prose-only. Skipped when no tools are advertised and — the
-            // point of #1549 — on rounds that carry no tool result for it to
-            // talk about. Existing/custom instructions are merged into the
-            // same system row below.
-            let ambientPreamble = !definitions.isEmpty
-                && ChatViewModel.carriesToolResultForThisTurn(history)
-                ? ChatViewModel.toolGuidancePreamble
-                : nil
+            var offered = enabledDefinitions
+            if toolExecutionsLeft == 0 {
+                // Document reads may outlive the external tool budget — but
+                // only for a model that actually reads. Without this gate a
+                // runaway caller of external tools just spins on
+                // budget-exhausted error rows instead of reaching the bounded
+                // synthesis (golden journey: tool-loop-budget).
+                if documentReadsLeft < maxDocumentReads {
+                    offered = offered.filter { Self.documentToolNames.contains($0.function.name) }
+                } else {
+                    offered = []
+                }
+            }
+            if documentReadsLeft == 0 {
+                offered = offered.filter { !Self.documentToolNames.contains($0.function.name) }
+            }
+            if offered.isEmpty { isFinalSynthesisRound = true }
+            let definitions = isFinalSynthesisRound
+                ? []
+                : ChatViewModel.wireDefinitions(forAlias: wireAlias, enabled: offered)
             // Inserted BEFORE the trim so its tokens are inside the budget the
             // trim works to, not added on top of a body already sized to fill
             // the window.
             history = ChatViewModel.addingInstructionLayers(
                 to: history,
-                ambientPreamble: ambientPreamble,
-                dateContext: ChatViewModel.currentDateTimeContext(),
+                dateContext: ChatViewModel.currentDateContext(now: requestInstant),
                 memoryContext: memoryContext,
                 global: globalInstruction,
                 conversation: conversationInstruction
+            )
+            // First of the two guidance passes: stamped BEFORE the trim so
+            // the guidance rows count toward the budget the trim works to.
+            // The clock trailer below rewrites every user row's trailer, and
+            // the second pass re-stamps the trimmed history behind it.
+            history = ChatViewModel.stampingToolGuidance(
+                on: history,
+                toolsAdvertised: !definitions.isEmpty
             )
             // v0.5.11 / issue #363: silent context-window trim against the
             // engine-reported window (captured on the last profile fetch),
@@ -2389,23 +2892,6 @@ final class ChatViewModel {
                 history,
                 contextWindow: ctxWindow
             )
-            // The trim drops the oldest rows to fit and deliberately preserves
-            // a leading system row, so on an over-budget turn it can carry the
-            // preamble through while taking the tool result it describes. That
-            // puts "your only source of truth is the tool result" on the wire
-            // with no tool result behind it — #1549 again, just needing a long
-            // enough conversation to reach. If the evidence didn't survive,
-            // neither does the instruction.
-            if let ambientPreamble,
-                !ChatViewModel.carriesToolResultForThisTurn(history)
-            {
-                history = ChatViewModel.removingLeadingSystemComponent(
-                    ambientPreamble,
-                    from: history
-                )
-            }
-            // Add this after the ambient/evidence consistency check above so
-            // combining the two system instructions cannot defeat that guard.
             if isFinalSynthesisRound {
                 history = ChatViewModel.addingToolBudgetSynthesisPreamble(to: history)
             }
@@ -2415,6 +2901,43 @@ final class ChatViewModel {
             if forceGroundingCorrection {
                 history = ChatViewModel.addingGroundingCorrectionPreamble(to: history)
             }
+            // LAST, after the trim and every preamble: each user turn carries
+            // the clock of the moment it was sent, so the prompt stays
+            // append-only between turns and the engine's prefix cache can
+            // reuse it. See ``currentDateContext`` for the measurement that
+            // motivates moving the clock out of the system row, and
+            // ``stampingClockContext`` for why it is every user row rather
+            // than just the newest one.
+            // ``answeringAt`` is this request's instant: it changes nothing
+            // for an ordinary send (the newest row was minted just now) and
+            // only speaks up when a regenerate is re-answering a question
+            // asked in an earlier minute — see ``answeringNowLine``.
+            history = ChatViewModel.stampingClockContext(
+                on: history,
+                answeringAt: requestInstant
+            )
+            // Second guidance pass, on the TRIMMED history and behind the
+            // clock trailer: a trim that dropped the evidence drops the
+            // instruction with it (#1549). Stamped on user rows rather than
+            // the system row so the prompt stays append-only across the tool
+            // round and every turn after it — see ``stampingToolGuidance``.
+            history = ChatViewModel.stampingToolGuidance(
+                on: history,
+                toolsAdvertised: !definitions.isEmpty
+            )
+            // Whether any document extract survived onto THIS request, read
+            // off the same array that is about to be encoded. The
+            // tool-not-called caption is decided later, at the completion
+            // site, where the trim is no longer visible — see
+            // ``historyCarriesAttachmentGrounding``.
+            //
+            // A request-scoped `let`, captured by the completion closure
+            // alongside `request` itself, NOT view-model state: codex caught
+            // that a stored property is read by whichever stream finishes
+            // last, so two overlapping sends could decide each other's
+            // caption.
+            let wireCarriesAttachmentGrounding =
+                ChatViewModel.historyCarriesAttachmentGrounding(history)
             let request: ChatStreamClient.Request
             if let s = sampling {
                 let resolved = s.resolved(toolsEnabled: !definitions.isEmpty)
@@ -2425,6 +2948,8 @@ final class ChatViewModel {
                     topP: resolved.topP,
                     maxTokens: resolved.maxTokens,
                     repetitionPenalty: resolved.repetitionPenalty,
+                    repetitionPenaltyIsImplicitDefault:
+                        resolved.repetitionPenaltyIsImplicitDefault,
                     tools: definitions.isEmpty ? nil : definitions,
                     enableThinking: resolved.enableThinking,
                     supportsImageInput: supportsImageInput
@@ -2446,6 +2971,7 @@ final class ChatViewModel {
             let outcome = await runOneStream(
                 placeholderIndex: currentPlaceholder,
                 request: request,
+                wireCarriesAttachmentGrounding: wireCarriesAttachmentGrounding,
                 epoch: epoch
             )
             switch outcome {
@@ -2556,20 +3082,31 @@ final class ChatViewModel {
                         finaliseCancelledPlaceholder(at: currentPlaceholder, epoch: epoch)
                         return
                     }
-                    // A model may batch many calls into one assistant turn.
-                    // Enforce the budget per requested call, and still emit a
-                    // matching result for every skipped call so the transcript
-                    // remains a valid assistant(tool_calls) → tool sequence.
-                    guard toolExecutionsLeft > 0 else {
-                        results.append(ToolCallResult(
-                            toolCallID: call.id,
-                            content: "Tool budget exhausted. Answer using the results already available.",
-                            isError: true,
-                            failureKind: .toolFailed
-                        ))
-                        continue
+                    // Emit a matching failure row for every call over its budget.
+                    let isDocumentRead = Self.documentToolNames.contains(call.function.name)
+                    if isDocumentRead {
+                        guard documentReadsLeft > 0 else {
+                            results.append(ToolCallResult(
+                                toolCallID: call.id,
+                                content: "Document-read budget exhausted for this turn. Answer using the parts of the document already read, and say which parts you have not seen.",
+                                isError: true,
+                                failureKind: .toolFailed
+                            ))
+                            continue
+                        }
+                        documentReadsLeft -= 1
+                    } else {
+                        guard toolExecutionsLeft > 0 else {
+                            results.append(ToolCallResult(
+                                toolCallID: call.id,
+                                content: "Tool budget exhausted. Answer using the results already available.",
+                                isError: true,
+                                failureKind: .toolFailed
+                            ))
+                            continue
+                        }
+                        toolExecutionsLeft -= 1
                     }
-                    toolExecutionsLeft -= 1
                     let r = await toolExecutor.execute(call, advertised: definitions)
                     results.append(r)
                     if call.function.name == "web_search" {
@@ -2604,7 +3141,7 @@ final class ChatViewModel {
                 }
                 // Open the next assistant placeholder and loop.
                 currentPlaceholder = appendMessage(ChatMessage(role: .assistant, status: .streaming))
-                if toolExecutionsLeft == 0 {
+                if toolExecutionsLeft == 0 && documentReadsLeft == 0 {
                     isFinalSynthesisRound = true
                 }
             }
@@ -2723,7 +3260,7 @@ final class ChatViewModel {
     /// Asking the whole transcript instead means a single weather lookup
     /// re-arms the preamble for every ordinary question that follows it —
     /// #1549 again, wearing a longer conversation.
-    static func carriesToolResultForThisTurn(_ history: [ChatMessage]) -> Bool {
+    nonisolated static func carriesToolResultForThisTurn(_ history: [ChatMessage]) -> Bool {
         let start =
             history.lastIndex { $0.role == .user }
             .map { history.index(after: $0) } ?? history.startIndex
@@ -2767,24 +3304,98 @@ final class ChatViewModel {
         }
     }
 
-    static func ambientSystemMessages(
-        historyOpensWithSystem: Bool,
-        toolsAdvertised: Bool,
-        toolResultPresent: Bool
+    /// Ride the anti-confabulation guidance on user rows as a wire-only
+    /// trailer, never on the system row.
+    ///
+    /// The system row is the first thing in every request and the engine's
+    /// prefix cache reuses a stored prompt only up to the first differing
+    /// token. Putting ~400 tokens of guidance at its head on the round that
+    /// carries a tool result, and taking them out again on the next turn,
+    /// rewrote the head of the prompt twice per tool call, so a single web
+    /// search cost the WHOLE conversation two cold prefills (0.14.1 on
+    /// Qwen3.8-27B with a 5.7k-token conversation: ~20 s each, against 1.5 s
+    /// for an append-only turn).
+    ///
+    /// Every user row whose turn (the rows up to the next user message)
+    /// holds a tool result carries the guidance, and keeps carrying it on
+    /// later turns — like the clock trailer, the stamp is a pure function of
+    /// the row's own turn, so the bytes of a row never change once the turn
+    /// behind it is complete. Stamping only the newest row was measured on
+    /// Qwen3.8-27B (Studio, 2026-09-13): the tool round resumed from the
+    /// boundary before that row (486 of 2033 tokens prefilled), but the next
+    /// turn diverged again exactly where the trailer had been removed and
+    /// re-prefilled 1982 tokens, because the engine keeps only eight
+    /// non-trimmable (hybrid) entries and the one older boundary that could
+    /// have served it was already evicted by the tool loop's own requests.
+    ///
+    /// The price of persistence is ~400 tokens of history per tool-bearing
+    /// turn (the trim counts them, see below). Against the alternative —
+    /// re-prefilling the whole conversation on the turn after every tool
+    /// call — it is the cheaper side by a wide margin: a 5.7k-token 27B
+    /// conversation re-prefilled costs ~20 s, while 400 extra history tokens
+    /// prefill in well under a second and sit inside a 32k+ window. The
+    /// guidance text itself says it binds only the message it rides and
+    /// that later messages without their own tool result are answered
+    /// normally, so an old stamp is a faithful record of that turn's prompt,
+    /// not a live instruction.
+    ///
+    /// Same gate as before (#1549): tools must be advertised, and a row is
+    /// only stamped when its own turn holds a tool result. The stamp is
+    /// REBUILT, not appended: any guidance already in a row's trailer is
+    /// removed first, so the function is idempotent, and a row keeps the
+    /// guidance only while the gate still holds for it — when the tools are
+    /// withdrawn (the final synthesis round, a tool toggled off) the text
+    /// claiming tool access leaves every row, not just the newest one.
+    ///
+    /// Called twice per round: once BEFORE ``trimMessagesForContextWindow``
+    /// so the ~400 tokens per stamped row count toward the context budget,
+    /// and once after the clock trailer on the trimmed history, so evidence
+    /// the trim dropped takes its instruction with it. The second pass can
+    /// only remove guidance the first pass added, so the trimmed request
+    /// never exceeds the budget the trim worked to.
+    nonisolated static func stampingToolGuidance(
+        on messages: [ChatMessage],
+        toolsAdvertised: Bool
     ) -> [ChatMessage] {
-        guard !historyOpensWithSystem, toolsAdvertised, toolResultPresent else {
-            return []
+        var result = messages
+        let userIndices = result.indices.filter { result[$0].role == .user }
+        for (n, index) in userIndices.enumerated() {
+            let pristine = strippingToolGuidance(from: result[index].wireSuffix)
+            let turnEnd = n + 1 < userIndices.count ? userIndices[n + 1] : result.endIndex
+            let earned = toolsAdvertised
+                && result[result.index(after: index)..<turnEnd].contains(where: { $0.role == .tool })
+            result[index].wireSuffix = earned
+                ? [pristine, toolGuidance].compactMap { $0 }.joined(separator: "\n\n")
+                : pristine
         }
-        return [ChatMessage(role: .system, content: toolGuidancePreamble, status: .complete)]
+        return result
     }
 
-    /// Merge current-date context, ambient, pre-existing, global, and
-    /// conversation layers into one leading system row. Local chat templates
-    /// often reject a second system message, so every caller must go through
-    /// this transformation.
+    /// The trailer without the guidance component ``stampingToolGuidance``
+    /// adds (and without the separator that joined it), or nil when nothing
+    /// else was there.
+    nonisolated static func strippingToolGuidance(from suffix: String?) -> String? {
+        guard var remaining = suffix else { return nil }
+        // Only the terminal component this function joined: a trailer that
+        // merely mentions the text elsewhere is not ours to edit.
+        if remaining.hasSuffix("\n\n" + toolGuidance) {
+            remaining.removeLast(toolGuidance.count + 2)
+        } else if remaining == toolGuidance {
+            remaining = ""
+        }
+        return remaining.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : remaining
+    }
+
+    /// Merge current-date context, pre-existing, global, and conversation
+    /// layers into one leading system row. Local chat templates often reject
+    /// a second system message, so every caller must go through this
+    /// transformation. Nothing request-scoped belongs here: the row is the
+    /// head of every prompt, and any byte that changes between two turns
+    /// costs the engine's prefix cache the whole conversation (that is why
+    /// the wall clock rides each user row and the tool guidance rides the
+    /// newest one — ``stampingClockContext``, ``stampingToolGuidance``).
     nonisolated static func addingInstructionLayers(
         to messages: [ChatMessage],
-        ambientPreamble: String?,
         dateContext: String? = nil,
         memoryContext: String? = nil,
         global: String,
@@ -2792,11 +3403,7 @@ final class ChatViewModel {
     ) -> [ChatMessage] {
         var result = messages
         let existing = result.first?.role == .system ? result.removeFirst().content : nil
-        // The ambient preamble stays the LEADING component (so
-        // ``removingLeadingSystemComponent`` can strip it when context
-        // trimming drops the tool result that armed it); the date context
-        // rides below it because it is valid regardless of tool presence.
-        var parts = [ambientPreamble, dateContext, existing]
+        var parts = [dateContext, existing]
             .compactMap { $0.flatMap(normalizedInstruction) }
         if let memoryContext, let memory = normalizedInstruction(memoryContext) {
             parts.append(memory)
@@ -2835,8 +3442,12 @@ final class ChatViewModel {
     ) -> String {
         addingInstructionLayers(
             to: [],
-            ambientPreamble: nil,
-            dateContext: dateContext ?? currentDateTimeContext(),
+            // The preview shows what actually goes on the wire: the system
+            // row carries the DATE only. The wall clock rides each user turn
+            // as a wire-only trailer (``stampingClockContext``), so quoting it
+            // here would show the reader a system row Rapid never sends. The
+            // editor's caption tells them where the time went.
+            dateContext: dateContext ?? currentDateContext(),
             memoryContext: memoryContext,
             global: global,
             conversation: conversation
@@ -2847,22 +3458,42 @@ final class ChatViewModel {
     /// model does not guess "today" from training memory (issue #2330, where
     /// `qwen3.5-4b-4bit` answered "Friday, May 24, 2024" and then insisted it
     /// had no way to know the date). This supplies the Mac's authoritative
-    /// local date/time as a system-prompt template variable at request time —
-    /// the pattern peer desktop chat products use — rather than relying on the
+    /// local date as a system-prompt template variable at request time — the
+    /// pattern peer desktop chat products use — rather than relying on the
     /// model to infer it must search for the date, and without adding a
     /// local-clock tool or touching tool routing.
     ///
     /// Injected per `send` (each request recomputes it against the live clock),
     /// so it cannot go stale across midnight, a time-zone change, a restored
-    /// conversation, or a long-lived session. `now` and the calendar's
-    /// time zone are injectable so tests can pin the exact output and cover
+    /// conversation, or a long-lived session. `now` and the calendar's time
+    /// zone are injectable so tests can pin the exact output and cover
     /// rollover.
-    nonisolated static func currentDateTimeContext(
+    ///
+    /// The calendar day, time zone and nothing finer — the half of #2330's
+    /// context that belongs in the leading system row.
+    ///
+    /// The wall CLOCK deliberately does not appear here; it rides each user
+    /// turn instead (``clockContext(at:calendar:)`` +
+    /// ``stampingClockContext(on:calendar:)``). The engine's prompt cache
+    /// reuses a request only when its token prefix is byte-identical to a
+    /// stored one, and the system row is the FIRST thing in every request: a
+    /// minute-resolution string there rewrites the head of the prompt the
+    /// moment the clock ticks, which turns an append-only follow-up into a
+    /// full re-prefill of the whole conversation, document and all.
+    ///
+    /// Measured against this engine on an M3 Ultra (qwen3.8-27b-4bit, a
+    /// 2.3k-token prompt): an append-only second turn with a byte-identical
+    /// system row answers in 0.6 s; the same second turn with only the minute
+    /// changed costs 7.3 s — the cold-start prefill, paid again. With an
+    /// 8-page PDF attached the desktop was paying 15–17 s on EVERY follow-up.
+    ///
+    /// Day granularity still moves once per day, so a conversation spanning
+    /// local midnight re-prefills exactly once. That is the price of keeping
+    /// #2330's guarantee that the model never has to guess the date.
+    nonisolated static func currentDateContext(
         now: Date = Date(),
         calendar inputCalendar: Calendar = .autoupdatingCurrent
     ) -> String {
-        // Fixed gregorian calendar + en_US_POSIX so output never depends on the
-        // user's locale for date/time names or AM/PM rendering.
         var gregorian = Calendar(identifier: .gregorian)
         gregorian.timeZone = inputCalendar.timeZone
         let zone = inputCalendar.timeZone
@@ -2870,35 +3501,165 @@ final class ChatViewModel {
         formatter.calendar = gregorian
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = zone
-
         formatter.dateFormat = "EEEE, MMMM d, yyyy"
         let dateText = formatter.string(from: now)
-        formatter.dateFormat = "h:mm a"
-        let timeText = formatter.string(from: now)
-
-        let abbreviation = zone.abbreviation(for: now) ?? zone.identifier
+        // Identifier only, no abbreviation. codex caught that "PST"/"PDT" is
+        // instant-specific: it flips mid-day at a daylight-saving transition
+        // and would re-prefill every open conversation at 2 a.m. twice a
+        // year, in the one block this whole change exists to hold still. The
+        // abbreviation still rides on each message trailer, where it is
+        // describing a specific instant and is therefore correct there.
         return """
-        [CURRENT DATE AND TIME]
-        Today is \(dateText). The current local time is \(timeText) (\(abbreviation), \(zone.identifier)).
+        [CURRENT DATE]
+        Today is \(dateText) (\(zone.identifier)).
         """
     }
 
-    /// Remove an exact first component from the merged system row. Used when
-    /// context trimming drops the tool evidence that armed ambient guidance.
-    nonisolated static func removingLeadingSystemComponent(
-        _ component: String,
-        from messages: [ChatMessage]
+    /// One minute-resolution wall-clock stamp: "<full date> at <h:mm a>
+    /// (<abbreviation>, <identifier>)". Shared by the "sent" trailer and the
+    /// regenerate line so the two can never drift in format — and so
+    /// comparing them for equality is a reliable "does this say anything new".
+    nonisolated static func clockStampText(
+        at instant: Date,
+        calendar inputCalendar: Calendar = .autoupdatingCurrent
+    ) -> String {
+        var gregorian = Calendar(identifier: .gregorian)
+        gregorian.timeZone = inputCalendar.timeZone
+        let zone = inputCalendar.timeZone
+        let formatter = DateFormatter()
+        formatter.calendar = gregorian
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = zone
+        formatter.dateFormat = "EEEE, MMMM d, yyyy 'at' h:mm a"
+        let stampText = formatter.string(from: instant)
+        let abbreviation = zone.abbreviation(for: instant) ?? zone.identifier
+        return "\(stampText) (\(abbreviation), \(zone.identifier))"
+    }
+
+    /// The wall clock at `instant`, for the trailer stamped on a user turn.
+    ///
+    /// Split out of the system row for the prefix-cache reason documented on
+    /// ``currentDateContext``. It keeps #2330's contract — the newest user row
+    /// always carries the time it was sent, so the model is still told the
+    /// current local time on every request and never answers a "what time is
+    /// it" from training memory — while keeping the volatile tokens out of the
+    /// prompt's head.
+    nonisolated static func clockContext(
+        at instant: Date,
+        calendar inputCalendar: Calendar = .autoupdatingCurrent
+    ) -> String {
+        """
+        [MESSAGE SENT]
+        This message was sent \(clockStampText(at: instant, calendar: inputCalendar)).
+        """
+    }
+
+    /// The extra trailer line a REGENERATE or RETRY adds to the turn it is
+    /// re-answering, and only when it carries information: the question was
+    /// asked at one instant and is being answered at a materially later one.
+    ///
+    /// Returns "" when both instants render to the same minute-resolution
+    /// stamp, which is every ordinary send (the row was minted by this
+    /// request) and every regenerate within the same minute. So the common
+    /// path is byte-identical to having no such line at all.
+    ///
+    /// Why this exists: the reused row's "sent" stamp is honestly the original
+    /// ask time, but a model asked "what time is it?" and re-answering it 45
+    /// minutes later would otherwise report the stale clock — the exact
+    /// regression codex caught, against the pre-change behaviour where the
+    /// clock was recomputed per request. Appending rather than rewriting keeps
+    /// the row's own stamp immutable.
+    ///
+    /// The cache cost is bounded and paid only by the user who regenerated:
+    /// the line is gone again on the NEXT turn (which re-stamps from
+    /// ``ChatMessage/createdAt``), so that turn's shared prefix ends just
+    /// before this row instead of after it — a re-prefill of the last exchange,
+    /// not of the conversation. The document in the first turn stays cached.
+    nonisolated static func answeringNowLine(
+        asked: Date,
+        answeringAt: Date,
+        calendar: Calendar = .autoupdatingCurrent
+    ) -> String {
+        let askedText = clockStampText(at: asked, calendar: calendar)
+        let nowText = clockStampText(at: answeringAt, calendar: calendar)
+        guard askedText != nowText else { return "" }
+        return "\nThis answer is being generated \(nowText)."
+    }
+
+    /// Stamp every user row with the moment it was sent, as a wire-only
+    /// trailer.
+    ///
+    /// The trailer reads "This message was sent <full date> at <time>", not
+    /// "the current local time is …", and it carries the date as well as the
+    /// clock. Both were codex findings on this PR, and both are about the
+    /// same thing: every user row in the history wears one of these, so
+    /// anything phrased as "current" would have the prompt asserting three
+    /// contradictory current times, and a bare time on an old row would
+    /// silently attach yesterday's clock to today's ``[CURRENT DATE]`` in a
+    /// conversation that crossed midnight. A send-time stamp is true of every
+    /// row forever, which is also exactly what makes it cacheable.
+    ///
+    /// The model still knows what time it is now: the newest user row is the
+    /// one being sent, so its stamp IS the request time.
+    ///
+    /// Derived from each row's own ``ChatMessage/createdAt`` — which is
+    /// persisted and immutable — rather than from "now", so the rendering of
+    /// a turn never changes after the fact and each request is a strict
+    /// EXTENSION of the one before it. That is the precise shape the engine's
+    /// prompt cache requires: it reuses a stored entry only when that entry is
+    /// a token-exact prefix of the new request.
+    ///
+    /// Stamping only the newest row was tried first and does not work. The
+    /// trailer then has to be removed from that row on the following turn, the
+    /// stored entry stops being a prefix, and reuse is lost exactly as it was
+    /// with the clock in the system row. Measured on this engine
+    /// (qwen3.8-27b-4bit, ~2.3k-token prompt, M3 Ultra): newest-row-only
+    /// trailer 7.4 s on turn two; stamped-per-turn 0.8 s against 7.5 s cold.
+    ///
+    /// The cost is roughly twenty tokens per user turn, bought with the entire
+    /// prefill of every follow-up — 15–17 s in the 0.14.1 document dogfood.
+    ///
+    /// What this means for the three ways a turn can be re-sent, because codex
+    /// asked and the answer is not uniform:
+    ///
+    ///   * **A new send** mints a fresh row (``send(_:alias:…)`` builds a
+    ///     ``ChatMessage`` with the default ``createdAt`` of `Date()`), so the
+    ///     trailer is the live clock. This is the common case.
+    ///   * **An edited send** goes through ``editUserMessage(id:newContent:…)``,
+    ///     which rewinds the path and calls ``send`` — so it, too, mints a new
+    ///     row and gets the live clock. Free: the edited text already broke
+    ///     the shared prefix at that row, so there is no reuse to protect.
+    ///   * **Regenerate / Retry** (``regenerateAnswer(afterUserAt:…)``) reuse
+    ///     the existing user row deliberately — the question was asked then,
+    ///     and re-answering it is not asking it again — so its "sent" stamp
+    ///     keeps the original ask time. But re-answering "what time is it?"
+    ///     three quarters of an hour later must not report the stale clock,
+    ///     which is why ``answeringNowLine`` APPENDS the answer time to that
+    ///     one row when the two instants differ. Append, not rewrite: the
+    ///     row's own stamp stays immutable, the common regenerate (same
+    ///     minute) adds nothing at all, and the bounded cache cost of the rare
+    ///     late one is documented on that helper.
+    nonisolated static func stampingClockContext(
+        on messages: [ChatMessage],
+        calendar: Calendar = .autoupdatingCurrent,
+        answeringAt: Date? = nil
     ) -> [ChatMessage] {
+        guard messages.contains(where: { $0.role == .user }) else { return messages }
         var result = messages
-        guard result.first?.role == .system,
-              let normalized = normalizedInstruction(component)
-        else { return result }
-        let separator = "\n\n"
-        let prefix = normalized + separator
-        if result[0].content == normalized {
-            result.removeFirst()
-        } else if result[0].content.hasPrefix(prefix) {
-            result[0].content.removeFirst(prefix.count)
+        let newestUserIndex = result.lastIndex { $0.role == .user }
+        for index in result.indices where result[index].role == .user {
+            var trailer = clockContext(
+                at: result[index].createdAt,
+                calendar: calendar
+            )
+            if index == newestUserIndex, let answeringAt {
+                trailer += answeringNowLine(
+                    asked: result[index].createdAt,
+                    answeringAt: answeringAt,
+                    calendar: calendar
+                )
+            }
+            result[index].wireSuffix = trailer
         }
         return result
     }
@@ -2907,7 +3668,7 @@ final class ChatViewModel {
         CustomInstructionsConfig.normalized(value)
     }
 
-    static let toolGuidancePreamble: String = """
+    nonisolated static let toolGuidance: String = """
 You have access to tools that fetch real-time information. When you use one of these tools, follow these rules — they OVERRIDE your training data:
 
 1. Your ONLY source of truth for this turn is the tool result text. If a fact is not in the tool result, you DO NOT KNOW IT for the purposes of this answer. Your training data on this topic is OUT OF DATE and MUST NOT be used.
@@ -2926,7 +3687,7 @@ You have access to tools that fetch real-time information. When you use one of t
 
 8. If a tool result is an error, refusal, or user decline, state the reason written in that result. Never replace it with a different explanation, and never claim the tool lacks a capability unless the result itself says so.
 
-These rules apply to every tool, not just web search.
+These rules apply to every tool, not just web search. They bind the answer to THIS message and the tool results fetched for it. A later message that has no tool result of its own is answered normally; the tool results above remain ordinary conversation context for it.
 """
 
     /// Failure-specific instruction for the one correction round the tool loop
@@ -3053,6 +3814,11 @@ Your previous draft refused the question by claiming you lack real-time access o
     private func runOneStream(
         placeholderIndex: Int,
         request: ChatStreamClient.Request,
+        // Travels WITH the request rather than living on the view model:
+        // whether a document extract survived the trim onto this particular
+        // wire body. codex caught that a stored property would be read by
+        // whichever stream happens to finish last.
+        wireCarriesAttachmentGrounding: Bool,
         epoch: Int
     ) async -> StreamOutcome {
         var current = currentMessage(index: placeholderIndex)
@@ -3250,7 +4016,12 @@ Your previous draft refused the question by claiming you lack real-time access o
                             toolSucceededThisTurn: ChatViewModel.turnHadSuccessfulTool(
                                 messages: self.messages,
                                 placeholderIndex: placeholderIndex
-                            )
+                            ),
+                            promptHadAttachment: wireCarriesAttachmentGrounding,
+                            // The roster this REQUEST carried, read off the
+                            // encoded array — a tool the user disabled, or one
+                            // the budget withheld, was not "available".
+                            advertisedToolNames: request.tools?.map(\.function.name)
                         )
                         // Issue #513 (defense-in-depth, layer 3): when
                         // the request offered tools but the model emitted

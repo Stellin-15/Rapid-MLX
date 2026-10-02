@@ -24,7 +24,9 @@ from unittest.mock import patch
 
 import pytest
 
-from vllm_mlx import cli
+from rapid_mlx import cli
+
+pytestmark = pytest.mark.usefixtures("stub_serve_port_resolution")
 
 
 def _make_serve_args(model: str) -> Namespace:
@@ -172,30 +174,30 @@ def test_offline_unique_complete_snapshot_is_noop_not_refused(monkeypatch, capsy
 def test_offline_unique_complete_snapshot_is_runnable_in_inventory(monkeypatch):
     """Serve admission and cached-model inventory share one verdict."""
     monkeypatch.setattr(
-        "vllm_mlx.audio.registry.resolve_audio_alias", lambda _repo: None
+        "rapid_mlx.audio.registry.resolve_audio_alias", lambda _repo: None
     )
-    monkeypatch.setattr("vllm_mlx._download_gate.is_repo_cached", lambda _repo: False)
+    monkeypatch.setattr("rapid_mlx._download_gate.is_repo_cached", lambda _repo: False)
     monkeypatch.setattr(
-        "vllm_mlx._download_gate._snapshot_is_complete_split_model",
+        "rapid_mlx._download_gate._snapshot_is_complete_split_model",
         lambda _repo: False,
     )
     monkeypatch.setattr(
-        "vllm_mlx._download_gate._snapshot_is_complete_mflux_model",
+        "rapid_mlx._download_gate._snapshot_is_complete_mflux_model",
         lambda _repo: False,
     )
     monkeypatch.setattr(
-        "vllm_mlx._download_gate._snapshot_is_complete_wan_model",
+        "rapid_mlx._download_gate._snapshot_is_complete_wan_model",
         lambda _repo: False,
     )
     monkeypatch.setattr(
-        "vllm_mlx.model_metadata.resolve_unreferenced_cached_snapshot",
+        "rapid_mlx.model_metadata.resolve_unreferenced_cached_snapshot",
         lambda _repo: None,
     )
     monkeypatch.setattr(
-        "vllm_mlx.model_metadata.resolve_offline_cached_snapshot",
+        "rapid_mlx.model_metadata.resolve_offline_cached_snapshot",
         lambda _repo: "/cache/models--acme--model/snapshots/complete",
     )
-    monkeypatch.setattr("vllm_mlx.video.wan.WAN_REVISIONS", {})
+    monkeypatch.setattr("rapid_mlx.video.wan.WAN_REVISIONS", {})
 
     assert cli._cache_runnability("acme/model") is True
     assert cli._cache_entry_is_runnable("acme/model") is True
@@ -263,7 +265,7 @@ def test_gate_refuses_offline_uncached_before_notices(monkeypatch, capsys):
     uncached repo id; the offline refusal fires first (SystemExit 1), and the
     size-estimate + ``confirm_or_abort`` path is never reached (#2357-P2).
     """
-    import vllm_mlx._download_gate as gate
+    import rapid_mlx._download_gate as gate
 
     # Outer gate condition: text-only probe reports uncached (no root
     # ``model*.safetensors``). Offline refusal scope: the shared runnability
@@ -305,8 +307,8 @@ def test_serve_audio_alias_refuses_offline_uncached(monkeypatch, capsys):
     main()'s B2 gate, and ``_serve_audio_mode`` loads weights lazily — so the
     audio fork itself must refuse an offline + uncached model BEFORE booting
     the audio server (codex #2357-P1-a)."""
-    from vllm_mlx.audio import probe
-    from vllm_mlx.audio.registry import AudioAliasEntry
+    from rapid_mlx.audio import probe
+    from rapid_mlx.audio.registry import AudioAliasEntry
 
     # ``serve_command`` gates audio aliases on ``require_audio_or_exit`` at the
     # top, which exits(2) when ``mlx_audio`` is absent (base install / the
@@ -332,8 +334,12 @@ def test_serve_audio_alias_refuses_offline_uncached(monkeypatch, capsys):
         reached_audio_boot.append(a)
         raise AssertionError("audio server must not boot for offline+uncached")
 
+    def _cannot_resolve_port(*a, **k):
+        raise AssertionError("offline+uncached refusal must run before port resolution")
+
     with (
         patch.object(cli, "_resolve_audio_model_for_serve", return_value=entry),
+        patch.object(cli, "_resolve_serve_port", side_effect=_cannot_resolve_port),
         patch.object(cli, "_serve_audio_mode", side_effect=_cannot_boot),
     ):
         args = _make_serve_args("whisper")
@@ -351,7 +357,7 @@ def test_gate_does_not_refuse_when_wan_local_dir_set(monkeypatch, capsys, tmp_pa
     ``RAPID_MLX_WAN_MODEL_DIR`` local checkpoint must NOT be refused — Wan's
     own lane loads from the local dir and never goes through
     ``_ensure_model_downloaded`` (codex #2357-P1-b)."""
-    import vllm_mlx._download_gate as gate
+    import rapid_mlx._download_gate as gate
 
     (tmp_path / "checkpoint").mkdir()
     monkeypatch.setattr(gate, "is_repo_cached", lambda name: False)
@@ -391,7 +397,7 @@ def test_gate_dispatches_unique_complete_offline_snapshot_without_confirm(
     monkeypatch, capsys
 ):
     """The interactive entry gate agrees with the loader's offline fallback."""
-    import vllm_mlx._download_gate as gate
+    import rapid_mlx._download_gate as gate
 
     monkeypatch.setattr(gate, "is_repo_cached", lambda _name: False)
     monkeypatch.setattr(cli, "_cache_entry_is_runnable", lambda _name: False)
@@ -434,7 +440,7 @@ def test_gate_wan_dir_set_does_not_exempt_text_model(monkeypatch, capsys, tmp_pa
     """A stray ``RAPID_MLX_WAN_MODEL_DIR`` must NOT exempt an unrelated text
     model from the offline refusal — the exemption is scoped to the video-gen
     lane (codex #2357-P2)."""
-    import vllm_mlx._download_gate as gate
+    import rapid_mlx._download_gate as gate
 
     monkeypatch.setattr(gate, "is_repo_cached", lambda name: False)
     monkeypatch.setattr(cli, "_cache_entry_is_runnable", lambda name: False)
@@ -467,7 +473,7 @@ def test_gate_skips_offline_refusal_for_attached_client(monkeypatch, capsys):
     server) must NOT be refused for a model absent from the local cache — the
     named model lives remotely and is never meant to be downloaded locally
     (codex #2357-P1)."""
-    import vllm_mlx._download_gate as gate
+    import rapid_mlx._download_gate as gate
 
     monkeypatch.setattr(gate, "is_repo_cached", lambda name: False)
     monkeypatch.setattr(cli, "_cache_entry_is_runnable", lambda name: False)
@@ -537,7 +543,7 @@ def test_cache_probe_fault_fails_open_for_offline(monkeypatch, exc):
     """
     # Induce an expected probe fault in resolve_audio_alias.
     monkeypatch.setattr(
-        "vllm_mlx.audio.registry.resolve_audio_alias",
+        "rapid_mlx.audio.registry.resolve_audio_alias",
         lambda repo: (_ for _ in ()).throw(exc),
     )
     # Tri-state core: inconclusive, not a baked True (regression) nor False.
@@ -559,7 +565,7 @@ def test_cached_models_survives_probe_fault(monkeypatch, capsys, exc):
     )
     monkeypatch.setattr(cli, "_scan_external_model_dirs", lambda: [])
     monkeypatch.setattr(
-        "vllm_mlx.audio.registry.resolve_audio_alias",
+        "rapid_mlx.audio.registry.resolve_audio_alias",
         lambda _repo: (_ for _ in ()).throw(exc),
     )
 
@@ -573,7 +579,7 @@ def test_pull_prefetch_gate_survives_probe_fault(monkeypatch, capsys, exc):
     """A faulty cache entry is treated as not runnable and pulls normally."""
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     monkeypatch.setattr(
-        "vllm_mlx.audio.registry.resolve_audio_alias",
+        "rapid_mlx.audio.registry.resolve_audio_alias",
         lambda _repo: (_ for _ in ()).throw(exc),
     )
     seen = {}
@@ -632,14 +638,14 @@ def test_chat_model_switch_survives_probe_fault(monkeypatch, capsys, exc):
     monkeypatch.setattr(cli, "_ensure_model_downloaded", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cli, "_wait_for_chat_server", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        "vllm_mlx.model_aliases.resolve_model", lambda alias: f"org/{alias}"
+        "rapid_mlx.model_aliases.resolve_model", lambda alias: f"org/{alias}"
     )
-    monkeypatch.setattr("vllm_mlx._download_gate.is_repo_cached", lambda _repo: False)
+    monkeypatch.setattr("rapid_mlx._download_gate.is_repo_cached", lambda _repo: False)
     monkeypatch.setattr(
-        "vllm_mlx.audio.registry.resolve_audio_alias",
+        "rapid_mlx.audio.registry.resolve_audio_alias",
         lambda _repo: (_ for _ in ()).throw(exc),
     )
-    monkeypatch.setattr("vllm_mlx._download_gate.confirm_or_abort", _confirm_or_abort)
+    monkeypatch.setattr("rapid_mlx._download_gate.confirm_or_abort", _confirm_or_abort)
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     monkeypatch.delenv("RAPID_MLX_AUTO_PULL", raising=False)
 
@@ -680,7 +686,7 @@ def test_ensure_model_downloaded_does_not_refuse_offline_on_probe_fault(
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     # Induce a probe fault: _cache_runnability -> resolve_audio_alias raises.
     monkeypatch.setattr(
-        "vllm_mlx.audio.registry.resolve_audio_alias",
+        "rapid_mlx.audio.registry.resolve_audio_alias",
         lambda repo: (_ for _ in ()).throw(OSError("denied")),
     )
     # The refusal must not fire, so the function proceeds to the download path;

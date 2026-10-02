@@ -14,7 +14,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_mlx import cli, model_aliases, model_metadata
+from rapid_mlx import cli, model_aliases, model_metadata
+from rapid_mlx.runtime.optional_runtime import OptionalRuntimeMissing
 
 
 def _profile(**overrides):
@@ -45,7 +46,7 @@ TEXT_CONFIG = {"architectures": ["Qwen3ForCausalLM"]}
 def _patch_weights(monkeypatch, *, metadata, verdict=None, prefetched=None):
     """``metadata`` is what the cache holds before the guard runs;
     ``prefetched`` is what it holds after the config-only prefetch."""
-    from vllm_mlx.api import utils as api_utils
+    from rapid_mlx.api import utils as api_utils
 
     state = {"current": metadata, "prefetches": []}
 
@@ -140,7 +141,7 @@ def test_text_config_behind_vision_flag_is_exempt(monkeypatch):
 
 
 def test_vendored_text_arch_is_exempt(monkeypatch):
-    from vllm_mlx.api import utils as api_utils
+    from rapid_mlx.api import utils as api_utils
 
     _patch_profile(monkeypatch, _profile())
     _patch_weights(monkeypatch, metadata=None, prefetched=_meta(VLM_CONFIG))
@@ -236,7 +237,7 @@ def _args(**overrides):
 
 
 def test_lane_helper_falls_back_to_profile_when_probe_says_text(monkeypatch):
-    from vllm_mlx.api import utils as api_utils
+    from rapid_mlx.api import utils as api_utils
 
     monkeypatch.setattr(api_utils, "is_mllm_model", lambda name: False)
     _patch_profile(monkeypatch, _profile())
@@ -259,7 +260,7 @@ def test_lane_helper_falls_back_to_profile_when_probe_says_text(monkeypatch):
 def test_lane_helper_keeps_text_diffusion_on_vision_runtime(monkeypatch, overrides):
     """codex #3127: the flag short-circuits must not let a text-diffusion
     alias skip the mlx-vlm guard — its runtime ignores those flags."""
-    from vllm_mlx.api import utils as api_utils
+    from rapid_mlx.api import utils as api_utils
 
     monkeypatch.setattr(api_utils, "is_mllm_model", lambda name: False)
     _patch_profile(
@@ -281,7 +282,7 @@ def test_alias_modality(monkeypatch):
 
 
 def _mask_vision_runtime(monkeypatch):
-    from vllm_mlx.models import mllm
+    from rapid_mlx.models import mllm
 
     monkeypatch.setattr(
         mllm,
@@ -290,25 +291,24 @@ def _mask_vision_runtime(monkeypatch):
     )
 
 
-def test_text_diffusion_guard_message_drops_no_mllm_hint(monkeypatch, capsys):
-    from vllm_mlx.models.mllm import require_mlx_vlm_or_exit
+def test_text_diffusion_guard_message_drops_no_mllm_hint(monkeypatch):
+    from rapid_mlx.models.mllm import require_mlx_vlm_or_exit
 
     _mask_vision_runtime(monkeypatch)
-    with pytest.raises(SystemExit) as exc_info:
+    with pytest.raises(OptionalRuntimeMissing) as exc_info:
         require_mlx_vlm_or_exit("diffusion-gemma-26b-4bit", text_diffusion=True)
-    assert exc_info.value.code == 2
-    err = capsys.readouterr().err
+    err = exc_info.value.format_user_message()
     assert "text-diffusion alias" in err
     assert "rapid-mlx[vision]" in err.replace("'", "")
     assert "--no-mllm" not in err
 
 
-def test_vision_guard_message_keeps_no_mllm_hint(monkeypatch, capsys):
-    from vllm_mlx.models.mllm import require_mlx_vlm_or_exit
+def test_vision_guard_message_keeps_no_mllm_hint(monkeypatch):
+    from rapid_mlx.models.mllm import require_mlx_vlm_or_exit
 
     _mask_vision_runtime(monkeypatch)
-    with pytest.raises(SystemExit):
+    with pytest.raises(OptionalRuntimeMissing) as exc_info:
         require_mlx_vlm_or_exit("gemma-4-26b-4bit")
-    err = capsys.readouterr().err
+    err = exc_info.value.format_user_message()
     assert "vision/multimodal alias" in err
     assert "--no-mllm" in err

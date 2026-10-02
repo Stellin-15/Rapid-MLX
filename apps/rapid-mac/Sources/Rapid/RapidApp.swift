@@ -67,6 +67,9 @@ struct RapidApp: App {
     /// The single source of truth for the embedded rapid-mlx child. We
     /// build it once at app launch so all windows / scenes share state.
     @State private var server: ServerManager
+    /// Model-free, app-owned sidecar for native Computer Use. It remains
+    /// independent from chat model selection and replacement.
+    @State private var cuaServer: CUAServerManager
     /// Per-window-but-shared chat controller — single window for now, so
     /// keeping a process-wide instance is fine.
     @State private var chatViewModel: ChatViewModel
@@ -103,9 +106,9 @@ struct RapidApp: App {
     /// Deep-link channel into the Settings window.
     @State private var settingsRouter: SettingsRouter
     @State private var commandPaletteRequest = CommandPaletteRequestCoordinator()
-    /// App-owned owner of the one-time invitation that follows the first
-    /// successful product outcome. Feature models only publish typed success.
-    @State private var deferredTelemetryConsent: DeferredTelemetryConsentCoordinator
+    /// App-owned one-time launch disclosure. Feature models also publish typed
+    /// successes through it to the existing activation reporter.
+    @State private var telemetryNotice: TelemetryNoticeCoordinator
     /// Local-only post-value GitHub invitation. It shares the typed success
     /// seam above but owns independent quiet-window and backoff policy.
     @State private var githubStarPrompt: GitHubStarPromptCoordinator
@@ -131,6 +134,8 @@ struct RapidApp: App {
     /// Per-fetch approval gate for the ``browse`` tool, shared by the tool
     /// runner (which suspends on it) and the SwiftUI approval sheet.
     @State private var browseApproval: BrowseApprovalStore
+    /// Consent gate for built-in local workspace reads and actions.
+    @State private var localToolApproval: LocalToolApprovalStore
     /// MCP connectors (issue #1716) — the config file the engine reads, the
     /// live state it reports back, the per-tool consent gate, and the registry
     /// that ties them into the chat loop.
@@ -147,24 +152,43 @@ struct RapidApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     init() {
+        // One Desktop per user session, decided before ANYTHING this launch
+        // could leave behind: the crash marker below, and the launch port
+        // sweep further down, which trusts the on-disk sidecar ownership
+        // record and would SIGTERM the RUNNING instance's engine as an
+        // "orphan" before a later guard got to run. A second instance
+        // (`open -n`, a direct `Contents/MacOS/Rapid` exec, a second copy
+        // of the bundle — LaunchServices only enforces
+        // ``LSMultipleInstancesProhibited`` for Finder and `open -a`) used
+        // to start its own sidecar on the same port and leave the first
+        // window on "Couldn't start <model> — check the model files" while
+        // the model was loaded next door (0.14.3 dogfood, 2026-09-18).
+        // Hand the launch to the survivor and leave. Plain `exit`: nothing
+        // has been set up, so there is nothing to tear down. If the survivor
+        // vanished between the check and the hand-off (quit-and-relaunch),
+        // this launch is the only Desktop and carries on.
+        if SingleInstanceGuard.yieldsLaunch() { exit(0) }
         // Install the crash reporter FIRST — every other init step can
         // fatalError under bad disk / permissions state, and we want
         // those abortions to leave a marker for the next launch.
         CrashReporter.install()
-        // Migrate only users who had explicitly changed the legacy
-        // telemetry toggle. An absent value remains undecided/off and is
-        // handled by the post-value consent coordinator.
+        // Reconcile the local sender gate before any launch task can emit.
+        // A disclosure that is still owed remains off until its banner's
+        // onAppear callback successfully merges the shared marker.
         TelemetryConsent.synchronizeExistingDecision()
-        let consentCoordinator = DeferredTelemetryConsentCoordinator()
+        let noticeCoordinator = TelemetryNoticeCoordinator()
         let starPromptCoordinator = GitHubStarPromptCoordinator()
         // #2878 changed the Desktop default from 8000 to 7659. Preserve the
         // old endpoint for upgrades before InstallTracker records this launch;
         // otherwise existing OpenAI-compatible clients silently disconnect.
-        PortAllocator.migrateLegacyDefaultIfNeeded(
-            hadPreviousLaunch: UserDefaults.standard.string(
-                forKey: InstallTracker.lastSeenVersionKey
-            ) != nil
-        )
+        // Capture before InstallTracker records this launch. This is also the
+        // durable first-run-funnel upgrade exclusion: even an older install
+        // that never completed or entered Quickstart must not become a new
+        // telemetry cohort merely because it upgraded into this feature.
+        let hadPreviousLaunch = UserDefaults.standard.string(
+            forKey: InstallTracker.lastSeenVersionKey
+        ) != nil
+        PortAllocator.migrateLegacyDefaultIfNeeded(hadPreviousLaunch: hadPreviousLaunch)
         // Sweep orphan rapid-mlx processes from previous sessions BEFORE
         // anything else looks at our serve port.
         //
@@ -191,6 +215,7 @@ struct RapidApp: App {
         // the same port. Still detached — launch never blocks on it.
         PortSweep.startLaunchSweep(port: PortAllocator.candidatePorts.first ?? 8000)
         let manager = ServerManager()
+        let cuaServerManager = CUAServerManager()
         let samplingConfig = SamplingConfig()
         let customInstructionsConfig = CustomInstructionsConfig()
         let memoryStore = MemoryStore()
@@ -203,12 +228,15 @@ struct RapidApp: App {
         // so Settings + the approval sheet bind to the same instances.
         let webSearchConfig = WebSearchConfig()
         let browseApprovalStore = BrowseApprovalStore()
+        let localToolApprovalStore = LocalToolApprovalStore()
         let builtinRegistry = BuiltinToolRegistry(
             browseApproval: browseApprovalStore,
-            webSearch: webSearchConfig
+            webSearch: webSearchConfig,
+            localApproval: localToolApprovalStore
         )
         _webSearch = State(initialValue: webSearchConfig)
         _browseApproval = State(initialValue: browseApprovalStore)
+        _localToolApproval = State(initialValue: localToolApprovalStore)
 
         // Issue #1716: MCP connectors. The config store owns the file the
         // engine child reads; the catalog reads back what that child actually
@@ -284,8 +312,8 @@ struct RapidApp: App {
             customInstructions: customInstructionsConfig,
             memoryStore: memoryStore,
             server: manager,
-            onProductValueDelivered: { [weak consentCoordinator, weak starPromptCoordinator] kind in
-                consentCoordinator?.productValueDelivered(kind)
+            onProductValueDelivered: { [weak noticeCoordinator, weak starPromptCoordinator] kind in
+                noticeCoordinator?.productValueDelivered(kind)
                 starPromptCoordinator?.productValueDelivered(kind)
             }
         )
@@ -334,8 +362,8 @@ struct RapidApp: App {
             server: manager,
             testingReadiness: fixtureReadiness,
             testingHotkeyStart: fixtureHotkeyStart,
-            onProductValueDelivered: { [weak consentCoordinator, weak starPromptCoordinator] kind in
-                consentCoordinator?.productValueDelivered(kind)
+            onProductValueDelivered: { [weak noticeCoordinator, weak starPromptCoordinator] kind in
+                noticeCoordinator?.productValueDelivered(kind)
                 starPromptCoordinator?.productValueDelivered(kind)
             }
         )
@@ -346,18 +374,22 @@ struct RapidApp: App {
         _downloads = State(initialValue: downloadsInstance)
         _shareCompute = State(initialValue: shareComputeManager)
         _installTracker = State(initialValue: InstallTracker())
-        _quickstart = State(initialValue: QuickstartCoordinator())
+        _quickstart = State(initialValue: QuickstartCoordinator(
+            hasChatHistory: !chat.conversations.isEmpty,
+            hadPreviousLaunch: hadPreviousLaunch
+        ))
         let dockPrompt = DockVisibilityPromptStore()
         _dockPromptStore = State(initialValue: dockPrompt)
         AppDelegate.shared.dockPromptStore = dockPrompt
         _chatViewModel = State(initialValue: chat)
         let imageGenViewModel = ImageGenViewModel(server: manager)
-        imageGenViewModel.observeProductValue { [weak consentCoordinator, weak starPromptCoordinator] kind in
-            consentCoordinator?.productValueDelivered(kind)
+        imageGenViewModel.observeProductValue { [weak noticeCoordinator, weak starPromptCoordinator] kind in
+            noticeCoordinator?.productValueDelivered(kind)
             starPromptCoordinator?.productValueDelivered(kind)
         }
         _imageGen = State(initialValue: imageGenViewModel)
         _audio = State(initialValue: AudioViewModel(server: manager))
+        _cuaServer = State(initialValue: cuaServerManager)
         _video = State(initialValue: VideoGenViewModel(server: manager))
         _dictation = State(initialValue: dictationController)
         _updater = State(initialValue: updateChecker)
@@ -367,12 +399,13 @@ struct RapidApp: App {
         _memoryStore = State(initialValue: memoryStore)
         _appearance = State(initialValue: appearanceConfig)
         _settingsRouter = State(initialValue: SettingsRouter())
-        _deferredTelemetryConsent = State(initialValue: consentCoordinator)
+        _telemetryNotice = State(initialValue: noticeCoordinator)
         _githubStarPrompt = State(initialValue: starPromptCoordinator)
         // Hand the live singletons to the delegate so the shutdown hook
         // and the AppKit menu-bar tray can reach them without rebuilding
         // the SwiftUI environment.
         AppDelegate.shared.server = manager
+        AppDelegate.shared.cuaServer = cuaServerManager
         AppDelegate.shared.downloads = downloadsInstance
         AppDelegate.shared.shareCompute = shareComputeManager
         AppDelegate.shared.updater = updateChecker
@@ -390,6 +423,7 @@ struct RapidApp: App {
                 // lane per the rapidmlx.com design system (rapid-desktop #632).
                 .tint(RapidTheme.brandAmber)
                 .environment(server)
+                .environment(cuaServer)
                 .environment(downloads)
                 .environment(shareCompute)
                 .environment(chatViewModel)
@@ -405,13 +439,14 @@ struct RapidApp: App {
                 .environment(appearance)
                 .environment(settingsRouter)
                 .environment(commandPaletteRequest)
-                .environment(deferredTelemetryConsent)
+                .environment(telemetryNotice)
                 .environment(githubStarPrompt)
                 .environment(installTracker)
                 .environment(quickstart)
                 .environment(dockPromptStore)
                 .environment(webSearch)
                 .environment(browseApproval)
+                .environment(localToolApproval)
                 .environment(mcpConfig)
                 .environment(mcpCatalog)
                 .environment(mcpApproval)
@@ -543,6 +578,16 @@ struct RapidApp: App {
                 Toggle("Show Server Log", isOn: $showLogs)
                     .keyboardShortcut("l", modifiers: [.command, .shift])
             }
+            // Help → Tell Us What You Want…  The voice channel. The menu
+            // bar is where a user looks for "how do I reach these
+            // people", and the answer is the same Discord invite the
+            // README and `rapid-mlx feedback` open. Opening a link is
+            // all it does — nothing is attached, nothing is reported.
+            CommandGroup(after: .help) {
+                Button("Tell Us What You Want…") {
+                    NSWorkspace.shared.open(CommunityLinks.discordInvite)
+                }
+            }
             CommandMenu("Go") {
                 Button("Command Palette…") {
                     NSApp.activate(ignoringOtherApps: true)
@@ -560,6 +605,32 @@ struct RapidApp: App {
         // status-item menu action. ⌘, is re-wired in ``.commands``.
         Window("Settings", id: "settings") {
             SettingsView()
+                .background {
+                    // Keep Settings out of AppKit window restoration. A quit
+                    // with only Settings open (main closed with ⌘W) used to
+                    // persist "settings" as the whole session, and the next
+                    // launch restored exactly that: a Settings window, no
+                    // main window, and — because ContentView is what starts
+                    // the sidecar — no engine (0.14.3 dogfood, 2026-09-18).
+                    // ``restorationBehavior(.disabled)`` is the SwiftUI
+                    // spelling but needs macOS 15; the AppKit flag it sets
+                    // works on the 14 floor too.
+                    WindowAccessor { window in
+                        window.isRestorable = false
+                    }
+                    .frame(width: 0, height: 0)
+                }
+                .task {
+                    // Heal a session already persisted in that shape: if
+                    // Settings is the first window of this process, this is
+                    // a restoration-only launch, so bring up the main window
+                    // the way a fresh launch would. Never fires for a user
+                    // who opened Settings from a running Desktop, because
+                    // the main window has been attached by then.
+                    if !AppDelegate.shared.hasAttachedMainWindow {
+                        openWindow(id: "main")
+                    }
+                }
                 .tint(RapidTheme.brandAmber)
                 .environment(chatViewModel)
                 .environment(sampling)
@@ -580,12 +651,13 @@ struct RapidApp: App {
                 .environment(dockPromptStore)
                 .environment(webSearch)
                 .environment(browseApproval)
+                .environment(localToolApproval)
                 .environment(mcpConfig)
                 .environment(mcpCatalog)
                 .environment(mcpApproval)
                 .environment(mcpTools)
                 .environment(perfConfig)
-                .environment(deferredTelemetryConsent)
+                .environment(telemetryNotice)
         }
         .windowResizability(.contentMinSize)
         .defaultSize(width: 900, height: 720)
@@ -621,6 +693,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     static let shared = AppDelegate()
 
     weak var server: ServerManager?
+    weak var cuaServer: CUAServerManager?
     weak var downloads: DownloadManager?
     weak var shareCompute: ShareComputeManager?
     /// Hand from ``RapidApp.init`` so ``applicationWillTerminate`` can
@@ -670,11 +743,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// survive scene re-mount across hide/show cycles.
     var mainWindowCloseInterceptor: MainWindowCloseInterceptor?
 
+    /// Whether SwiftUI has materialised the main window at least once in
+    /// this process. The Settings scene reads it to tell a restoration-only
+    /// launch (Settings came back, main did not) from Settings opened on top
+    /// of a running Desktop.
+    private(set) var hasAttachedMainWindow = false
+
     /// Attach the AppKit-only main-window behaviours once SwiftUI has
     /// materialised its concrete ``NSWindow``. Repeated accessor callbacks
     /// are expected; installation is idempotent for the same window and is
     /// repeated when SwiftUI creates a replacement after a normal close.
     func attachMainWindow(_ window: NSWindow) {
+        hasAttachedMainWindow = true
         let needsInstall = MainWindowCloseInterceptor.shouldReinstall(
             currentAttachedWindow: mainWindowCloseInterceptor?.attachedWindow,
             newWindow: window
@@ -1042,9 +1122,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stopStream: () -> Void,
         signalShareCompute: () -> Void,
         signalServer: () -> Void,
+        signalCUAServer: () -> Void = {},
         signalDownloads: () -> Void,
         reapShareCompute: () -> Void,
         reapServer: () -> Void,
+        reapCUAServer: () -> Void = {},
         reapDownloads: () -> Void,
         flushConversations: () -> Void,
         flushFolders: () -> Void
@@ -1061,11 +1143,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // SIGTERM before anyone waits, so the graces overlap.
         signalShareCompute()
         signalServer()
+        signalCUAServer()
         signalDownloads()
         // Reap phase — blocking. Server first: its grace is the long
         // one, and by the time it returns the download children have
         // had that entire window to exit.
         reapServer()
+        reapCUAServer()
         reapShareCompute()
         reapDownloads()
         // Drain any queued conversation-history write so the last turn /
@@ -1098,9 +1182,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             stopStream: { AppDelegate.shared.chat?.stopAndPersist() },
             signalShareCompute: { AppDelegate.shared.shareCompute?.beginShutdown() },
             signalServer: { AppDelegate.shared.server?.beginShutdown() },
+            signalCUAServer: { AppDelegate.shared.cuaServer?.beginShutdown() },
             signalDownloads: { AppDelegate.shared.downloads?.beginShutdown() },
             reapShareCompute: { AppDelegate.shared.shareCompute?.finishShutdown() },
             reapServer: { AppDelegate.shared.server?.shutdownSync() },
+            reapCUAServer: { AppDelegate.shared.cuaServer?.shutdownSync() },
             reapDownloads: { AppDelegate.shared.downloads?.finishShutdown() },
             flushConversations: { ConversationStore.flush() },
             flushFolders: { ConversationFolderStore.flush() }

@@ -6,9 +6,10 @@ import Testing
 ///
 /// The regression these lock down: a declined `browse` approval used to fall
 /// through to ``FailureDiagnosis/Kind/toolFailed``, so clicking **Don't allow**
-/// painted a red tool card reading *"The tool couldn't finish. Check its input,
-/// then try again."* — the app reporting a fault, blaming the user's own input
-/// for it, and offering to retry the very thing they had just refused.
+/// painted a red tool card reading *"The tool couldn't finish. Check its
+/// input, then try again."* (the ``.toolFailed`` copy of the day) — the app
+/// reporting a fault, blaming the user's own input for it, and offering to
+/// retry the very thing they had just refused.
 ///
 /// Four properties are pinned here, and all four matter:
 ///   1. A decline classifies as ``FailureDiagnosis/Kind/userDeclined`` and
@@ -343,9 +344,16 @@ final class DeclinedToolDiagnosisTests {
     /// user stopping a transfer they started, which is the same shape as
     /// declining a permission prompt: nothing malfunctioned, so nothing should
     /// be painted as though it had.
+    ///
+    /// ``requestSuperseded`` joined with the faithful-engine-error slice
+    /// (#3564). A model swap under a running request cancels it cooperatively:
+    /// the engine did exactly what was asked (load the new model), so — like a
+    /// decline or a cancelled download — nothing failed and the copy is a calm
+    /// "ask again", not a red fault.
     private static let noticeKinds: Set<FailureDiagnosis.Kind> = [
         .userDeclined,
         .downloadCancelled,
+        .requestSuperseded,
     ]
 
     @Test("Only the user's own choices are notices; every other kind stays an error")

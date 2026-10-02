@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Contract tests for ``vllm_mlx/aliases.json`` — under-spec'd alias guard.
+"""Contract tests for ``rapid_mlx/aliases.json`` — under-spec'd alias guard.
 
 The alias JSON is a frequent landing-zone for "looks-fine-on-PR" mistakes
 that only surface much later: a Qwen alias missing ``tool_call_parser``
@@ -29,16 +29,16 @@ from pathlib import Path
 
 import pytest
 
-from vllm_mlx import model_sizes
-from vllm_mlx.model_aliases import (
+from rapid_mlx import model_sizes
+from rapid_mlx.model_aliases import (
     POPULAR_ALIASES,
     VALID_PFLASH_TIERS,
     VALID_SUFFIX_TIERS,
     list_profiles,
 )
-from vllm_mlx.model_auto_config import detect_model_config
-from vllm_mlx.reasoning import list_parsers as list_reasoning_parsers
-from vllm_mlx.tool_parsers import ToolParserManager
+from rapid_mlx.model_auto_config import detect_model_config
+from rapid_mlx.reasoning import list_parsers as list_reasoning_parsers
+from rapid_mlx.tool_parsers import ToolParserManager
 
 # Top-level keys we currently accept on a profile object. Typo-guard: if a
 # PR adds ``is_hybird: true`` (real typo) it silently flows through as an
@@ -71,6 +71,7 @@ ALLOWED_PROFILE_KEYS: frozenset[str] = frozenset(
         "is_moe",
         "supports_spec_decode",
         "supports_native_mtp",
+        "native_mtp_draft_model",
         "mtp_draft_model",
         "mtp_speculative_tokens",
         "mtp_continuous_batching_tier",
@@ -86,17 +87,24 @@ ALLOWED_PROFILE_KEYS: frozenset[str] = frozenset(
         "dflash_target_revision",
         "dflash_draft_revision",
         "dflash_algorithm",
+        # Closed provider selection for the explicitly qualified DFlash pair.
+        # _coerce accepts only "tensorfold" and requires a pinned drafter.
+        "dflash_backend",
         "supports_ddtree",
         "ddtree_draft_model",
         "ddtree_speculative_tokens",
         "ddtree_tree_budget",
         "min_memory_gb",
+        "enforce_min_memory",
         "vision_min_memory_gb",
         "experimental",
         "recommended_sampling",
         "pflash_tier",
         "pflash_keep_ratio",
         "turboquant_tier",
+        "tensorfold_mtp",
+        "tensorfold_target_revision",
+        "tensorfold_runtime_revision",
     }
 )
 
@@ -104,7 +112,7 @@ ALLOWED_PROFILE_KEYS: frozenset[str] = frozenset(
 def _raw_aliases() -> dict[str, dict | str]:
     """Return the raw JSON, not the coerced profiles — we need to see
     unexpected keys before ``_coerce`` drops them on the floor."""
-    path = Path(__file__).resolve().parents[1] / "vllm_mlx" / "aliases.json"
+    path = Path(__file__).resolve().parents[1] / "rapid_mlx" / "aliases.json"
     return json.loads(path.read_text())
 
 
@@ -161,6 +169,33 @@ def test_neohorse_9b_alias_is_experimental_text_only_and_conservative() -> None:
     assert alias not in POPULAR_ALIASES
 
 
+def test_k2_horizon_7b_alias_uses_rapid_native_runtime_contract() -> None:
+    """K2 stays opt-in and binds only its reviewed IFM protocol handlers."""
+
+    alias = "k2-horizon-7b-4bit"
+    profile = list_profiles()[alias]
+
+    assert profile.hf_path == "abenzerps/K2-Horizon-7B-MLX-4bit"
+    assert profile.modality == "text"
+    assert profile.is_text_only is True
+    assert profile.experimental is True
+    assert profile.min_memory_gb == 16.0
+    assert profile.tool_call_parser == "k2_horizon"
+    assert profile.reasoning_parser == "k2_horizon"
+    assert profile.is_hybrid is False
+    assert profile.is_hybrid_explicit is True
+    assert profile.is_moe is False
+    assert profile.supports_spec_decode is False
+    assert profile.supports_native_mtp is False
+    assert profile.mtp_draft_model is None
+    assert profile.mtp_default_enabled is False
+    assert profile.pflash_tier == "unknown"
+    assert profile.turboquant_tier == "unknown"
+    assert detect_model_config(alias) == profile
+    assert detect_model_config(profile.hf_path) == profile
+    assert alias not in POPULAR_ALIASES
+
+
 def test_qwen38_27b_aliases_pin_the_native_named_xml_tool_contract() -> None:
     """Every shipped 27B checkpoint uses the same native XML tool template."""
 
@@ -174,6 +209,29 @@ def test_qwen38_27b_aliases_pin_the_native_named_xml_tool_contract() -> None:
         assert profile.tool_call_parser == "qwen3_coder_xml"
         assert detect_model_config(alias) == profile
         assert detect_model_config(profile.hf_path) == profile
+
+
+def test_bonsai2_27b_pins_the_published_multimodal_contract() -> None:
+    """Bonsai 2 uses named XML tools and its published sampling defaults."""
+
+    alias = "bonsai2-27b-2bit"
+    profile = list_profiles()[alias]
+
+    assert profile.hf_path == "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"
+    assert profile.supports_image_input is True
+    assert profile.is_text_only is False
+    assert profile.tool_call_parser == "qwen3_coder_xml"
+    assert profile.reasoning_parser == "qwen3"
+    assert profile.is_hybrid is True
+    assert profile.is_hybrid_explicit is True
+    assert profile.supports_spec_decode is False
+    assert dict(profile.recommended_sampling or ()) == {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20.0,
+    }
+    assert detect_model_config(alias) == profile
+    assert detect_model_config(profile.hf_path) == profile
 
 
 def test_qwen38_27b_abliterated_alias_is_scoped_and_conservative() -> None:
@@ -204,7 +262,7 @@ def test_qwen38_27b_abliterated_alias_is_scoped_and_conservative() -> None:
 
 
 def test_native_mtp_alias_metadata_is_strict_and_unambiguous() -> None:
-    from vllm_mlx.model_aliases import _coerce
+    from rapid_mlx.model_aliases import _coerce
 
     with pytest.raises(ValueError, match="supports_native_mtp"):
         _coerce(
@@ -236,10 +294,28 @@ def test_native_mtp_alias_metadata_is_strict_and_unambiguous() -> None:
                 "mtp_draft_model": "publisher/drafter",
             },
         )
+    with pytest.raises(ValueError, match="org/repo"):
+        _coerce(
+            "malformed-native-sidecar",
+            {
+                "hf_path": "publisher/model",
+                "supports_native_mtp": True,
+                "native_mtp_draft_model": "drafter-without-owner",
+                "mtp_speculative_tokens": 1,
+            },
+        )
+    with pytest.raises(ValueError, match="requires supports_native_mtp"):
+        _coerce(
+            "orphan-native-sidecar",
+            {
+                "hf_path": "publisher/model",
+                "native_mtp_draft_model": "publisher/drafter",
+            },
+        )
 
 
 def test_flash_next_native_mtp_capability_label_is_opt_in() -> None:
-    from vllm_mlx.model_auto_config import _mtp_path_label
+    from rapid_mlx.model_auto_config import _mtp_path_label
 
     profile = list_profiles()["qwen3.8-flash-next-4bit"]
 
@@ -251,7 +327,7 @@ def test_flash_next_native_mtp_capability_label_is_opt_in() -> None:
 
 @pytest.mark.parametrize("bad_value", [0, 1, "true", None])
 def test_experimental_alias_flag_requires_a_boolean(bad_value) -> None:
-    from vllm_mlx.model_aliases import _coerce
+    from rapid_mlx.model_aliases import _coerce
 
     with pytest.raises(ValueError, match="experimental"):
         _coerce(
@@ -555,7 +631,7 @@ def test_alias_only_uses_known_keys(alias: str) -> None:
         f"{alias}: unknown profile keys {sorted(extra)}. "
         f"Allowed: {sorted(ALLOWED_PROFILE_KEYS)}. "
         f"If you're adding a new field, update ALLOWED_PROFILE_KEYS here "
-        f"and AliasProfile in vllm_mlx/model_aliases.py."
+        f"and AliasProfile in rapid_mlx/model_aliases.py."
     )
 
 
@@ -573,7 +649,7 @@ def test_popular_aliases_all_exist_in_registry() -> None:
     assert not missing, (
         f"POPULAR_ALIASES references aliases that don't exist in "
         f"aliases.json: {missing}. Either add the alias or remove the "
-        f"name from POPULAR_ALIASES in vllm_mlx/model_aliases.py."
+        f"name from POPULAR_ALIASES in rapid_mlx/model_aliases.py."
     )
 
 
@@ -590,7 +666,7 @@ def test_popular_aliases_all_exist_in_registry() -> None:
 def test_negative_control_hybrid_spec_decode_combination_is_caught() -> None:
     """If a future PR adds ``is_hybrid=true`` + ``supports_spec_decode=true``,
     ``test_hybrid_disables_spec_decode`` must reject it."""
-    from vllm_mlx.model_aliases import AliasProfile
+    from rapid_mlx.model_aliases import AliasProfile
 
     bad = AliasProfile(
         hf_path="fake/Model",
@@ -751,8 +827,8 @@ def test_negative_control_dflash_on_moe_is_caught() -> None:
     be rejected by the eligibility gate. Exercises the actual gate path
     (not just the data structure) so a regression that quietly removes
     the MoE check in ``eligibility.check`` fails this test."""
-    from vllm_mlx.model_aliases import AliasProfile
-    from vllm_mlx.speculative.dflash import DFlashUnavailable, check
+    from rapid_mlx.model_aliases import AliasProfile
+    from rapid_mlx.speculative.dflash import DFlashUnavailable, check
 
     bad = AliasProfile(
         hf_path="fake/MoE-Model",
@@ -767,7 +843,7 @@ def test_negative_control_dflash_on_moe_is_caught() -> None:
 def test_negative_control_dflash_missing_drafter_is_caught() -> None:
     """``supports_dflash=True`` without ``dflash_draft_model`` must be
     rejected at JSON load time by ``_coerce``."""
-    from vllm_mlx.model_aliases import _coerce
+    from rapid_mlx.model_aliases import _coerce
 
     with pytest.raises(ValueError, match="dflash_draft_model"):
         _coerce(
@@ -777,7 +853,7 @@ def test_negative_control_dflash_missing_drafter_is_caught() -> None:
 
 
 def test_negative_control_dflash_missing_algorithm_is_caught() -> None:
-    from vllm_mlx.model_aliases import _coerce
+    from rapid_mlx.model_aliases import _coerce
 
     with pytest.raises(ValueError, match="dflash_algorithm"):
         _coerce(
@@ -791,7 +867,7 @@ def test_negative_control_dflash_missing_algorithm_is_caught() -> None:
 
 
 def test_negative_control_dflash_algorithm_without_drafter_is_caught() -> None:
-    from vllm_mlx.model_aliases import _coerce
+    from rapid_mlx.model_aliases import _coerce
 
     with pytest.raises(ValueError, match="requires dflash_draft_model"):
         _coerce(
@@ -801,7 +877,7 @@ def test_negative_control_dflash_algorithm_without_drafter_is_caught() -> None:
 
 
 def test_negative_control_unknown_dflash_algorithm_is_caught() -> None:
-    from vllm_mlx.model_aliases import _coerce
+    from rapid_mlx.model_aliases import _coerce
 
     with pytest.raises(ValueError, match="not in"):
         _coerce(
@@ -815,7 +891,7 @@ def test_negative_control_unknown_dflash_algorithm_is_caught() -> None:
 
 
 def test_negative_control_dflash_revision_without_drafter_is_caught() -> None:
-    from vllm_mlx.model_aliases import _coerce
+    from rapid_mlx.model_aliases import _coerce
 
     with pytest.raises(ValueError, match="revision pins require"):
         _coerce(
@@ -836,7 +912,7 @@ def test_negative_control_dflash_revision_without_drafter_is_caught() -> None:
 def test_dflash_pair_requires_immutable_full_revision_pins(
     target_revision, draft_revision
 ) -> None:
-    from vllm_mlx.model_aliases import _coerce
+    from rapid_mlx.model_aliases import _coerce
 
     with pytest.raises(ValueError, match="revision"):
         _coerce(
@@ -854,7 +930,7 @@ def test_dflash_pair_requires_immutable_full_revision_pins(
 
 @pytest.mark.parametrize("bad_floor", [0, -1, True, "32"])
 def test_vision_memory_floor_requires_a_positive_number(bad_floor) -> None:
-    from vllm_mlx.model_aliases import _coerce
+    from rapid_mlx.model_aliases import _coerce
 
     with pytest.raises(ValueError, match="vision_min_memory_gb"):
         _coerce(
@@ -880,9 +956,20 @@ def test_qwen35_and_qwen36_vision_aliases_carry_the_same_memory_floor() -> None:
         assert profile.get("vision_min_memory_gb") == 32, name
 
 
+@pytest.mark.parametrize(
+    "alias",
+    ["mistral-24b-4bit", "devstral-24b-4bit", "devstral-v2-24b-4bit"],
+)
+def test_text_capable_mistral_vision_routes_do_not_overload_memory_floor(alias) -> None:
+    profile = list_profiles()[alias]
+    assert profile.vision_min_memory_gb is None
+    assert profile.modality == "text"
+    assert profile.is_text_only is False
+
+
 def test_mtp_preset_requires_a_valid_drafter_and_positive_token_count() -> None:
     """MTP capability metadata is consumed by both CLI and macOS Settings."""
-    from vllm_mlx.model_aliases import _coerce
+    from rapid_mlx.model_aliases import _coerce
 
     profile = _coerce(
         "fake-alias",
@@ -914,7 +1001,7 @@ def test_mtp_preset_requires_a_valid_drafter_and_positive_token_count() -> None:
 
 
 def test_mtp_token_count_without_a_drafter_is_rejected() -> None:
-    from vllm_mlx.model_aliases import _coerce
+    from rapid_mlx.model_aliases import _coerce
 
     with pytest.raises(ValueError, match="requires .*mtp_draft_model"):
         _coerce(
@@ -925,7 +1012,7 @@ def test_mtp_token_count_without_a_drafter_is_rejected() -> None:
 
 def test_pflash_keep_ratio_out_of_range_is_rejected() -> None:
     """A ``pflash_keep_ratio`` outside (0, 1] must fail loud at load time."""
-    from vllm_mlx.model_aliases import _coerce
+    from rapid_mlx.model_aliases import _coerce
 
     for bad in (0.0, -0.1, 1.5, 2):
         with pytest.raises(ValueError, match="pflash_keep_ratio"):
@@ -938,7 +1025,7 @@ def test_pflash_keep_ratio_out_of_range_is_rejected() -> None:
 def test_pflash_keep_ratio_non_number_is_rejected() -> None:
     """A non-numeric ``pflash_keep_ratio`` (incl. bool) must be rejected —
     ``True`` is an int subclass in Python and would otherwise slip through."""
-    from vllm_mlx.model_aliases import _coerce
+    from rapid_mlx.model_aliases import _coerce
 
     for bad in ("0.5", True, [0.5]):
         with pytest.raises(ValueError, match="pflash_keep_ratio"):
@@ -950,7 +1037,7 @@ def test_pflash_keep_ratio_non_number_is_rejected() -> None:
 
 def test_pflash_keep_ratio_valid_value_is_accepted() -> None:
     """A valid override coerces onto the profile as a float."""
-    from vllm_mlx.model_aliases import _coerce
+    from rapid_mlx.model_aliases import _coerce
 
     profile = _coerce(
         "fake-alias",
@@ -965,7 +1052,7 @@ def test_pflash_keep_ratio_requires_verified_tier() -> None:
     at load time: the resolver applies the override whenever PFlash runs (incl.
     an explicit ``--pflash always``), so allowing it on an unknown-tier alias
     would silently shift explicitly-enabled PFlash behaviour (codex #1458 r2)."""
-    from vllm_mlx.model_aliases import _coerce
+    from rapid_mlx.model_aliases import _coerce
 
     # default tier is "unknown"
     with pytest.raises(ValueError, match="only valid with pflash_tier='verified'"):
@@ -1042,7 +1129,7 @@ def test_ddtree_eligible_aliases_have_dflash_drafter() -> None:
 
 
 def test_negative_control_ddtree_missing_drafter_is_caught() -> None:
-    from vllm_mlx.model_aliases import _coerce
+    from rapid_mlx.model_aliases import _coerce
 
     with pytest.raises(ValueError, match="ddtree_draft_model"):
         _coerce(
@@ -1649,6 +1736,14 @@ _CURATED_RECOMMENDED_SAMPLING: dict[str, dict[str, float]] = {
     "glm4.5-air-4bit": {"temperature": 0.6, "top_p": 0.95},
     # GLM-4.7-Flash ships temperature=1.0 upstream; we add only top_p.
     "glm4.7-9b-4bit": {"top_p": 0.95},
+    # Native MTP is qualified on greedy decode. These values also neutralize
+    # Desktop's generic repetition penalty, which the serial runtime cannot
+    # apply without changing the qualified target distribution.
+    "glm5.3-flash-4bit": {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "repetition_penalty": 1.0,
+    },
 }
 
 
@@ -1698,7 +1793,7 @@ def test_curated_aliases_do_not_contradict_fixture_generation_config() -> None:
     """
     import tempfile
 
-    from vllm_mlx.utils.generation_config import load_generation_config_sampling
+    from rapid_mlx.utils.generation_config import load_generation_config_sampling
 
     fixture_dir = Path(__file__).parent / "fixtures" / "generation_configs"
     profiles = list_profiles()
@@ -1827,7 +1922,7 @@ def test_tier4_short_alias_keys_are_unique() -> None:
     Pin uniqueness explicitly by re-parsing the raw file and counting
     occurrences of each alias key.
     """
-    path = Path(__file__).resolve().parents[1] / "vllm_mlx" / "aliases.json"
+    path = Path(__file__).resolve().parents[1] / "rapid_mlx" / "aliases.json"
     raw_text = path.read_text()
     # Lightweight key scan — count quoted alias names at the start of a
     # JSON object property. Anchored on the leading whitespace pattern
@@ -2063,8 +2158,8 @@ def test_glm_5_2_reap50_alias_resolves_to_pipenetwork_4bit() -> None:
     )
 
 
-def test_glm_5_3_flash_alias_is_experimental_and_fails_closed() -> None:
-    """GLM-5.3 starts on the verified autoregressive VLM path only."""
+def test_glm_5_3_flash_alias_declares_qualified_native_mtp() -> None:
+    """GLM-5.3 advertises only its immutable, qualified native-MTP pair."""
 
     alias = "glm5.3-flash-4bit"
     profile = list_profiles()[alias]
@@ -2077,11 +2172,19 @@ def test_glm_5_3_flash_alias_is_experimental_and_fails_closed() -> None:
     assert profile.is_hybrid_explicit is True
     assert profile.is_moe is True
     assert profile.supports_spec_decode is False
-    assert profile.supports_native_mtp is False
+    assert profile.supports_native_mtp is True
+    assert profile.native_mtp_draft_model == "rapid-mlx/GLM-5.3-Flash-MTP-4bit"
+    assert profile.mtp_draft_model is None
+    assert profile.mtp_speculative_tokens == 1
+    assert profile.mtp_default_enabled is True
     assert profile.supports_dflash is False
     assert profile.tool_call_parser == "glm47"
-    assert profile.reasoning_parser == "glm4"
-    assert profile.recommended_sampling is None
+    assert profile.reasoning_parser == "glm5"
+    assert dict(profile.recommended_sampling or ()) == {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "repetition_penalty": 1.0,
+    }
     assert detect_model_config(alias) == profile
     assert detect_model_config(profile.hf_path) == profile
 
@@ -2120,7 +2223,7 @@ def test_image_input_capability_never_conflicts_with_text_only(alias: str) -> No
 
 
 def test_image_input_capability_is_strict_and_explicit() -> None:
-    from vllm_mlx.model_aliases import _coerce
+    from rapid_mlx.model_aliases import _coerce
 
     profiles = list_profiles()
     assert profiles["qwen3.8-27b-4bit"].supports_image_input is True

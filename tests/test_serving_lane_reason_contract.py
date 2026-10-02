@@ -17,14 +17,14 @@ Both survived because the Swift fixtures asserting this area used the ghost
 strings too, so the tests agreed with the app instead of with the engine.
 
 The engine now has a single source of truth: ``SERVING_LANE_REASONS`` /
-``AUTO_TEXT_FALLBACK_REASONS`` in ``vllm_mlx/api/utils.py``, enforced at
+``AUTO_TEXT_FALLBACK_REASONS`` in ``rapid_mlx/api/utils.py``, enforced at
 construction time by ``ServingLaneDecision.__post_init__``. This test imports
 that SSOT and, rather than trusting it to be right, re-scans the whole engine
 tree for the literals actually emitted and proves the SSOT is both complete (no
 emitted reason can fall outside it) and exactly matches the Swift ``case``
 labels the user actually reads.
 
-mlx-free: the ``vllm_mlx.api.utils`` import chain pulls in no MLX (verified —
+mlx-free: the ``rapid_mlx.api.utils`` import chain pulls in no MLX (verified —
 the Linux CI leg runs this with no MLX installed), and reason collection is
 pure text parsing.
 """
@@ -37,7 +37,7 @@ from pathlib import Path
 
 import pytest
 
-from vllm_mlx.api.utils import (
+from rapid_mlx.api.utils import (
     AUTO_TEXT_FALLBACK_REASONS,
     SERVING_LANE_REASONS,
     VISION_SERVING_LANE_REASONS,
@@ -48,7 +48,7 @@ REPO = Path(__file__).resolve().parents[1]
 # Scan the whole engine tree rather than naming files, so a reason introduced
 # in a fourth module (or a literal seeded outside the decision function) cannot
 # slip past this contract.
-ENGINE = REPO / "vllm_mlx"
+ENGINE = REPO / "rapid_mlx"
 
 PROFILE_SWIFT = REPO / "apps/rapid-mac/Sources/Rapid/Server/ServerModelProfile.swift"
 
@@ -135,6 +135,64 @@ def _decision_reasons() -> dict[str, tuple[bool, bool]]:
                 f"{previous} and {classification}"
             )
     assert found, "no ServingLaneDecision constructions found — parser is stale"
+    return found
+
+
+def _static_model_info_lane_reasons() -> dict[str, bool]:
+    """Static ``ModelInfo`` reason/lane pairs emitted outside lane decisions."""
+    found: dict[str, bool] = {}
+    for path in ENGINE.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        constants = _module_string_constants(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            constructor_name = (
+                node.func.id
+                if isinstance(node.func, ast.Name)
+                else node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else None
+            )
+            if constructor_name != "ModelInfo":
+                continue
+            lane_node = next(
+                (item.value for item in node.keywords if item.arg == "serving_lane"),
+                None,
+            )
+            reason_node = next(
+                (
+                    item.value
+                    for item in node.keywords
+                    if item.arg == "serving_lane_reason"
+                ),
+                None,
+            )
+            if lane_node is None or reason_node is None:
+                continue
+            if not (
+                isinstance(lane_node, ast.Constant)
+                and isinstance(lane_node.value, str)
+                and (
+                    isinstance(reason_node, ast.Constant)
+                    and isinstance(reason_node.value, str)
+                    or isinstance(reason_node, ast.Name)
+                    and reason_node.id in constants
+                )
+            ):
+                continue
+            context = f"ModelInfo at {path}:{node.lineno}"
+            lane = lane_node.value
+            assert lane in {"text", "vision"}, (
+                f"{context} uses unknown static serving lane {lane!r}"
+            )
+            reason = _string_value(reason_node, constants, context=context)
+            is_mllm = lane == "vision"
+            previous = found.setdefault(reason, is_mllm)
+            assert previous == is_mllm, (
+                f"{reason!r} has conflicting static ModelInfo lane classifications: "
+                f"{previous} and {is_mllm}"
+            )
     return found
 
 
@@ -652,12 +710,18 @@ def test_vision_lane_reason_ssot_matches_the_tree():
     decision_vision = {
         reason for reason, (is_mllm, _) in _decision_reasons().items() if is_mllm
     }
-    assert set(VISION_SERVING_LANE_REASONS) == decision_vision, (
-        "VISION_SERVING_LANE_REASONS and decision call sites disagree:\n"
-        f"  in SSOT but no vision decision emits it: "
-        f"{sorted(set(VISION_SERVING_LANE_REASONS) - decision_vision) or 'none'}\n"
+    model_info_vision = {
+        reason
+        for reason, is_mllm in _static_model_info_lane_reasons().items()
+        if is_mllm
+    }
+    emitted_vision = decision_vision | model_info_vision
+    assert set(VISION_SERVING_LANE_REASONS) == emitted_vision, (
+        "VISION_SERVING_LANE_REASONS and static engine call sites disagree:\n"
+        f"  in SSOT but no vision call site emits it: "
+        f"{sorted(set(VISION_SERVING_LANE_REASONS) - emitted_vision) or 'none'}\n"
         f"  emitted on vision lane but absent from SSOT: "
-        f"{sorted(decision_vision - set(VISION_SERVING_LANE_REASONS)) or 'none'}"
+        f"{sorted(emitted_vision - set(VISION_SERVING_LANE_REASONS)) or 'none'}"
     )
 
 

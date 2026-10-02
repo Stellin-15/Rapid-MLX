@@ -1,0 +1,411 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Best-effort telemetry v2 event emission.
+
+The accepted-event token is an accidental-misuse guard, not an unforgeable
+capability. Same-process Python can always reach module state or use tools such
+as ``object.__new__``; resisting that is outside this module's threat model.
+The token instead carries one immutable, validated property snapshot across
+the consent decision and dedupe claim. Enqueue deliberately does not decide
+consent again, but it does re-run the cheap registry validation so mutation or
+forgery can never put registry-invalid or free-text properties on the wire.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import threading
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
+from pathlib import Path
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Protocol
+
+import rapid_mlx
+from rapid_mlx.telemetry import (
+    build_gate,
+    common_props,
+    envelope,
+    registry,
+    state,
+    store,
+)
+
+if TYPE_CHECKING:
+    from rapid_mlx.telemetry.consent_decision import ProcessRole
+
+__all__ = [
+    "emit_active_day",
+    "set_surface_for_role",
+    "start_lifecycle",
+    "track",
+    "would_accept",
+]
+
+
+@dataclass(frozen=True)
+class _ProcessContext:
+    platform: common_props.PlatformFacts
+    surface: str
+    install_id: str
+    session_id: str
+    app_version: str
+    channel: str
+
+
+# This discourages accidental construction only. Python module internals are
+# reachable by same-process code, which is explicitly outside the threat model.
+__ACCEPTED_EVENT_AUTHORITY = object()
+
+
+def _has_accepted_event_authority(candidate: object) -> bool:
+    """Check the misuse guard without class-scope name mangling."""
+    return candidate is __ACCEPTED_EVENT_AUTHORITY
+
+
+@dataclass(frozen=True, slots=True)
+class _AcceptedEvent:
+    """Opaque accidental-misuse guard carrying one immutable snapshot."""
+
+    event: str
+    props: Mapping[str, object]
+    nth_model_served: int | None
+    _authority: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not _has_accepted_event_authority(self._authority):
+            raise TypeError("accepted events can only be created by would_accept")
+        object.__setattr__(
+            self,
+            "props",
+            MappingProxyType(copy.deepcopy(dict(self.props))),
+        )
+
+    def __copy__(self) -> _AcceptedEvent:
+        """An immutable token is its own safe shallow copy."""
+        return self
+
+
+class _ActiveDayStore(Protocol):
+    def claim_active_day(self) -> bool: ...
+
+
+_context_lock = threading.Lock()
+_context: _ProcessContext | None = None
+_context_resolved = False
+_surface: str | None = None
+_app_opened_attempted = False
+_cohort_lock = threading.Lock()
+_cohort_day: date | None = None
+_cohort_bucket: str | None = None
+_active_day_lock = threading.Lock()
+_active_day_claimed_day: date | None = None
+
+
+def _set_surface(surface: str) -> None:
+    """Set the process surface before its first v2 event."""
+    global _surface
+    if surface not in ("cli", "server", "desktop"):
+        return
+    with _context_lock:
+        if _context_resolved:
+            return
+        _surface = surface
+
+
+def _surface_from_role(role: ProcessRole | None = None) -> str | None:
+    """Return the surface implied by a desktop-owned process role."""
+    try:
+        from rapid_mlx.telemetry import consent_runtime
+        from rapid_mlx.telemetry.consent_decision import ProcessRole
+
+        resolved_role = consent_runtime.detect_role() if role is None else role
+        if resolved_role is ProcessRole.DESKTOP or (
+            resolved_role is ProcessRole.SIDECAR
+            and consent_runtime.is_desktop_sidecar()
+        ):
+            return "desktop"
+    except Exception:
+        return None
+    return None
+
+
+def set_surface_for_role(role: ProcessRole | None = None) -> bool:
+    """Apply role-derived surface attribution without starting a lifecycle."""
+    surface = _surface_from_role(role)
+    if surface is None:
+        return False
+    _set_surface(surface)
+    return True
+
+
+def _process_context() -> _ProcessContext | None:
+    """Resolve immutable common fields once, including a failed build gate."""
+    global _context, _context_resolved
+    with _context_lock:
+        if _context_resolved:
+            return _context
+
+        # The build gate must be the first operation: a developer checkout or
+        # untrusted build must not even read machine facts, much less create an
+        # install id or initialize an emit session.
+        stamp = build_gate.official_build()
+        if stamp is None:
+            _context_resolved = True
+            return None
+
+        # The frozen snapshot cannot change during a process and is reused by
+        # every event.
+        platform = common_props.read_platform_facts()
+        surface = _surface or _surface_from_role() or "cli"
+
+        install_id = state.get_or_create_client_id()
+        session_id = state.session_id()
+        app_version = rapid_mlx.__version__
+        _context = _ProcessContext(
+            platform=platform,
+            surface=surface,
+            install_id=install_id,
+            session_id=session_id,
+            app_version=app_version,
+            channel=stamp.channel,
+        )
+        _context_resolved = True
+        return _context
+
+
+def _upload_allowed() -> bool:
+    """Apply the no-side-effect gates in their required order."""
+    if build_gate.official_build() is None:
+        return False
+    from rapid_mlx.telemetry import consent_runtime
+
+    return consent_runtime.upload_allowed()
+
+
+def _utc_day() -> date:
+    """Return the current UTC day through a narrow test seam."""
+    return datetime.now(timezone.utc).date()
+
+
+def _days_since_first_run_bucket() -> str | None:
+    """Read and cache a valid durable cohort stamp once per UTC day."""
+    global _cohort_bucket, _cohort_day
+    today = _utc_day()
+    with _cohort_lock:
+        if _cohort_day != today:
+            bucket = store.days_since_first_run_bucket()
+            if bucket is None:
+                return None
+            _cohort_bucket = bucket
+            _cohort_day = today
+        return _cohort_bucket
+
+
+def _accepted_props(
+    event: str, props: Mapping[str, object]
+) -> dict[str, object] | None:
+    """Apply the sole consent and event-registry acceptance decision."""
+    try:
+        if not _upload_allowed():
+            return None
+        return registry.validate(event, dict(props))
+    except Exception:
+        return None
+
+
+def would_accept(
+    event: str,
+    props: Mapping[str, object],
+    *,
+    nth_model_served: int | None = None,
+) -> _AcceptedEvent | None:
+    """Return opaque proof of consent and registry acceptance, or ``None``."""
+    accepted_props = _accepted_props(event, props)
+    if accepted_props is None:
+        return None
+    return _AcceptedEvent(
+        event=event,
+        props=accepted_props,
+        nth_model_served=nth_model_served,
+        _authority=__ACCEPTED_EVENT_AUTHORITY,
+    )
+
+
+def track(
+    event: str,
+    props: Mapping[str, object],
+    *,
+    nth_model_served: int | None = None,
+) -> bool:
+    """Queue one registry-approved v2 event and report sender acceptance."""
+    try:
+        accepted = would_accept(
+            event,
+            props,
+            nth_model_served=nth_model_served,
+        )
+        if accepted is None:
+            return False
+        return _enqueue_accepted(accepted)
+    except Exception:
+        return False
+
+
+def _enqueue_accepted(accepted: _AcceptedEvent) -> bool:
+    """Queue an event only when accompanied by proof minted by this module."""
+    try:
+        if type(accepted) is not _AcceptedEvent:
+            return False
+        authority = accepted._authority
+        event = str(accepted.event)
+        props = dict(accepted.props)
+        nth_model_served = accepted.nth_model_served
+        if not _has_accepted_event_authority(authority):
+            return False
+        # Consent was decided exactly once before the dedupe ledger claim. The
+        # registry is cheap and is intentionally re-run here: even same-process
+        # forgery or ``object.__setattr__`` cannot put unvalidated data on wire.
+        accepted_props = registry.validate(event, props)
+        if accepted_props is None:
+            return False
+        context = _process_context()
+        if context is None:
+            return False
+
+        # ``note_model_served`` uses zero as its failure sentinel. A real
+        # successful note is always at least one, so zero must stay off wire.
+        nth = None if nth_model_served == 0 else nth_model_served
+        common = common_props.build_common_props(
+            surface=context.surface,
+            install_id=context.install_id,
+            session_id=context.session_id,
+            app_version=context.app_version,
+            channel=context.channel,
+            nth_model_served=nth,
+            days_since_first_run_bucket=_days_since_first_run_bucket(),
+            platform=context.platform,
+        )
+        if common is None:
+            return False
+        item = envelope._build_batch_item_from_validated(
+            event, dict(accepted_props), common
+        )
+        if item is None:
+            return False
+
+        # Importing the sender registers an at-fork hook, so defer it until an
+        # event has passed every earlier gate.
+        from rapid_mlx.telemetry import posthog_sender
+
+        return posthog_sender.get_sender().capture(item)
+    except Exception:
+        return False
+
+
+def _app_opened_recent_path() -> Path:
+    """Resolve the ``app_opened`` dedupe ledger beneath the state root."""
+    return state._default_telemetry_dir() / "state" / "app-opened-recent.json"
+
+
+def _app_opened_install_scope() -> str:
+    """Return a local-only one-way scope for the current install identity."""
+    install_id = state.get_or_create_client_id()
+    return hashlib.sha256(install_id.encode("utf-8")).hexdigest()
+
+
+def _emit_app_opened(surface: str) -> None:
+    """Attempt ``app_opened`` once per process for an eligible process.
+
+    At most one event per (surface, app_version) per install per ten-minute
+    window survives, using the same durable mode-0600 claim ledger as
+    ``model_serve_failed``: a restart loop that relaunches the process every
+    few seconds cannot flood launch telemetry, while a launch after the window
+    expires emits again. The claim is written before enqueue and is not rolled
+    back when the sender rejects the item, exactly like the serve-failure
+    ledger; consent-off processes never touch the ledger.
+    """
+    global _app_opened_attempted
+    try:
+        if not _upload_allowed():
+            return
+    except BaseException:
+        return
+    with _context_lock:
+        if _app_opened_attempted:
+            return
+        _app_opened_attempted = True
+    _set_surface(surface)
+    try:
+        from rapid_mlx.telemetry import model_events
+
+        accepted = would_accept("app_opened", {})
+        if accepted is None:
+            return
+        model_events._claim_ledger_key(
+            _app_opened_recent_path,
+            (
+                "app_opened",
+                surface,
+                rapid_mlx.__version__,
+                _app_opened_install_scope(),
+            ),
+            window_seconds=model_events.SERVE_FAILED_DEDUPE_SECONDS,
+            on_claim=lambda: _enqueue_accepted(accepted),
+        )
+    except BaseException:
+        return
+
+
+def start_lifecycle(surface: str) -> None:
+    """Start one eligible process lifecycle without affecting its host."""
+    try:
+        if surface not in ("cli", "server") or not _upload_allowed():
+            return
+        if set_surface_for_role():
+            return
+        from rapid_mlx.telemetry import posthog_sender
+
+        posthog_sender.install_atexit()
+        _emit_app_opened(surface)
+    except Exception:
+        return
+
+
+def emit_active_day(*, _store: _ActiveDayStore = store) -> None:
+    """Claim before capture so only one process emits per install and UTC day.
+
+    Claim-first ordering is deliberate: if capture is refused after the claim,
+    that day's event is lost rather than duplicated.
+    """
+    global _active_day_claimed_day
+    try:
+        if not _upload_allowed():
+            return
+        today = _utc_day()
+        with _active_day_lock:
+            if _active_day_claimed_day == today:
+                return
+            if _store.claim_active_day() is not True:
+                return
+            _active_day_claimed_day = today
+        track("active_day", {})
+    except Exception:
+        return
+
+
+def _reset_for_tests() -> None:
+    """Clear process memoization and lifecycle latches."""
+    global _active_day_claimed_day, _app_opened_attempted, _cohort_bucket, _cohort_day
+    global _context, _context_resolved, _surface
+    with _context_lock:
+        _context = None
+        _context_resolved = False
+        _surface = None
+        _app_opened_attempted = False
+    with _cohort_lock:
+        _cohort_day = None
+        _cohort_bucket = None
+    with _active_day_lock:
+        _active_day_claimed_day = None
