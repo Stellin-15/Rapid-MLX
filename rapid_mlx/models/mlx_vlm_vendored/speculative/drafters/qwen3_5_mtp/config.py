@@ -10,7 +10,7 @@ from mlx_vlm.models.qwen3_5_moe.config import TextConfig as MoeTextConfig
 class TextConfig:
     @classmethod
     def from_dict(cls, params: dict):
-        # Rapid upstream-bugfix (documented deviation): pinned 0.7.1 keyed
+        # Rapid upstream-bugfix (documented deviation): pinned 0.7.2 keyed
         # the MoE decision on the model type containing "moe", so the
         # Qwen3-Next family resolved to the dense config and the drafter
         # instantiated dense decoder layers over MoE checkpoints.

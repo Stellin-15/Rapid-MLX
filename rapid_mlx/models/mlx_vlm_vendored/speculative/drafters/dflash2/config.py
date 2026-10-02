@@ -128,7 +128,7 @@ class DFlash2Config(DFlashConfig):
         ):
             if key in dflash:
                 flat[key] = dflash[key]
-        # Rapid upstream-bugfix (documented deviation): pinned 0.7.1 drops
+        # Rapid upstream-bugfix (documented deviation): pinned 0.7.2 drops
         # the inherited ``causal`` flag, so a checkpoint declaring
         # ``dflash_config.causal`` loaded as non-causal and bypassed the
         # causal rejection in ``__post_init__``.
@@ -143,7 +143,7 @@ class DFlash2Config(DFlashConfig):
             flat["rope_scaling"] = rope_parameters
 
         if "runtime_block_size" not in flat:
-            # Rapid upstream-bugfix (documented deviation): pinned 0.7.1
+            # Rapid upstream-bugfix (documented deviation): pinned 0.7.2
             # indexes flat["block_size"], crashing with KeyError on an
             # otherwise valid config that relies on the dataclass default.
             default_block_size = cls.__dataclass_fields__["block_size"].default

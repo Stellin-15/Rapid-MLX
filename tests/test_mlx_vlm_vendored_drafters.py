@@ -1,7 +1,7 @@
 """Vendored drafter registry parity and binding probes (step 3c-1).
 
 The vendored ``speculative/drafters`` package must stay byte-verbatim
-against pinned ``mlx_vlm.speculative.drafters`` @ 0.7.1 except the
+against pinned ``mlx_vlm.speculative.drafters`` @ 0.7.2 except the
 documented import redirects listed in the package ``__init__.py``
 inventory. Every probe here fails closed: an undocumented edit anywhere in
 a drafter module diverges.
@@ -154,7 +154,7 @@ REDIRECTS = {
 DEVIATIONS = {
     "qwen3_5_mtp/config.py": [
         (
-            """        # Rapid upstream-bugfix (documented deviation): pinned 0.7.1 keyed
+            """        # Rapid upstream-bugfix (documented deviation): pinned 0.7.2 keyed
         # the MoE decision on the model type containing "moe", so the
         # Qwen3-Next family resolved to the dense config and the drafter
         # instantiated dense decoder layers over MoE checkpoints.
@@ -175,7 +175,7 @@ DEVIATIONS = {
                 "so the drafter can use the target embeddings and LM head."
             )
         if block_size <= 1:
-            # Rapid upstream-bugfix (documented deviation): pinned 0.7.1
+            # Rapid upstream-bugfix (documented deviation): pinned 0.7.2
             # crashes on mx.concatenate with an empty token list when
             # block_size <= 1 (also reachable through externally supplied
             # drafter repos that load_drafter cannot validate). Return the
@@ -192,7 +192,7 @@ DEVIATIONS = {
 """,
         ),
         (
-            """        # Rapid upstream-bugfix (documented deviation): pinned 0.7.1
+            """        # Rapid upstream-bugfix (documented deviation): pinned 0.7.2
         # dropped every row's bonus replay whenever any row lacked one,
         # leaving the other rows' caches and seeds stale. Mixed presence
         # is unsupported by the shared uniform-acceptance replay; fail
@@ -210,7 +210,7 @@ DEVIATIONS = {
         (
             """        mask_id = int(self.config.mask_token_id)
         if block_size <= 1:
-            # Rapid upstream-bugfix (documented deviation): pinned 0.7.1
+            # Rapid upstream-bugfix (documented deviation): pinned 0.7.2
             # builds masks with block_size - 1 entries, so block_size <= 1
             # produces an empty or invalid block; return the DFlash2-shaped
             # empty proposal before any mask allocation.
@@ -235,7 +235,7 @@ DEVIATIONS = {
         (
             """        mask_id = int(self.config.mask_token_id)
         if block_size <= 1:
-            # Rapid upstream-bugfix (documented deviation): pinned 0.7.1
+            # Rapid upstream-bugfix (documented deviation): pinned 0.7.2
             # builds masks with block_size - 1 entries, so block_size <= 1
             # produces an empty or invalid block; return the DFlash2-shaped
             # empty proposal before any mask allocation.
@@ -259,7 +259,7 @@ DEVIATIONS = {
         ),
         (
             """    def bind(self, target_model) -> "DFlashDraftModel":
-        # Rapid upstream-bugfix (documented deviation): pinned 0.7.1
+        # Rapid upstream-bugfix (documented deviation): pinned 0.7.2
         # resolved the embeddings only when unset, so resetting with a
         # different target kept the previous target's embeddings while
         # swapping its LM head. Force re-resolution on every bind.
@@ -272,7 +272,7 @@ DEVIATIONS = {
     "dflash2/config.py": [
         (
             """        if "runtime_block_size" not in flat:
-            # Rapid upstream-bugfix (documented deviation): pinned 0.7.1
+            # Rapid upstream-bugfix (documented deviation): pinned 0.7.2
             # indexes flat["block_size"], crashing with KeyError on an
             # otherwise valid config that relies on the dataclass default.
             default_block_size = cls.__dataclass_fields__["block_size"].default
@@ -285,7 +285,7 @@ DEVIATIONS = {
         (
             """            if key in dflash:
                 flat[key] = dflash[key]
-        # Rapid upstream-bugfix (documented deviation): pinned 0.7.1 drops
+        # Rapid upstream-bugfix (documented deviation): pinned 0.7.2 drops
         # the inherited ``causal`` flag, so a checkpoint declaring
         # ``dflash_config.causal`` loaded as non-causal and bypassed the
         # causal rejection in ``__post_init__``.
@@ -304,7 +304,7 @@ DEVIATIONS = {
             """        runtime_block_size = flat.get("runtime_block_size")
         if runtime_block_size is not None:
             # Rapid upstream-bugfix (documented deviation): validate and
-            # coerce together — pinned 0.7.1 kept the original value, so a
+            # coerce together — pinned 0.7.2 kept the original value, so a
             # numeric string passed validation and reached runtime code as
             # a str.
             flat["runtime_block_size"] = int(runtime_block_size)
@@ -357,9 +357,7 @@ from .qwen3_5_mtp import Qwen3_5MTPDraftModel""",
         # (dense backbones simply carry 0).
         return SimpleNamespace(
             config=SimpleNamespace(
-                num_experts=getattr(
-                    TextConfig.from_dict(text_config), "num_experts", 0
-                )
+                num_experts=getattr(TextConfig.from_dict(text_config), "num_experts", 0)
             )
         )
 
@@ -382,12 +380,10 @@ from .qwen3_5_mtp import Qwen3_5MTPDraftModel""",
                 # consistent switch_mlp layout (mirrors the gate_up_proj
                 # handling above).
                 for suffix in ("weight", "scales", "biases"):
-                    keys = [
-                        f"{prefix}.{e}.{proj}.{suffix}" for e in range(n_experts)
-                    ]
+                    keys = [f"{prefix}.{e}.{proj}.{suffix}" for e in range(n_experts)]
                     present = [k for k in keys if k in tensors]
                     # Rapid upstream-bugfix (documented deviation): pinned
-                    # 0.7.1 silently skipped missing or partial expert
+                    # 0.7.2 silently skipped missing or partial expert
                     # groups and saved an incomplete checkpoint that only
                     # failed at load time. Once a prefix is detected every
                     # weight projection must carry all ``num_experts``
@@ -420,7 +416,7 @@ from .qwen3_5_mtp import Qwen3_5MTPDraftModel""",
     ],
     "qwen3_5_mtp/qwen3_5_mtp.py": [
         (
-            """        # Rapid upstream-bugfix (documented deviation): pinned 0.7.1
+            """        # Rapid upstream-bugfix (documented deviation): pinned 0.7.2
         # crashes on mx.concatenate with an empty token list when
         # block_size <= 1; return the DFlash2-shaped empty proposal
         # BEFORE any seed-state consumption so a rejected round keeps the
@@ -433,7 +429,7 @@ from .qwen3_5_mtp import Qwen3_5MTPDraftModel""",
             """        if self._seed_token is not None and self._seed_hidden is not None:""",
         ),
         (
-            """        # Rapid upstream-bugfix (documented deviation): pinned 0.7.1 keyed
+            """        # Rapid upstream-bugfix (documented deviation): pinned 0.7.2 keyed
         # the decoder class on "moe" appearing in the model type, so the
         # Qwen3-Next family instantiated dense layers over MoE checkpoints.
         cfg_model_type = getattr(text_config, "model_type", "")
@@ -449,7 +445,7 @@ from .qwen3_5_mtp import Qwen3_5MTPDraftModel""",
         )""",
         ),
         (
-            """        # Rapid upstream-bugfix (documented deviation): pinned 0.7.1 only
+            """        # Rapid upstream-bugfix (documented deviation): pinned 0.7.2 only
         # checks that discovered indexes are contiguous from zero, so a
         # checkpoint with experts 0..k (k < num_experts - 1) stacked
         # undersized switch_mlp tensors; compare against the configured
@@ -491,7 +487,7 @@ from .qwen3_5_mtp import Qwen3_5MTPDraftModel""",
         ),
         (
             """                # Rapid upstream-bugfix (documented deviation): pinned
-                # 0.7.1 skips the padding correction for a scalar
+                # 0.7.2 skips the padding correction for a scalar
                 # _next_position, so shorter rows keep too-large position
                 # ids for the next round. Promote to per-row positions when
                 # the padding is heterogeneous.
@@ -501,11 +497,14 @@ from .qwen3_5_mtp import Qwen3_5MTPDraftModel""",
                 elif int(padding.min()) == int(padding.max()):
                     self._next_position = self._next_position - int(padding.min())
                 else:
-                    self._next_position = mx.full(
-                        (len(right_padding),),
-                        self._next_position,
-                        dtype=mx.int32,
-                    ) - padding
+                    self._next_position = (
+                        mx.full(
+                            (len(right_padding),),
+                            self._next_position,
+                            dtype=mx.int32,
+                        )
+                        - padding
+                    )
 """,
             """                if isinstance(self._next_position, mx.array):
                     self._next_position = self._next_position - mx.array(
@@ -522,7 +521,7 @@ from .qwen3_5_mtp import Qwen3_5MTPDraftModel""",
                 out[f"{prefix}.switch_mlp.gate_proj.scales"] = gate_scales
                 out[f"{prefix}.switch_mlp.up_proj.scales"] = up_scales
 
-            # Rapid upstream-bugfix (documented deviation): pinned 0.7.1
+            # Rapid upstream-bugfix (documented deviation): pinned 0.7.2
             # moves the fused scales but leaves the fused biases behind, so
             # affine-quantized experts lose required quantization metadata.
             gate_up_biases_key = f"{gate_up_key}_biases"
@@ -562,7 +561,7 @@ from .qwen3_5_mtp import Qwen3_5MTPDraftModel""",
     "__init__.py": [
         (
             """    "qwen3_dspark": "dflash",
-    # Rapid upstream-bugfix (documented deviation): pinned 0.7.1 omits the
+    # Rapid upstream-bugfix (documented deviation): pinned 0.7.2 omits the
     # served DFlash families' model types, so an explicit wrong --draft-kind
     # (e.g. "mtp") dispatched them through the wrong round loop instead of
     # being overridden here.
@@ -718,14 +717,12 @@ logger = logging.getLogger(__name__)""",
         shard = Path(name)
         if shard.is_absolute() or ".." in shard.parts:
             raise ValueError(
-                f"safetensors index entry escapes the checkpoint "
-                f"directory: {name!r}"
+                f"safetensors index entry escapes the checkpoint directory: {name!r}"
             )
         resolved_shard = (path / shard).resolve()
         if not any(resolved_shard.is_relative_to(root) for root in allowed_roots):
             raise ValueError(
-                f"safetensors index entry escapes the checkpoint "
-                f"directory: {name!r}"
+                f"safetensors index entry escapes the checkpoint directory: {name!r}"
             )
         yield _open_confined(
             resolved_shard, _containing_root(resolved_shard, allowed_roots)
@@ -761,9 +758,7 @@ def load_drafter(
                 "sidecar loading does not support loader options: "
                 + ", ".join(sorted(kwargs))
             )
-        quantization = config.get("quantization") or config.get(
-            "quantization_config"
-        )
+        quantization = config.get("quantization") or config.get("quantization_config")
         if quantization is not None:
             # Validate before constructing the model: malformed or legacy
             # metadata must fail with an actionable error, not an opaque
@@ -774,9 +769,7 @@ def load_drafter(
                     f"got {type(quantization).__name__}"
                 )
             missing = [
-                field
-                for field in ("group_size", "bits")
-                if field not in quantization
+                field for field in ("group_size", "bits") if field not in quantization
             ]
             if missing:
                 raise ValueError(
@@ -799,8 +792,9 @@ def load_drafter(
                 group_size=quantization["group_size"],
                 bits=quantization["bits"],
                 mode=quantization.get("mode", "affine"),
-                class_predicate=lambda p, m: f"{p}.scales" in weights
-                and hasattr(m, "to_quantized"),
+                class_predicate=lambda p, m: (
+                    f"{p}.scales" in weights and hasattr(m, "to_quantized")
+                ),
             )
         family_model.load_weights(list(weights.items()), strict=True)
         mx.eval(family_model.parameters())
@@ -816,7 +810,7 @@ def load_drafter(
             config = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {}
-    # Rapid upstream-bugfix (documented deviation): pinned 0.7.1 returns
+    # Rapid upstream-bugfix (documented deviation): pinned 0.7.2 returns
     # any decoded JSON value; a non-object config crashes resolve_drafter_kind
     # on config.get(). Degrade to the documented empty-dict contract.
     return config if isinstance(config, dict) else {}""",
@@ -873,7 +867,7 @@ def _peek_drafter_model_type(model_path) -> Optional[str]:
         (
             """    config = _read_drafter_config(model_path)
     # Rapid upstream-bugfix (documented deviation): resolve against the
-    # normalized model type — pinned 0.7.1 examined the raw backbone type,
+    # normalized model type — pinned 0.7.2 examined the raw backbone type,
     # so an explicit wrong --draft-kind (e.g. "mtp") on a backbone-declared
     # sidecar was returned unchanged and dispatched the DFlash drafter
     # through the MTP loop.
@@ -1023,7 +1017,7 @@ def _safetensors_keys(fd: int) -> List[str]:
         if output_path.resolve() == source_path.resolve():
             raise ValueError("output must differ from the source checkpoint")
 
-        # Rapid upstream-bugfix (documented deviation): pinned 0.7.1 writes
+        # Rapid upstream-bugfix (documented deviation): pinned 0.7.2 writes
         # directly into the destination, so a pre-existing directory keeps
         # stale tokenizer files and a failure after the weight save leaves
         # new weights paired with an old config.json. Build the complete
@@ -1046,7 +1040,7 @@ def _safetensors_keys(fd: int) -> List[str]:
         ),
         (
             """            selected: Dict[str, mx.array] = {}
-            # Rapid upstream-bugfix (documented deviation): pinned 0.7.1
+            # Rapid upstream-bugfix (documented deviation): pinned 0.7.2
             # took the MLX-source path when ANY selected shard carried MLX
             # metadata, so a mixed-format sharded checkpoint skipped
             # sanitization for every shard; require a uniform format.
@@ -1110,7 +1104,9 @@ def _safetensors_keys(fd: int) -> List[str]:
                 "text_config": text_config,
                 "block_size": resolved_block_size,
                 "tie_word_embeddings": bool(
-                    text_config.get("tie_word_embeddings", self.tie_word_embeddings_default)
+                    text_config.get(
+                        "tie_word_embeddings", self.tie_word_embeddings_default
+                    )
                 ),
             }
             draft_config.update(self.extra_config(text_config))
@@ -1135,8 +1131,7 @@ def _safetensors_keys(fd: int) -> List[str]:
                 resolved = src.resolve()
                 if not any(resolved.is_relative_to(root) for root in allowed_roots):
                     raise ValueError(
-                        f"tokenizer sidecar escapes the checkpoint "
-                        f"directory: {name!r}"
+                        f"tokenizer sidecar escapes the checkpoint directory: {name!r}"
                     )
                 # Copy through a no-follow-opened descriptor so the bytes
                 # read are the pinned file's, not whatever the path
@@ -1144,7 +1139,10 @@ def _safetensors_keys(fd: int) -> List[str]:
                 src_fd = _open_confined(
                     resolved, _containing_root(resolved, allowed_roots)
                 )
-                with os.fdopen(src_fd, "rb") as fsrc, open(staging / name, "wb") as fdst:
+                with (
+                    os.fdopen(src_fd, "rb") as fsrc,
+                    open(staging / name, "wb") as fdst,
+                ):
                     shutil.copyfileobj(fsrc, fdst)
 
             # Install under a per-destination advisory lock: concurrent
@@ -1167,9 +1165,7 @@ def _safetensors_keys(fd: int) -> List[str]:
             try:
                 lock_stat = os.fstat(lock_fd)
                 if not stat_module.S_ISREG(lock_stat.st_mode):
-                    raise RuntimeError(
-                        f"split lock {lock_path} is not a regular file"
-                    )
+                    raise RuntimeError(f"split lock {lock_path} is not a regular file")
                 if lock_stat.st_uid != os.getuid():
                     raise RuntimeError(
                         f"split lock {lock_path} is not owned by the current user"
@@ -1301,7 +1297,7 @@ def _safetensors_keys(fd: int) -> List[str]:
         return {}
     with open(index_path) as f:
         index = json.load(f)
-    # Rapid upstream-bugfix (documented deviation): pinned 0.7.1 assumes
+    # Rapid upstream-bugfix (documented deviation): pinned 0.7.2 assumes
     # both the index document and ``weight_map`` are objects; a malformed
     # index crashed with ``AttributeError`` instead of a clear error.
     weight_map = index.get("weight_map") if isinstance(index, dict) else None
@@ -1371,12 +1367,9 @@ def _safetensors_keys(fd: int) -> List[str]:
         allowed_roots = _allowed_checkpoint_roots(source_path)
         for file in _safetensor_files(source_path):
             resolved_file = file.resolve()
-            if not any(
-                resolved_file.is_relative_to(root) for root in allowed_roots
-            ):
+            if not any(resolved_file.is_relative_to(root) for root in allowed_roots):
                 raise ValueError(
-                    "safetensors shard escapes the checkpoint directory: "
-                    f"{file.name!r}"
+                    f"safetensors shard escapes the checkpoint directory: {file.name!r}"
                 )
             fd = _open_confined(
                 resolved_file, _containing_root(resolved_file, allowed_roots)
@@ -1405,9 +1398,11 @@ def _safetensors_keys(fd: int) -> List[str]:
         # descriptor pinned by ``iter_selected`` so the weight read cannot
         # be redirected by a concurrent path swap; the direct path is kept
         # for callers that iterate without confinement.
-        fd = self._pinned_shard_fds.pop(file, None) if getattr(
-            self, "_pinned_shard_fds", None
-        ) else None
+        fd = (
+            self._pinned_shard_fds.pop(file, None)
+            if getattr(self, "_pinned_shard_fds", None)
+            else None
+        )
         if fd is not None:
             with os.fdopen(fd, "rb") as f:
                 shard = mx.load(f, format="safetensors")
@@ -1693,7 +1688,7 @@ def test_mtp_split_updates_through_output_symlink(tmp_path):
 
 
 def test_mtp_split_rejects_mixed_format_shards(tmp_path, monkeypatch):
-    """A uniform shard format is required: pinned 0.7.1 took the MLX path
+    """A uniform shard format is required: pinned 0.7.2 took the MLX path
     when any shard carried MLX metadata, skipping sanitization for mixed
     checkpoints."""
     import mlx.core as mx
@@ -2066,7 +2061,7 @@ def test_mtp_split_weight_map_rejects_malformed_index(tmp_path):
 def test_qwen_mtp_batch_replay_corrects_scalar_position_for_ragged_rows():
     """Heterogeneous right_padding must promote a scalar _next_position.
 
-    Regression probe for the documented upstream-bugfix: pinned 0.7.1
+    Regression probe for the documented upstream-bugfix: pinned 0.7.2
     skips the padding correction when the tracked position is a scalar,
     so the shorter replayed row keeps too-large position ids.
     """
@@ -2440,7 +2435,7 @@ def test_qwen3_next_postprocess_stacks_quantized_expert_metadata():
 
 def test_qwen35_sanitize_rejects_incomplete_expert_group():
     """Discovered expert indexes must match the configured expert count —
-    pinned 0.7.1 stacked undersized tensors for experts 0..k."""
+    pinned 0.7.2 stacked undersized tensors for experts 0..k."""
     import mlx.core as mx
 
     from rapid_mlx.models.mlx_vlm_vendored.speculative.drafters.qwen3_5_mtp import (
@@ -2564,7 +2559,7 @@ def test_binding_shim_preserves_canonical_submodule_path(monkeypatch, tmp_path):
 
 def test_qwen3_next_postprocess_rejects_partial_expert_group():
     """A partially present expert group must fail loudly instead of
-    saving an incomplete checkpoint (pinned 0.7.1 skipped it silently)."""
+    saving an incomplete checkpoint (pinned 0.7.2 skipped it silently)."""
     import mlx.core as mx
 
     from rapid_mlx.models.mlx_vlm_vendored.speculative.drafters.qwen3_5_mtp import (
@@ -2599,7 +2594,7 @@ def test_qwen3_next_postprocess_rejects_partial_expert_group():
 
 def test_qwen35_sanitize_moves_fused_biases():
     """Fused expert gate_up/down quantization biases must reach the
-    switch_mlp keys — pinned 0.7.1 moved only the scales."""
+    switch_mlp keys — pinned 0.7.2 moved only the scales."""
     import mlx.core as mx
 
     from rapid_mlx.models.mlx_vlm_vendored.speculative.drafters.qwen3_5_mtp import (
@@ -2983,7 +2978,7 @@ def test_binding_sidecar_index_validation(monkeypatch, tmp_path):
 
 def test_qwen3_dflash_config_coerces_runtime_block_size():
     """A numeric-string runtime_block_size must be coerced to int, not
-    retained as a str that reaches runtime code (pinned 0.7.1 kept it)."""
+    retained as a str that reaches runtime code (pinned 0.7.2 kept it)."""
     from rapid_mlx.models.mlx_vlm_vendored.speculative.drafters.qwen3_dflash.config import (
         DFlashConfig,
     )
@@ -2999,7 +2994,7 @@ def test_qwen3_dflash_config_coerces_runtime_block_size():
 
 def test_dflash2_config_rejects_inherited_causal():
     """``dflash_config.causal`` must reach ``is_causal`` so the causal
-    rejection fires; pinned 0.7.1 dropped the flag and silently served a
+    rejection fires; pinned 0.7.2 dropped the flag and silently served a
     non-causal drafter."""
     from rapid_mlx.models.mlx_vlm_vendored.speculative.drafters.dflash2.config import (
         DFlash2Config,

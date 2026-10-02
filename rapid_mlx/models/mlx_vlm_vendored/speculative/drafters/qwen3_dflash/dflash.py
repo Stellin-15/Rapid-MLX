@@ -188,7 +188,7 @@ class DFlashDraftModel(nn.Module):
         self.draft_lens: List[int] = []
 
     def bind(self, target_model) -> "DFlashDraftModel":
-        # Rapid upstream-bugfix (documented deviation): pinned 0.7.1
+        # Rapid upstream-bugfix (documented deviation): pinned 0.7.2
         # resolved the embeddings only when unset, so resetting with a
         # different target kept the previous target's embeddings while
         # swapping its LM head. Force re-resolution on every bind.
@@ -271,7 +271,7 @@ class DFlashDraftModel(nn.Module):
     ) -> mx.array:
         mask_id = int(self.config.mask_token_id)
         if block_size <= 1:
-            # Rapid upstream-bugfix (documented deviation): pinned 0.7.1
+            # Rapid upstream-bugfix (documented deviation): pinned 0.7.2
             # builds masks with block_size - 1 entries, so block_size <= 1
             # produces an empty or invalid block; return the DFlash2-shaped
             # empty proposal before any mask allocation.
@@ -312,7 +312,7 @@ class DFlashDraftModel(nn.Module):
             )
         mask_id = int(self.config.mask_token_id)
         if block_size <= 1:
-            # Rapid upstream-bugfix (documented deviation): pinned 0.7.1
+            # Rapid upstream-bugfix (documented deviation): pinned 0.7.2
             # builds masks with block_size - 1 entries, so block_size <= 1
             # produces an empty or invalid block; return the DFlash2-shaped
             # empty proposal before any mask allocation.

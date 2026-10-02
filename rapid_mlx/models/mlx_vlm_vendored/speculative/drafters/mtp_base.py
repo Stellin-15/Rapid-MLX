@@ -210,7 +210,7 @@ class AutoregressiveMTPDraftModel(nn.Module):
         accepted_set = {int(a) for a in accepted}
         if len(accepted_set) != 1:
             raise ValueError("This MTP drafter requires uniform batch acceptance.")
-        # Rapid upstream-bugfix (documented deviation): pinned 0.7.1
+        # Rapid upstream-bugfix (documented deviation): pinned 0.7.2
         # dropped every row's bonus replay whenever any row lacked one,
         # leaving the other rows' caches and seeds stale. Mixed presence
         # is unsupported by the shared uniform-acceptance replay; fail
@@ -288,7 +288,7 @@ class AutoregressiveMTPDraftModel(nn.Module):
                 "so the drafter can use the target embeddings and LM head."
             )
         if block_size <= 1:
-            # Rapid upstream-bugfix (documented deviation): pinned 0.7.1
+            # Rapid upstream-bugfix (documented deviation): pinned 0.7.2
             # crashes on mx.concatenate with an empty token list when
             # block_size <= 1 (also reachable through externally supplied
             # drafter repos that load_drafter cannot validate). Return the

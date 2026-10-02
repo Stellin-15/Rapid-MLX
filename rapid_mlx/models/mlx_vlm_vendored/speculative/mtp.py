@@ -6,6 +6,11 @@ import mlx.nn as nn
 
 # VENDOR-DEVIATION(redirect): vendored cache lives at the package root.
 from .. import cache
+
+# VENDOR-DEVIATION(dual-namespace): target model implementations remain
+# pinned during step 3b, so model.make_cache() can return upstream classes.
+from mlx_vlm.models import cache as upstream_cache
+
 from ..models.linear import native_batch_linear
 
 # VENDOR-DEVIATION(redirect): the 2k-line quantized verifier stays on
@@ -16,6 +21,7 @@ from .cache_state import (
     abort_speculative_round,
     commit_speculative_round,
     iter_leaf_caches,
+    start_speculative_cache,
 )
 from .common import (
     _batch_cache_left_padding,
@@ -66,8 +72,19 @@ def _mtp_shared_kv_from_prompt_cache(
         if keys is None or values is None:
             continue
         if (
-            isinstance(layer_cache, cache.RotatingKVCache)
-            and not isinstance(layer_cache, cache.BufferedRotatingKVCache)
+            # VENDOR-DEVIATION(dual-namespace): preserve temporal ordering for
+            # rotating caches produced by either cache namespace.
+            isinstance(
+                layer_cache,
+                (cache.RotatingKVCache, upstream_cache.RotatingKVCache),
+            )
+            and not isinstance(
+                layer_cache,
+                (
+                    cache.BufferedRotatingKVCache,
+                    upstream_cache.BufferedRotatingKVCache,
+                ),
+            )
             and hasattr(layer_cache, "_temporal_order")
         ):
             keys = layer_cache._temporal_order(keys)
@@ -108,25 +125,48 @@ def _mtp_verify_without_logits(
 
     layers = getattr(getattr(lm, "model", None), "layers", [])
     if len(prompt_cache) == len(layers):
+        # VENDOR-DEVIATION(bugfix): the hook-less fallback must participate in
+        # the same cache transaction as every other speculative verifier.
+        transaction = start_speculative_cache(prompt_cache, verify_input.shape[1])
+        try:
+            hidden = lm.model(
+                verify_input,
+                cache=prompt_cache,
+                skip_final_norm=True,
+            )
+            shared_kv_states = _mtp_shared_kv_from_prompt_cache(lm, prompt_cache)
+            if shared_kv_states:
+                return _MTPVerifyResult(
+                    hidden=hidden,
+                    shared_kv_states=shared_kv_states,
+                    rollback_state=transaction,
+                )
+        except BaseException:
+            transaction.abort()
+            raise
+        # The sink retry must not append the same verifier block a second time.
+        transaction.abort()
+
+    shared_kv_sink: dict = {}
+    transaction = start_speculative_cache(prompt_cache, verify_input.shape[1])
+    try:
         hidden = lm.model(
             verify_input,
             cache=prompt_cache,
+            shared_kv_sink=shared_kv_sink,
             skip_final_norm=True,
         )
-        shared_kv_states = _mtp_shared_kv_from_prompt_cache(lm, prompt_cache)
-        if shared_kv_states:
-            return _MTPVerifyResult(hidden=hidden, shared_kv_states=shared_kv_states)
-
-    shared_kv_sink: dict = {}
-    hidden = lm.model(
-        verify_input,
-        cache=prompt_cache,
-        shared_kv_sink=shared_kv_sink,
-        skip_final_norm=True,
-    )
+    except BaseException:
+        transaction.abort()
+        raise
     if not shared_kv_sink:
+        transaction.abort()
         return None
-    return _MTPVerifyResult(hidden=hidden, shared_kv_states=shared_kv_sink)
+    return _MTPVerifyResult(
+        hidden=hidden,
+        shared_kv_states=shared_kv_sink,
+        rollback_state=transaction,
+    )
 
 
 def _mtp_verify_with_model_method(
@@ -572,15 +612,34 @@ def _buffer_mtp_target_cache(
     buffer_size = max(32, min(128, max(configured, requested) * 8))
 
     def buffer_entry(entry):
-        if isinstance(entry, cache.CacheList):
+        # VENDOR-DEVIATION(dual-namespace): recurse through both model-owned
+        # upstream trees and vendored fallback trees.
+        if isinstance(entry, (cache.CacheList, upstream_cache.CacheList)):
             entry.caches = tuple(buffer_entry(child) for child in entry.caches)
             return entry
-        if isinstance(entry, cache.BufferedRotatingKVCache):
+        if isinstance(
+            entry,
+            (
+                cache.BufferedRotatingKVCache,
+                upstream_cache.BufferedRotatingKVCache,
+            ),
+        ):
             entry.buffer_size = max(entry.buffer_size, buffer_size)
         elif (
-            isinstance(entry, cache.RotatingKVCache) and getattr(entry, "keep", 0) == 0
+            isinstance(
+                entry,
+                (cache.RotatingKVCache, upstream_cache.RotatingKVCache),
+            )
+            and getattr(entry, "keep", 0) == 0
         ):
-            return cache.BufferedRotatingKVCache.from_cache(
+            # Keep the replacement in the producer's namespace; downstream
+            # model code can use exact-type dispatch for its cache classes.
+            namespace = (
+                upstream_cache
+                if isinstance(entry, upstream_cache.RotatingKVCache)
+                else cache
+            )
+            return namespace.BufferedRotatingKVCache.from_cache(
                 entry, buffer_size=buffer_size
             )
         return entry

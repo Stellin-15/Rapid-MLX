@@ -11,7 +11,7 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Coroutine
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -75,6 +75,9 @@ from ..request import (
     ClientRequestError,
     InferenceAbortedError,
     inference_aborted_error_payload,
+    is_batch_cap_error,
+    is_chat_template_error,
+    is_media_input_error,
 )
 from ..response_cache import (
     UNCACHEABLE,
@@ -86,6 +89,7 @@ from ..service.helpers import (
     _TOOL_USE_REQUIRED_SUFFIX,
     _TOOL_USE_SYSTEM_SUFFIX,
     SSE_RESPONSE_HEADERS,
+    _aggregate_generation_attempts,
     _append_tool_use_suffix,
     _apply_reasoning_cutoff_notice,
     _build_prompt_with_thinking_compat,
@@ -120,18 +124,44 @@ from ..service.helpers import (
     _wait_with_disconnect,
     build_extended_sampling_kwargs,
     enable_thinking_warning_header,
+    enforce_context_length,
     enforce_context_length_for_messages,
     ensure_engine_ready,
     get_engine,
     get_model_max_context,
+    maybe_apply_default_reasoning_effort,
     maybe_apply_reasoning_effort,
     maybe_auto_disable_thinking_for_casual_chat,
     maybe_auto_disable_thinking_for_tools,
+    reasoning_stop_scope_kwargs,
     repair_messages_fit_context,
     served_chat_template,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _record_nonstream_failure(
+    raw_request, served_telemetry_id: str | None, error_class: str
+) -> None:
+    """Count one failed non-streaming chat completion under a fixed class.
+
+    For failures the route raises itself as an ``HTTPException`` (which the
+    generic handler re-raises uncounted), e.g. the strict-schema 502s.
+    """
+    from rapid_mlx.telemetry import inference as _telemetry_inference
+
+    caller_agent, caller_client = _telemetry_inference.request_caller_headers(
+        raw_request
+    )
+    _telemetry_inference.emit_completed_request(
+        model=served_telemetry_id or "<custom>",
+        endpoint="/v1/chat/completions",
+        caller_agent=caller_agent,
+        caller_client=caller_client,
+        result="failed",
+        error_class=error_class,
+    )
 
 
 def _new_stream_request_id() -> str:
@@ -143,24 +173,6 @@ def _new_stream_request_id() -> str:
 _SAFE_DEEPSEEK_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 router = APIRouter()
-
-
-def _degenerate_signal(
-    visible_text: str | None, telemetry_enabled: bool
-) -> bool | None:
-    """#1250 degeneracy canary for the emit sites below.
-
-    Returns ``None`` when telemetry is disabled — the default path skips the
-    heuristic entirely and no work is done. When enabled, runs the LOCAL
-    ``rapid_mlx.coherence.is_degenerate_completion`` on the visible completion
-    and returns only the bool; the text never leaves the host and is not
-    recoverable from the bool.
-    """
-    if not telemetry_enabled:
-        return None
-    from rapid_mlx.coherence import is_degenerate_completion
-
-    return is_degenerate_completion(visible_text)
 
 
 def _tool_call_name(tc) -> str | None:
@@ -3669,6 +3681,12 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     """
     _validate_model_name(request.model)
     engine = get_engine(request.model)
+    from rapid_mlx.telemetry.model_id import engine_telemetry_id
+
+    # Codex P1 on #3600: the telemetry identity is captured HERE, with the
+    # engine and carried with the request. Resolving it again at completion
+    # would re-read a registry that a resident-model swap may have repointed.
+    _served_telemetry_id = engine_telemetry_id(engine)
     await ensure_engine_ready(engine)
 
     # Admission reservation is acquired LATER — after cheap validation
@@ -3682,7 +3700,12 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     _admission_acquired = [False]
     try:
         return await _create_chat_completion_impl(
-            request, raw_request, engine, _commit_state, _admission_acquired
+            request,
+            raw_request,
+            engine,
+            _commit_state,
+            _admission_acquired,
+            _served_telemetry_id,
         )
     except asyncio.CancelledError as exc:
         _raise_lifecycle_cancel_or_reraise(engine, exc)
@@ -4076,12 +4099,18 @@ async def _create_chat_completion_impl(
     engine,
     _commit_state: list[bool],
     _admission_acquired: list[bool],
+    served_telemetry_id: str | None = None,
 ):
     """Inner impl for ``create_chat_completion``.
 
     Admission is reserved after cheap validation to avoid leaking a slot on
     validation ``HTTPException`` paths.
     """
+    from rapid_mlx.telemetry import inference as _telemetry_inference
+
+    _caller_agent, _caller_client = _telemetry_inference.request_caller_headers(
+        raw_request
+    )
     # Validate messages is non-empty
     if not request.messages:
         raise HTTPException(
@@ -4272,6 +4301,18 @@ async def _create_chat_completion_impl(
 
     # Validate n parameter (only n=1 supported)
     if request.n is not None and request.n > 1:
+        from rapid_mlx.telemetry.inference import (
+            emit_capability_rejected,
+            model_type_token,
+        )
+
+        emit_capability_rejected(
+            "multi_sample_unsupported",
+            model_type=model_type_token(engine),
+            model=served_telemetry_id,
+            caller_agent=_caller_agent,
+            caller_client=_caller_client,
+        )
         raise HTTPException(
             status_code=400,
             detail="n > 1 is not supported. Rapid-MLX generates one completion per request.",
@@ -4322,6 +4363,18 @@ async def _create_chat_completion_impl(
     # dropping it. We accept {} so defensive clients that always include
     # the field don't break.
     if request.logit_bias:
+        from rapid_mlx.telemetry.inference import (
+            emit_capability_rejected,
+            model_type_token,
+        )
+
+        emit_capability_rejected(
+            "logit_bias_unsupported",
+            model_type=model_type_token(engine),
+            model=served_telemetry_id,
+            caller_agent=_caller_agent,
+            caller_client=_caller_client,
+        )
         raise HTTPException(
             status_code=400,
             detail="logit_bias is not supported on this server",
@@ -4463,12 +4516,16 @@ async def _create_chat_completion_impl(
             allow_image=engine.is_mllm,
             allow_video=engine.is_mllm,
             allow_audio=False,
+            telemetry_model=served_telemetry_id,
+            caller_agent=_caller_agent,
+            caller_client=_caller_client,
         )
     except UnsupportedContentBlockError as e:
         raise HTTPException(
             status_code=400,
             detail=e.openai_detail(
-                serving_lane_reason=getattr(engine, "serving_lane_reason", None)
+                serving_lane_reason=getattr(engine, "serving_lane_reason", None),
+                engine=engine,
             ),
         ) from e
     except ValueError as e:
@@ -4496,6 +4553,9 @@ async def _create_chat_completion_impl(
         messages, images, videos = extract_multimodal_content(
             request.messages,
             preserve_native_format=engine.preserve_native_tool_format,
+            telemetry_model=served_telemetry_id,
+            caller_agent=_caller_agent,
+            caller_client=_caller_client,
         )
 
     has_media = bool(images or videos)
@@ -4634,6 +4694,18 @@ async def _create_chat_completion_impl(
     # ``reasoning_effort="none"`` request registers its enable_thinking
     # preference first (the tool auto-disable then no-ops on it) and a
     # graded value lands its ``reasoning_max_tokens`` cap from one source.
+    # #3714: ``serve --default-reasoning-effort`` fills the knob first when
+    # the client sent no reasoning signal at all, so a template whose own
+    # default is the most expensive level (GLM-5.3 → "Max") does not burn
+    # ``max_tokens`` in thinking on "say hello".
+    if maybe_apply_default_reasoning_effort(
+        request, default_effort=cfg.default_reasoning_effort
+    ):
+        logger.info(
+            "#3714 reasoning_effort defaulted to %s on /v1/chat/completions "
+            "(serve --default-reasoning-effort; client sent no reasoning knob)",
+            request.reasoning_effort,
+        )
     if maybe_apply_reasoning_effort(
         request, chat_template=served_chat_template(engine)
     ):
@@ -4716,6 +4788,7 @@ async def _create_chat_completion_impl(
     # alias → generation_config cascade. Only forwards values the
     # cascade actually produced.
     chat_kwargs.update(build_extended_sampling_kwargs(request))
+    chat_kwargs.update(reasoning_stop_scope_kwargs(engine, request))
 
     # Add multimodal content
     if has_media:
@@ -4894,7 +4967,21 @@ async def _create_chat_completion_impl(
         max_tokens=chat_kwargs.get("max_tokens"),
         enable_thinking=resolved_thinking,
         chat_template_kwargs=chat_kwargs.get("chat_template_kwargs"),
+        telemetry_model=served_telemetry_id,
+        caller_agent=_caller_agent,
+        caller_client=_caller_client,
     )
+    if _line1_prompt_tokens is not None and chat_kwargs.get("max_tokens") is not None:
+        _clamped_max_tokens = enforce_context_length(
+            engine,
+            _line1_prompt_tokens,
+            max_tokens=chat_kwargs["max_tokens"],
+            telemetry_model=served_telemetry_id,
+            caller_agent=_caller_agent,
+            caller_client=_caller_client,
+        )
+        if _clamped_max_tokens is not None:
+            chat_kwargs["max_tokens"] = _clamped_max_tokens
 
     # LINE① (#558, codex r4 #1) — HARD context-window allowance check. With
     # ``max_tokens=None`` the guard above only proved ``prompt_tokens <= window``
@@ -5286,29 +5373,14 @@ async def _create_chat_completion_impl(
                 },
             )
         if request.tools:
-            # Strict + tools is mutually exclusive on this engine:
-            # the constrained-decoding path is grammar-driven and
-            # cannot coexist with the tool-call grammar. OpenAI's
-            # cloud API treats this combination as 400 too. Surface
-            # the conflict explicitly so clients see the choice.
+            # Deliberate local-engine policy: tools own the first decode so a
+            # tool-call turn stays byte-for-byte identical to ordinary tool
+            # calling.  Final-text turns are buffered and schema-validated;
+            # only an invalid final answer pays for one tools-disabled,
+            # grammar-constrained repair pass.
+            json_schema = _strict_schema_check
+            use_strict_postgen_validation = strict_enforcement_active
             incr_strict_request()
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error": {
-                        "message": (
-                            "response_format.json_schema.strict=true "
-                            "cannot be combined with 'tools' — the "
-                            "constrained-decoding grammar is mutually "
-                            "exclusive with the tool-call grammar. "
-                            "Drop one or the other and retry."
-                        ),
-                        "type": "invalid_request_error",
-                        "code": "strict_with_tools_unsupported",
-                        "param": "response_format.json_schema.strict",
-                    }
-                },
-            )
 
     if response_format and not request.tools:
         json_schema = extract_json_schema_for_guided(response_format)
@@ -5427,7 +5499,8 @@ async def _create_chat_completion_impl(
                     type(engine).__name__,
                 )
 
-    if request.stream:
+    _buffer_strict_tool_stream = bool(request.stream and strict_mode and request.tools)
+    if request.stream and not _buffer_strict_tool_stream:
         # Validate chat template eagerly so template errors return 400
         if not engine.is_mllm:
             try:
@@ -5439,16 +5512,10 @@ async def _create_chat_completion_impl(
                     chat_template_kwargs=chat_kwargs.get("chat_template_kwargs"),
                 )
             except Exception as e:
-                err_msg = str(e)
-                err_type = type(e).__name__
-                if (
-                    "TemplateError" in err_type
-                    or "template" in err_msg.lower()
-                    or ("user" in err_msg.lower() and "found" in err_msg.lower())
-                ):
+                if is_chat_template_error(e):
                     raise HTTPException(
                         status_code=400,
-                        detail=f"Chat template error: {err_msg}",
+                        detail=f"Chat template error: {e}",
                     )
                 raise
         # L-05: surface silent ``enable_thinking`` drop on non-Qwen
@@ -5475,14 +5542,12 @@ async def _create_chat_completion_impl(
         # separately generated scheduler UUID would make a live request
         # impossible to address.
         response_id = _new_stream_request_id()
-        # Opt-in telemetry (Phase 2.2): the inbound User-Agent for the
-        # streaming ``request`` event's ``caller_agent``. Passed RAW (not
-        # bucketed) — ``emit.request`` funnels it through
-        # ``normalize_caller_agent`` exactly like the non-streaming path.
-        # Threaded as an explicit keyword so it never leaks into the
-        # ``**chat_kwargs`` the engine's ``stream_chat`` receives.
-        _caller_ua = (
-            raw_request.headers.get("user-agent") if raw_request is not None else None
+        # Preserve request attribution for the v2 inference emitter. Thread it
+        # explicitly so it never leaks into the engine's ``**chat_kwargs``.
+        from rapid_mlx.telemetry import inference as _telemetry_inference
+
+        _caller_ua, _caller_client = _telemetry_inference.request_caller_headers(
+            raw_request
         )
         if use_guided and json_schema:
             # Constrained streaming: run guided generation buffered, then
@@ -5500,6 +5565,8 @@ async def _create_chat_completion_impl(
                         response_id=response_id,
                         strict_mode=strict_mode,
                         caller_agent=_caller_ua,
+                        caller_client=_caller_client,
+                        served_telemetry_id=served_telemetry_id,
                         **chat_kwargs,
                     ),
                     raw_request,
@@ -5538,6 +5605,8 @@ async def _create_chat_completion_impl(
                         response_id=response_id,
                         request_id=response_id,
                         caller_agent=_caller_ua,
+                        caller_client=_caller_client,
+                        served_telemetry_id=served_telemetry_id,
                         **chat_kwargs,
                     ),
                     raw_request,
@@ -5558,6 +5627,8 @@ async def _create_chat_completion_impl(
             response_id=response_id,
             request_id=response_id,
             caller_agent=_caller_ua,
+            caller_client=_caller_client,
+            served_telemetry_id=served_telemetry_id,
             _client_disconnect_state=_client_disconnect_state,
             **chat_kwargs,
         )
@@ -5726,9 +5797,17 @@ async def _create_chat_completion_impl(
                 # Engine-owned cancellation is lifecycle control, never a
                 # guided failure eligible for unconstrained fallback.
                 if _consume_guided_lifecycle_cancel(engine, exc):
+                    # Stable ``model_replacement`` code so a model swap under a
+                    # guided chat request reads as "ask again", not the generic
+                    # failure card (was a bare-string 503).
+                    from ..request import lifecycle_cancel_error_payload
+
+                    _record_nonstream_failure(
+                        raw_request, served_telemetry_id, "model_replaced"
+                    )
                     raise HTTPException(
                         status_code=503,
-                        detail="Request cancelled by model replacement",
+                        detail={"error": lifecycle_cancel_error_payload()},
                     ) from exc
                 raise asyncio.CancelledError() from exc
             except HTTPException:
@@ -5757,6 +5836,9 @@ async def _create_chat_completion_impl(
                         "refusing to fall back to unconstrained because "
                         "strict=true: %s",
                         guided_err,
+                    )
+                    _record_nonstream_failure(
+                        raw_request, served_telemetry_id, "strict_schema_violation"
                     )
                     raise HTTPException(
                         status_code=502,
@@ -5802,8 +5884,20 @@ async def _create_chat_completion_impl(
     except HTTPException:
         raise
     except Exception as e:
+        from rapid_mlx.telemetry import inference as _telemetry_inference
+
+        caller_agent, caller_client = _telemetry_inference.request_caller_headers(
+            raw_request
+        )
+        _telemetry_inference.emit_completed_request(
+            model=served_telemetry_id or "<custom>",
+            endpoint="/v1/chat/completions",
+            caller_agent=caller_agent,
+            caller_client=caller_client,
+            result="failed",
+            error_class=_telemetry_inference.classify_inference_failure(e),
+        )
         err_msg = str(e)
-        err_type = type(e).__name__
         if isinstance(e, InferenceAbortedError):
             # Engine aborted the request (e.g. Metal runtime error caught
             # in the engine loop). Structured 503 carrying a stable
@@ -5811,11 +5905,7 @@ async def _create_chat_completion_impl(
             # (#3564) — the server is still up and a smaller request may
             # succeed (#353).
             raise _inference_aborted_http_exception(e) from e
-        if (
-            "TemplateError" in err_type
-            or "template" in err_msg.lower()
-            or ("user" in err_msg.lower() and "found" in err_msg.lower())
-        ):
+        if is_chat_template_error(e):
             raise HTTPException(
                 status_code=400, detail=f"Chat template error: {err_msg}"
             )
@@ -5833,11 +5923,7 @@ async def _create_chat_completion_impl(
         # 500. Surface as 400 so Desktop / curl clients see the actionable
         # message ("downscale image / raise --prefill-step-size") instead
         # of a generic server error.
-        if (
-            "Failed to process image" in err_msg
-            or "Failed to process video" in err_msg
-            or "exceeds the per-batch cap" in err_msg
-        ):
+        if is_media_input_error(e) or is_batch_cap_error(e):
             raise HTTPException(status_code=400, detail=err_msg)
         raise
     finally:
@@ -5853,6 +5939,19 @@ async def _create_chat_completion_impl(
     logger.info(
         f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
     )
+
+    # Strict structured output constrains final answers, not tool-call turns.
+    # Detect calls with the same parser used below and leave their wire payload
+    # untouched; only a genuine final-text turn enters schema validation.
+    _strict_tool_turn = False
+    if strict_mode and request.tools:
+        _engine_calls = getattr(output, "tool_calls", None)
+        _unused_text, _detected_calls = _parse_tool_calls_with_parser(
+            output.text,
+            request,
+            structured_tool_calls=_engine_calls,
+        )
+        _strict_tool_turn = bool(_detected_calls)
 
     # H-06: when the client asked for strict json_schema mode and we
     # routed through guided decoding, validate the buffered text
@@ -5871,6 +5970,7 @@ async def _create_chat_completion_impl(
     # then rejects with a confusing stack-trace far from the source.
     # The violations counter still ticks before we raise so the
     # operator sees both the rate AND the error response.
+    usage_detail_output = None
     if strict_mode and use_guided and json_schema and output is not None:
         ok, err = validate_output_against_schema(output.text or "", json_schema)
         if not ok:
@@ -5878,6 +5978,9 @@ async def _create_chat_completion_impl(
             logger.warning(
                 "Strict json_schema response failed post-decode validation: %s",
                 err,
+            )
+            _record_nonstream_failure(
+                raw_request, served_telemetry_id, "strict_schema_violation"
             )
             raise HTTPException(
                 status_code=502,
@@ -5901,16 +6004,25 @@ async def _create_chat_completion_impl(
     # UNCONSTRAINED above; now we validate the buffered output and
     # — if it doesn't validate — attempt ONE repair retry with a
     # system-prompt-injected hint naming the failing path. If the
-    # repair also fails we surface 422 with a structured envelope so
+    # repair also fails we surface a structured violation envelope so
     # SDK consumers (pydantic-ai) can read ``error.details.failing_path``
     # / ``expected`` / ``got`` instead of looping against an opaque
-    # error. Strict + tools is already rejected by the upstream
-    # ``strict_with_tools_unsupported`` gate, so we can assume no
-    # tool_calls path here.
-    if use_strict_postgen_validation and json_schema and output is not None:
+    # error. For strict + tools, tool-call turns bypass this block and
+    # invalid final-text turns use constrained generation for the repair.
+    if (
+        use_strict_postgen_validation
+        and json_schema
+        and output is not None
+        and not _strict_tool_turn
+    ):
         ok, failure_details = validate_and_envelope(output.text or "", json_schema)
         attempts = 1
-        if not ok and repair_retry_enabled():
+        repair_attempted = False
+        if (
+            not ok
+            and repair_retry_enabled()
+            and (not request.tools or engine.supports_guided_generation)
+        ):
             repair_messages = build_repair_messages(
                 messages,
                 output.text or "",
@@ -5996,14 +6108,26 @@ async def _create_chat_completion_impl(
             else:
                 incr_strict_repair_attempt()
                 attempts = 2
+                repair_attempted = True
                 logger.info(
                     "R12-4 strict json_schema first attempt failed "
                     "validation (%s); attempting single repair retry.",
                     failure_details.get("reason") if failure_details else "?",
                 )
                 try:
+                    if request.tools:
+                        repair_coro = engine.generate_with_schema(
+                            messages=repair_messages,
+                            json_schema=json_schema,
+                            raise_on_failure=True,
+                            **repair_kwargs,
+                        )
+                    else:
+                        repair_coro = engine.chat(
+                            messages=repair_messages, **repair_kwargs
+                        )
                     repair_output = await _wait_with_disconnect(
-                        engine.chat(messages=repair_messages, **repair_kwargs),
+                        repair_coro,
                         raw_request,
                         timeout=timeout,
                     )
@@ -6031,6 +6155,13 @@ async def _create_chat_completion_impl(
                         "NOT a schema-validation contract breach).",
                         type(repair_err).__name__,
                         repair_err,
+                    )
+                    from rapid_mlx.telemetry import inference as _telemetry_inference
+
+                    _record_nonstream_failure(
+                        raw_request,
+                        served_telemetry_id,
+                        _telemetry_inference.classify_inference_failure(repair_err),
                     )
                     raise HTTPException(
                         status_code=502,
@@ -6070,19 +6201,8 @@ async def _create_chat_completion_impl(
                     # taken from the SUCCESSFUL repair output since
                     # those describe what the client receives; only
                     # the numeric usage fields are summed.
-                    from dataclasses import replace as _dc_replace
-
-                    initial_prompt_tokens = output.prompt_tokens
-                    initial_completion_tokens = output.completion_tokens
-                    output = _dc_replace(
-                        repair_output,
-                        prompt_tokens=(
-                            initial_prompt_tokens + repair_output.prompt_tokens
-                        ),
-                        completion_tokens=(
-                            initial_completion_tokens + repair_output.completion_tokens
-                        ),
-                    )
+                    usage_detail_output = repair_output
+                    output = _aggregate_generation_attempts(output, repair_output)
                     ok = True
                     failure_details = None
                 else:
@@ -6097,12 +6217,20 @@ async def _create_chat_completion_impl(
                 failure_details or {"reason": "schema_violation"},
                 attempts=attempts,
             )
+            if request.tools and repair_attempted:
+                envelope["error"]["code"] = "strict_schema_violation"
             logger.warning(
                 "R12-4 strict json_schema validation failed after %d attempt(s): %s",
                 attempts,
                 (failure_details or {}).get("message"),
             )
-            raise HTTPException(status_code=422, detail=envelope)
+            _record_nonstream_failure(
+                raw_request, served_telemetry_id, "strict_schema_violation"
+            )
+            raise HTTPException(
+                status_code=502 if request.tools and repair_attempted else 422,
+                detail=envelope,
+            )
 
     # Parse tool calls from output using configured parser.
     # ``output.tool_calls`` is non-None when the engine's
@@ -6671,7 +6799,11 @@ async def _create_chat_completion_impl(
                 logprobs=choice_logprobs,
             )
         ],
-        usage=_build_usage(output, reasoning_text),
+        usage=_build_usage(
+            output,
+            reasoning_text,
+            detail_output=usage_detail_output,
+        ),
         metrics=_build_response_metrics(output),
     )
     # ── Response cache — STORE ───────────────────────────────────────
@@ -6696,66 +6828,119 @@ async def _create_chat_completion_impl(
         request, getattr(cfg, "reasoning_parser_name", None)
     )
 
-    # Opt-in telemetry (Phase 2.2): record a bucketed ``request`` event for
-    # this completed non-streaming chat completion. ``caller_agent`` comes
-    # from the inbound User-Agent (bucketed to an allowlist in ``redact`` —
-    # never stored raw); every perf number is bucketed. ``emit.request`` is
-    # sampled + ``is_enabled()``-gated + ``@_safe``, so this is a cheap
-    # no-op when telemetry is off / not sampled and can never affect the
-    # response. TTFT == total latency here (a non-streaming response is
-    # delivered in one shot); the streaming path reports true TTFT.
-    from rapid_mlx.telemetry import emit as _telemetry_emit
-
-    # Client-side degeneracy check (#1250): only when telemetry is enabled,
-    # run the local ``looks_like_garbage`` heuristic on the VISIBLE content
-    # and send ONLY the resulting bool — never the text. Empty content stays
-    # ``False`` (already captured by the zero completion-token bucket), so
-    # this is a clean "non-empty output looks like garbage" post-release
-    # canary for the #1234 class. Gated on ``is_enabled()`` so the default
-    # (telemetry off) path does no extra work.
-    _output_degenerate = _degenerate_signal(final_content, _telemetry_emit.is_enabled())
-
-    _telemetry_emit.request(
-        endpoint="/v1/chat/completions",
-        model_alias=request.model,
-        stream=False,
-        tool_call_used=bool(tool_calls),
-        prompt_tokens=output.prompt_tokens,
-        completion_tokens=output.completion_tokens,
-        ttft_ms=elapsed * 1000.0,
-        tps=tokens_per_sec,
-        status=200,
-        caller_agent=(
-            raw_request.headers.get("user-agent") if raw_request is not None else None
-        ),
-        output_degenerate=_output_degenerate,
-    )
-
     # Serialize the response FIRST so a serialization failure surfaces as an
     # error the client sees — not as a "successful inference" we already
     # counted. ``model_dump_json`` can raise; the activation emit below must be
     # reached only when the 2xx body is actually built.
-    response = Response(
-        content=chat_response.model_dump_json(exclude_none=True),
-        media_type="application/json",
-        headers=response_headers or None,
-    )
-
-    # Activation funnel (docs/telemetry-activation.md): a successful, non-empty
-    # inference is the ``first_inference`` engagement milestone. Fired once per
-    # install and UNSAMPLED — distinct from the 10%-sampled ``request`` event
-    # above — so the engaged baseline can't be reconstructed-from-sample. A
-    # 2xx with zero completion tokens (empty generation) does NOT count. Emitted
-    # only after the response above is successfully constructed.
-    from rapid_mlx.telemetry.activation_spec import is_successful_inference
-
-    if is_successful_inference(200, output.completion_tokens):
-        _telemetry_emit.activation(
-            activation_kind="first_inference",
-            surface=_telemetry_emit.server_surface(),
+    response: Response
+    if _buffer_strict_tool_stream:
+        response = StreamingResponse(
+            _stream_buffered_chat_response(chat_response, request),
+            media_type="text/event-stream",
+            headers={**SSE_RESPONSE_HEADERS, **response_headers},
+        )
+    else:
+        response = Response(
+            content=chat_response.model_dump_json(exclude_none=True),
+            media_type="application/json",
+            headers=response_headers or None,
         )
 
+    from rapid_mlx.telemetry import inference as _telemetry_inference
+
+    caller_agent, caller_client = _telemetry_inference.request_caller_headers(
+        raw_request
+    )
+    _telemetry_inference.emit_completed_request(
+        model=served_telemetry_id or "<custom>",
+        endpoint="/v1/chat/completions",
+        caller_agent=caller_agent,
+        caller_client=caller_client,
+        result="ok",
+    )
+
     return response
+
+
+async def _stream_buffered_chat_response(
+    response: ChatCompletionResponse,
+    request: ChatCompletionRequest,
+) -> AsyncIterator[str]:
+    """Replay a buffered strict turn through the ordinary Chat state machine."""
+
+    choice = response.choices[0]
+    message = choice.message
+    outputs: list[GenerationOutput] = []
+
+    def append_output(
+        text: str,
+        channel: str,
+        *,
+        tool_calls: list[dict] | None = None,
+    ) -> None:
+        outputs.append(
+            GenerationOutput(
+                text=text,
+                new_text=text,
+                channel=channel,
+                tool_calls=tool_calls,
+                finished=False,
+                finish_reason=None,
+            )
+        )
+
+    if message.reasoning_content:
+        append_output(message.reasoning_content, "reasoning")
+    if message.content:
+        append_output(message.content, "content")
+    if message.tool_calls:
+        append_output(
+            " ",
+            "tool_call",
+            tool_calls=[
+                {
+                    "id": tool_call.id,
+                    "name": tool_call.function.name,
+                    "arguments": tool_call.function.arguments,
+                }
+                for tool_call in message.tool_calls
+            ],
+        )
+    if not outputs:
+        outputs.append(GenerationOutput(text="", new_text="", finished=False))
+
+    terminal = outputs[-1]
+    terminal.finished = True
+    terminal.finish_reason = choice.finish_reason
+    terminal.prompt_tokens = response.usage.prompt_tokens
+    terminal.completion_tokens = response.usage.completion_tokens
+    if response.usage.prompt_tokens_details is not None:
+        terminal.cached_tokens = response.usage.prompt_tokens_details.cached_tokens
+    if (
+        response.metrics is not None
+        and response.metrics.speculative_decoding is not None
+    ):
+        terminal.spec_decode_metrics = (
+            response.metrics.speculative_decoding.model_dump()
+        )
+
+    class _ReplayEngine:
+        tokenizer = None
+
+        async def stream_chat(self, **_kwargs):
+            for replay_output in outputs:
+                yield replay_output
+
+    replay_outcome = [False]
+    async for event in stream_chat_completion(
+        _ReplayEngine(),
+        [],
+        request,
+        response_id=response.id,
+        created=response.created,
+        _ok_outcome=replay_outcome,
+    ):
+        yield event
 
 
 async def stream_chat_completion(
@@ -6766,7 +6951,10 @@ async def stream_chat_completion(
     response_id: str | None = None,
     created: int | None = None,
     caller_agent: str | None = None,
+    caller_client: str | None = None,
+    served_telemetry_id: str | None = None,
     _client_disconnect_state: list[bool] | None = None,
+    _ok_outcome: list[bool] | None = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream chat completion response.
@@ -6782,14 +6970,13 @@ async def stream_chat_completion(
             stream stays self-consistent across the guided→unconstrained
             handoff (DeepSeek pr_validate round 5 finding).
         created: Optional pre-computed Unix timestamp. Same rationale.
-        caller_agent: Raw inbound HTTP ``User-Agent`` for the opt-in
-            streaming ``request`` telemetry event. Passed through
-            unbucketed — ``emit.request`` funnels it through
-            ``normalize_caller_agent`` (never stored raw). ``None`` when
-            the header is absent or telemetry is off.
         _client_disconnect_state: Private route/guard coordination latch.
             True means the consumer disappeared and post-stream recovery must
             not synthesize terminal frames for the dead connection.
+        _ok_outcome: Private telemetry hand-off for a wrapper that still has
+            to judge the stream (strict post-generation validation). When
+            given, a clean end sets ``_ok_outcome[0] = True`` INSTEAD of
+            counting ``ok``; the wrapper then counts exactly one outcome.
     """
     from ..service.postprocessor import StreamingPostProcessor
 
@@ -6804,14 +6991,6 @@ async def stream_chat_completion(
         if response_id is None:
             response_id = _new_stream_request_id()
         start_time = time.perf_counter()
-        # Opt-in telemetry (Phase 2.2): wall-clock of the FIRST real output
-        # token (content / reasoning / tool_call). This is the meaningful
-        # TTFT for a streaming response — unlike non-streaming, where TTFT
-        # collapses to total latency. Stays ``None`` until the first token
-        # is emitted so an empty / immediately-aborted stream reports no
-        # first-token time. Captured inside the loop, read in the terminal
-        # block below.
-        first_token_ts: float | None = None
 
         # Check if we should include usage in the final chunk
         include_usage = request.stream_options and request.stream_options.include_usage
@@ -6933,10 +7112,18 @@ async def stream_chat_completion(
         # legacy first-output fallback.
         request_admitted_event = asyncio.Event()
         kwargs["request_admitted_event"] = request_admitted_event
-        engine_stream = engine.stream_chat(
-            messages=messages, is_streaming=True, **kwargs
+        from rapid_mlx.telemetry import inference as _telemetry_inference
+
+        engine_stream = _telemetry_inference.emit_failed_on_stream_error(
+            engine.stream_chat(messages=messages, is_streaming=True, **kwargs),
+            model=served_telemetry_id or "<custom>",
+            endpoint="/v1/chat/completions",
+            caller_agent=caller_agent,
+            caller_client=caller_client,
         )
-        engine_output_task = asyncio.create_task(anext(engine_stream))
+        engine_output_task = asyncio.create_task(
+            cast(Coroutine[Any, Any, Any], anext(engine_stream))
+        )
         first_engine_output_task = engine_output_task
         admission_task = asyncio.create_task(request_admitted_event.wait())
         done, _ = await asyncio.wait(
@@ -7173,20 +7360,6 @@ async def stream_chat_completion(
                 stream_matched_stop = _chunk_matched_stop
 
             for event in processor.process_chunk(output):
-                # Telemetry: stamp TTFT on the first real output token
-                # (content / reasoning / tool_call). Cheap monotonic read
-                # gated to fire once; never touches the wire.
-                if (
-                    first_token_ts is None
-                    and event.type
-                    in (
-                        "content",
-                        "reasoning",
-                        "tool_call",
-                    )
-                    and not _buffer_forced_content
-                ):
-                    first_token_ts = time.perf_counter()
                 if event.type == "content":
                     _event_logprobs = (
                         _build_chunk_logprobs(output) if want_logprobs else None
@@ -7220,21 +7393,15 @@ async def stream_chat_completion(
                                 )
                                 _forced_content_pending.clear()
                                 if _clean_pending:
-                                    if first_token_ts is None:
-                                        first_token_ts = time.perf_counter()
                                     yield _content_sse_chunk(_clean_pending, None)
                             elif not _may_be_tool_wire(_pending_raw):
                                 # A partial candidate diverged into ordinary
                                 # prose (e.g. ``<funx``): replay every held byte.
                                 for _text, _logprobs in _forced_content_pending:
                                     if _text:
-                                        if first_token_ts is None:
-                                            first_token_ts = time.perf_counter()
                                         yield _content_sse_chunk(_text, _logprobs)
                                 _forced_content_pending.clear()
                         else:
-                            if first_token_ts is None:
-                                first_token_ts = time.perf_counter()
                             yield _content_sse_chunk(event.content, _event_logprobs)
                     else:
                         yield _content_sse_chunk(event.content, _event_logprobs)
@@ -7246,8 +7413,6 @@ async def stream_chat_completion(
                         # it cannot be spliced around this reasoning event.
                         _forced_content_pending.clear()
                         _forced_wire_quarantine = True
-                    if first_token_ts is None:
-                        first_token_ts = time.perf_counter()
                     yield _fast_sse_chunk(event.reasoning, "reasoning_content")
 
                 elif event.type == "tool_call":
@@ -7325,8 +7490,6 @@ async def stream_chat_completion(
                         _forced_content_pending.clear()
                     _forced_wire_quarantine = False
                     _forced_quarantine_tail = ""
-                    if first_token_ts is None:
-                        first_token_ts = time.perf_counter()
                     yield _tc_sse
 
                 elif event.type == "finish":
@@ -7394,8 +7557,6 @@ async def stream_chat_completion(
                     finish_output,
                 )
             else:
-                if first_token_ts is None:
-                    first_token_ts = time.perf_counter()
                 yield _fast_sse_chunk(finalize_reasoning, "reasoning_content")
 
         # #447 streaming-parity synthesis (2026-06-26). The non-stream
@@ -7576,8 +7737,6 @@ async def stream_chat_completion(
                 if _contains_structural_tool_wire_leak(_pending_raw):
                     _final_content = _scrub_visible_tool_wire_leaks(_pending_raw)
                     if _final_content:
-                        if first_token_ts is None:
-                            first_token_ts = time.perf_counter()
                         yield _content_sse_chunk(_final_content, None)
                 else:
                     # No payload-bearing structure materialized by stream end:
@@ -7585,8 +7744,6 @@ async def stream_chat_completion(
                     for _text, _logprobs in _forced_content_pending:
                         if not _text:
                             continue
-                        if first_token_ts is None:
-                            first_token_ts = time.perf_counter()
                         yield _content_sse_chunk(_text, _logprobs)
                 _forced_content_pending.clear()
 
@@ -8087,87 +8244,19 @@ async def stream_chat_completion(
 
         yield "data: [DONE]\n\n"
 
-        # Opt-in telemetry (Phase 2.2): record a bucketed ``request`` event
-        # for this completed STREAMING chat completion. This is the path
-        # real agent traffic (Cursor / Claude Code / Aider) takes, so it is
-        # where ``caller_agent`` + a MEANINGFUL ``ttft_ms`` actually come
-        # from — the non-streaming emit only ever sees one-shot self-tests.
-        #
-        # Emitted AFTER ``[DONE]`` (and any usage chunk) has been yielded so
-        # the terminal wire markers always reach the client first — the
-        # consent check / lazy queue-thread start can never delay stream
-        # completion, and it never touches first-token latency. On the
-        # SUCCESS path only: a client disconnect / early abort raises out of
-        # the loop above and unwinds through ``finally`` below, skipping
-        # this — matching the non-streaming (success-only) emit and how
-        # ``_disconnect_guard`` treats aborts.
-        #
-        # ``ttft_ms`` is wall-clock to the FIRST emitted token (captured in
-        # the loop), not total latency. ``tps`` is the DECODE throughput —
-        # completion tokens over the post-first-token window (total − ttft),
-        # the streaming analogue of the non-streaming ``completion / total``
-        # (where ttft == total collapses the window). Both fall back to the
-        # total-latency numbers when no token was emitted / the decode
-        # window is non-positive. ``emit.request`` is sampled +
-        # ``is_enabled()``-gated + ``@_safe``, so this is a cheap no-op when
-        # telemetry is off / not sampled and can never raise into the
-        # stream. ``caller_agent`` is passed RAW; the helper buckets it via
-        # ``normalize_caller_agent``.
-        if first_token_ts is not None:
-            _ttft_seconds = max(0.0, first_token_ts - start_time)
+        if _ok_outcome is not None:
+            _ok_outcome[:] = [True]
         else:
-            _ttft_seconds = elapsed
-        _decode_seconds = elapsed - _ttft_seconds
-        _decode_tps = (
-            completion_tokens / _decode_seconds
-            if _decode_seconds > 0
-            else tokens_per_sec
-        )
-        _tool_call_used = bool(fallback_tool_calls) or (
-            getattr(processor, "_tool_calls_emitted_to_wire", 0) > 0
-        )
-        from rapid_mlx.telemetry import emit as _telemetry_emit
+            from rapid_mlx.telemetry import inference as _telemetry_inference
 
-        # #1250 canary on the visible streamed content — the accumulated
-        # assistant text (reasoning is separate). Runs locally, only the
-        # bool is emitted; see ``_degenerate_signal``.
-        _output_degenerate = _degenerate_signal(
-            getattr(processor, "accumulated_text", "") or "",
-            _telemetry_emit.is_enabled(),
-        )
-
-        _telemetry_emit.request(
-            endpoint="/v1/chat/completions",
-            model_alias=request.model,
-            stream=True,
-            tool_call_used=_tool_call_used,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            ttft_ms=_ttft_seconds * 1000.0,
-            tps=_decode_tps,
-            status=200,
-            caller_agent=caller_agent,
-            output_degenerate=_output_degenerate,
-        )
-
-        # Activation funnel (docs/telemetry-activation.md): the streaming
-        # analogue of the non-streaming site above. A successful, non-empty
-        # stream is the ``first_inference`` milestone — once per install,
-        # unsampled. An empty stream (zero completion tokens) does NOT count.
-        #
-        # Placement is intentional: we emit only after the generator drains
-        # normally (all tokens flushed). A stream the client disconnects or
-        # cancels mid-generation raises out before here and is deliberately NOT
-        # counted — under-counting is conservative and never inflates the
-        # engaged funnel, whereas emitting at the first yielded token would
-        # over-count streams that then error out (contradicting "successful").
-        from rapid_mlx.telemetry.activation_spec import is_successful_inference
-
-        if is_successful_inference(200, completion_tokens):
-            _telemetry_emit.activation(
-                activation_kind="first_inference",
-                surface=_telemetry_emit.server_surface(),
+            _telemetry_inference.emit_completed_request(
+                model=served_telemetry_id or "<custom>",
+                endpoint="/v1/chat/completions",
+                caller_agent=caller_agent,
+                caller_client=caller_client,
+                result="ok",
             )
+
     finally:
         if admission_task is not None and not admission_task.done():
             admission_task.cancel()
@@ -8195,6 +8284,8 @@ async def stream_chat_completion_guided(
     response_id: str | None = None,
     strict_mode: bool = False,
     caller_agent: str | None = None,
+    caller_client: str | None = None,
+    served_telemetry_id: str | None = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream chat completion with json_schema constrained decoding.
@@ -8269,6 +8360,19 @@ async def stream_chat_completion_guided(
             )
             return f"data: {error_data}\n\n", "data: [DONE]\n\n"
 
+        def _record_model_replacement_failure() -> None:
+            """Count server-side replacement; explicit client cancel is silent."""
+            from rapid_mlx.telemetry import inference as _telemetry_inference
+
+            _telemetry_inference.emit_completed_request(
+                model=served_telemetry_id or "<custom>",
+                endpoint="/v1/chat/completions",
+                caller_agent=caller_agent,
+                caller_client=caller_client,
+                result="failed",
+                error_class="model_replaced",
+            )
+
         def _finish_guided_handoff() -> tuple[bool, object | None]:
             finish = getattr(engine, "finish_guided_handoff", None)
             if not callable(finish):
@@ -8287,6 +8391,7 @@ async def stream_chat_completion_guided(
         ) -> tuple[str, str]:
             exc = GuidedGenerationCancelledError(lifecycle_task=lifecycle_task)
             if _consume_guided_lifecycle_cancel(engine, exc):
+                _record_model_replacement_failure()
                 return _model_replacement_terminal_events()
             return _cancelled_terminal_events()
 
@@ -8358,6 +8463,7 @@ async def stream_chat_completion_guided(
             output = await guided_task
         except GuidedGenerationCancelledError as exc:
             if _consume_guided_lifecycle_cancel(engine, exc):
+                _record_model_replacement_failure()
                 for event in _model_replacement_terminal_events():
                     yield event
                 return
@@ -8420,6 +8526,16 @@ async def stream_chat_completion_guided(
                         "param": "response_format.json_schema",
                     }
                 }
+                from rapid_mlx.telemetry import inference as _telemetry_inference
+
+                _telemetry_inference.emit_completed_request(
+                    model=served_telemetry_id or "<custom>",
+                    endpoint="/v1/chat/completions",
+                    caller_agent=caller_agent,
+                    caller_client=caller_client,
+                    result="failed",
+                    error_class="strict_schema_violation",
+                )
                 yield f"data: {json.dumps(_err_envelope)}\n\n"
                 yield "data: [DONE]\n\n"
                 return
@@ -8443,6 +8559,8 @@ async def stream_chat_completion_guided(
                     created=_sse_created,
                     request_id=response_id,
                     caller_agent=caller_agent,
+                    caller_client=caller_client,
+                    served_telemetry_id=served_telemetry_id,
                     **kwargs,
                 ),
             )
@@ -8514,6 +8632,16 @@ async def stream_chat_completion_guided(
                         "param": "response_format.json_schema",
                     }
                 }
+                from rapid_mlx.telemetry import inference as _telemetry_inference
+
+                _telemetry_inference.emit_completed_request(
+                    model=served_telemetry_id or "<custom>",
+                    endpoint="/v1/chat/completions",
+                    caller_agent=caller_agent,
+                    caller_client=caller_client,
+                    result="failed",
+                    error_class="strict_schema_violation",
+                )
                 yield f"data: {json.dumps(_err_envelope)}\n\n"
                 yield "data: [DONE]\n\n"
                 return
@@ -8608,6 +8736,15 @@ async def stream_chat_completion_guided(
             yield f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n"
 
         yield "data: [DONE]\n\n"
+        from rapid_mlx.telemetry import inference as _telemetry_inference
+
+        _telemetry_inference.emit_completed_request(
+            model=served_telemetry_id or "<custom>",
+            endpoint="/v1/chat/completions",
+            caller_agent=caller_agent,
+            caller_client=caller_client,
+            result="ok",
+        )
     finally:
         if cfg.gc_control and gc_was_enabled:
             gc.enable()
@@ -8622,6 +8759,8 @@ async def stream_chat_completion_strict_postgen(
     *,
     response_id: str | None = None,
     caller_agent: str | None = None,
+    caller_client: str | None = None,
+    served_telemetry_id: str | None = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """R12-4 — streaming variant of post-generate strict enforcement.
@@ -8768,6 +8907,31 @@ async def stream_chat_completion_strict_postgen(
     # handle we explicitly close the generator on overflow so the
     # engine cleanup runs synchronously with the wrapper's
     # decision to bail.
+    # The upstream stream hands its clean-end ``ok`` to us: only after
+    # validation do we know whether this request succeeded.
+    upstream_ok: list[bool] = [False]
+
+    def _count_outcome(error_class: str | None) -> None:
+        from rapid_mlx.telemetry import inference as _telemetry_inference
+
+        if error_class is None:
+            _telemetry_inference.emit_completed_request(
+                model=served_telemetry_id or "<custom>",
+                endpoint="/v1/chat/completions",
+                caller_agent=caller_agent,
+                caller_client=caller_client,
+                result="ok",
+            )
+            return
+        _telemetry_inference.emit_completed_request(
+            model=served_telemetry_id or "<custom>",
+            endpoint="/v1/chat/completions",
+            caller_agent=caller_agent,
+            caller_client=caller_client,
+            result="failed",
+            error_class=error_class,
+        )
+
     upstream_agen = stream_chat_completion(
         engine,
         messages,
@@ -8775,6 +8939,9 @@ async def stream_chat_completion_strict_postgen(
         response_id=response_id,
         created=created,
         caller_agent=caller_agent,
+        caller_client=caller_client,
+        served_telemetry_id=served_telemetry_id,
+        _ok_outcome=upstream_ok,
         **kwargs,
     )
     try:
@@ -8809,11 +8976,9 @@ async def stream_chat_completion_strict_postgen(
                             # accumulate ``delta.reasoning_content``
                             # (a separate thinking-channel surface
                             # that is NOT included in the schema's
-                            # scope) or ``delta.tool_calls`` (which
-                            # is forbidden in strict mode by the
-                            # ``strict_with_tools_unsupported`` gate
-                            # in the chat route — line ~2310 — so it
-                            # cannot legally appear here). Any future
+                            # scope) or ``delta.tool_calls``. Strict tool
+                            # requests use the separate buffered path, so
+                            # tool deltas cannot reach this helper. Any future
                             # delta surface that carries user-visible
                             # text MUST be added here, OR the route
                             # gate must reject strict mode for that
@@ -8998,6 +9163,7 @@ async def stream_chat_completion_strict_postgen(
                 "R12-4 strict json_schema streaming buffer overflow at %d bytes",
                 _buffer_cap,
             )
+            _count_outcome("strict_schema_violation")
             validation_emitted = True
             return
 
@@ -9014,8 +9180,14 @@ async def stream_chat_completion_strict_postgen(
                 yield terminal
             if held_usage_chunk is not None:
                 yield held_usage_chunk
+            if upstream_ok[0]:
+                _count_outcome(None)
         else:
             incr_strict_violation()
+            if upstream_ok[0]:
+                # Only a stream that ran to its clean end is judged; one the
+                # client abandoned was never going to validate.
+                _count_outcome("strict_schema_violation")
             envelope = build_violation_envelope(
                 failure_details or {"reason": "schema_violation"},
                 attempts=1,

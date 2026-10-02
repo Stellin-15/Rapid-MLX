@@ -38,9 +38,7 @@ class Qwen3_5MTPSplitter(MTPSplitter):
         # (dense backbones simply carry 0).
         return SimpleNamespace(
             config=SimpleNamespace(
-                num_experts=getattr(
-                    TextConfig.from_dict(text_config), "num_experts", 0
-                )
+                num_experts=getattr(TextConfig.from_dict(text_config), "num_experts", 0)
             )
         )
 
@@ -119,12 +117,10 @@ class Qwen3NextMTPSplitter(MTPSplitter):
                 # consistent switch_mlp layout (mirrors the gate_up_proj
                 # handling above).
                 for suffix in ("weight", "scales", "biases"):
-                    keys = [
-                        f"{prefix}.{e}.{proj}.{suffix}" for e in range(n_experts)
-                    ]
+                    keys = [f"{prefix}.{e}.{proj}.{suffix}" for e in range(n_experts)]
                     present = [k for k in keys if k in tensors]
                     # Rapid upstream-bugfix (documented deviation): pinned
-                    # 0.7.1 silently skipped missing or partial expert
+                    # 0.7.2 silently skipped missing or partial expert
                     # groups and saved an incomplete checkpoint that only
                     # failed at load time. Once a prefix is detected every
                     # weight projection must carry all ``num_experts``

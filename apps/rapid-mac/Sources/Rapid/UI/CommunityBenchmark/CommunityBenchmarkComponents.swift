@@ -70,23 +70,48 @@ enum CommunityMascotContext {
 struct CommunityMascot: View {
     let context: CommunityMascotContext
     var isAnimating = false
+    /// Overrides the context's visible character size.
+    ///
+    /// The contexts encode the sizes the Benchmark module drew the character
+    /// at. Share Compute places the same approved plate in its own
+    /// compositions, where the design calls for a smaller character than any
+    /// existing context provides — and a mascot sized past its slot would
+    /// overflow the workbench's clip and lose its tail. Overriding the size
+    /// keeps the plate, the context restriction, and the reduced-motion
+    /// behaviour intact; only the scale differs.
+    var visibleSize: CGFloat? = nil
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var characterSize: CGFloat { visibleSize ?? context.pointSize }
+
+    /// The rendered box for ``characterSize``, using the same visible-ratio
+    /// correction ``CommunityMascotContext/renderedBoxSize`` applies.
+    private var boxSize: CGFloat { (characterSize / context.art.visibleRatio).rounded() }
 
     var body: some View {
         // The frame is the RENDERED box, not the visible character: the plate
         // is ~50% transparent margin, so reserving only the character's size
         // let the artwork spill out and collide with the headline beneath it
         // on the Published sheet. The margin is just whitespace in the layout.
-        mascotImage
-            .opacity(context == .running && !isAnimating ? 0.75 : 1)
-            .animation(
-                reduceMotion || !isAnimating
-                    ? nil
-                    : .easeInOut(duration: 0.9).repeatForever(autoreverses: true),
-                value: isAnimating
-            )
-            .accessibilityHidden(true)
+        //
+        // The breathing loop is owned by ``BreathingLoop`` and only exists
+        // while the mascot has something to signal: a `repeatForever`
+        // attached via `.animation(_:value:)` outlives the state that
+        // started it (see ``BreathingLoop``), and a sheet that keeps
+        // committing frames after the run finished is the same idle-CPU
+        // leak the footer's status dot had.
+        Group {
+            if RapidMotion.shouldPulse(isAnimating: isAnimating, reduceMotion: reduceMotion) {
+                BreathingLoop(opacity: 0.75) {
+                    mascotImage
+                }
+            } else {
+                mascotImage
+                    .opacity(context == .running && !isAnimating ? 0.75 : 1)
+            }
+        }
+        .accessibilityHidden(true)
     }
 
     @ViewBuilder
@@ -96,12 +121,12 @@ struct CommunityMascot: View {
                 .resizable()
                 .interpolation(.high)
                 .scaledToFit()
-                .frame(width: context.renderedBoxSize, height: context.renderedBoxSize)
+                .frame(width: boxSize, height: boxSize)
         } else {
             // The asset is bundled at build time, so this is "the .app got
             // corrupted" territory; the existing brand mark keeps the
             // composition intact rather than leaving a hole.
-            CheetahLogo(size: context.pointSize)
+            CheetahLogo(size: characterSize)
         }
     }
 }

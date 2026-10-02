@@ -22,6 +22,7 @@ from rapid_mlx.image.engine import (
     ImageRuntimeError,
 )
 from rapid_mlx.runtime.image_lane import ImageEngine
+from rapid_mlx.runtime.optional_runtime import OptionalRuntimeMissing
 
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
@@ -37,9 +38,9 @@ def test_image_runtime_probe_and_guard_report_unsupported_python(
     issue = image_lane.image_runtime_issue("flux2-klein-4b")
     assert issue is not None
     assert "Python 3.11 or newer (current: 3.10)" in issue
-    with pytest.raises(SystemExit, match="2"):
+    with pytest.raises(OptionalRuntimeMissing) as exc:
         image_lane.require_image_runtime_or_exit("flux2-klein-4b")
-    assert "Python 3.11 or newer" in capsys.readouterr().err
+    assert "Python 3.11 or newer" in exc.value.format_user_message()
 
 
 class _FakeGeneratedImage:
@@ -104,6 +105,21 @@ def test_default_steps_is_family_aware(hf_path, expected_default_steps):
 def test_unknown_family_raises():
     with pytest.raises(ImageRuntimeError, match="Unsupported image model"):
         ImageGenerationEngine("stabilityai/some-unwired-model")
+
+
+@pytest.mark.parametrize(
+    "hf_path",
+    [
+        "Qwen/Qwen-Image-2.0",
+        "Qwen/Qwen-Image-2.2",
+        "acme/Qwen-Image-Edit-2.1",
+        "acme/Qwen-Image-Edit-v2.1",
+        "acme/Qwen-Image-2.1-Edit",
+    ],
+)
+def test_unsupported_qwen_image_2_is_rejected_before_1x_dispatch(hf_path):
+    with pytest.raises(ImageRuntimeError, match=r"Qwen-Image 2.x.*not supported"):
+        ImageGenerationEngine(hf_path)
 
 
 @pytest.mark.parametrize(
@@ -584,6 +600,12 @@ def test_image_adapter_residency_without_mode_preserves_family_default(monkeypat
 def test_image_adapter_delegates_atomic_performance_methods(monkeypatch):
     engine = ImageEngine("Runpod/FLUX.2-klein-4B-mflux-4bit")
     expected = {"denoise_seconds": 8.0, "denoise_steps": 4}
+    loaded_modes = []
+    monkeypatch.setattr(
+        engine._engine,
+        "_ensure_loaded",
+        lambda *, for_edit=None: loaded_modes.append(for_edit),
+    )
     monkeypatch.setattr(engine._engine, "performance_snapshot", lambda: expected)
     monkeypatch.setattr(
         engine._engine,
@@ -593,6 +615,7 @@ def test_image_adapter_delegates_atomic_performance_methods(monkeypatch):
 
     assert engine.performance_snapshot() == expected
     assert engine.generate_with_performance(prompt="a fox") == (b"png", expected)
+    assert loaded_modes == [False]
 
 
 # --------------------------------------------------------------------------- #
@@ -714,9 +737,16 @@ def test_route_400_url_response_format(client, monkeypatch):
 
 
 def test_route_happy_path_returns_b64(client, monkeypatch):
+    from rapid_mlx.telemetry import inference
+
+    emit_calls = []
+    monkeypatch.setattr(
+        inference, "emit_completed_request", lambda **kwargs: emit_calls.append(kwargs)
+    )
     _patch_engine(monkeypatch, _FakeImageEngine())
     resp = client.post(
         "/v1/images/generations",
+        headers={"user-agent": "openai-python/1.2", "x-rapid-client": "rapid-desktop"},
         json={"prompt": "a red fox", "size": "512x512", "seed": 42},
     )
     assert resp.status_code == 200
@@ -724,6 +754,15 @@ def test_route_happy_path_returns_b64(client, monkeypatch):
     assert "created" in body and len(body["data"]) == 1
     raw = base64.b64decode(body["data"][0]["b64_json"])
     assert raw.startswith(_PNG_MAGIC)
+    assert emit_calls == [
+        {
+            "model": "<custom>",
+            "endpoint": "/v1/images/generations",
+            "caller_agent": "openai-python/1.2",
+            "caller_client": "rapid-desktop",
+            "result": "ok",
+        }
+    ]
 
 
 def test_route_logs_measured_klein_step_throughput(client, monkeypatch, caplog):
@@ -1223,7 +1262,11 @@ def test_generations_uses_engine_default_steps(client, monkeypatch, default_step
     assert engine.steps_seen == [default_steps]
 
 
-def test_image_alias_skips_the_mllm_routing_preflight(monkeypatch):
+@pytest.mark.parametrize(
+    "model_ref",
+    ["z-image-turbo", "MLX-COMMUNITY/qwen-image-2.1-mflux-q4"],
+)
+def test_image_alias_skips_the_mllm_routing_preflight(monkeypatch, model_ref):
     """An image-gen alias must not run the MLLM-vs-text routing preflight.
 
     ``_ensure_routing_config`` materializes a checkpoint ``config.json`` so
@@ -1268,8 +1311,13 @@ def test_image_alias_skips_the_mllm_routing_preflight(monkeypatch):
         for attr in ("_engine", "_model_name", "_model_alias")
     }
     try:
-        server.load_model("z-image-turbo")
-        assert built.get("model_name") == "filipstrand/Z-Image-Turbo-mflux-4bit", (
+        server.load_model(model_ref)
+        expected = (
+            "filipstrand/Z-Image-Turbo-mflux-4bit"
+            if model_ref == "z-image-turbo"
+            else "mlx-community/Qwen-Image-2.1-mflux-q4"
+        )
+        assert built.get("model_name") == expected, (
             "the image alias never reached ImageEngine — the MLLM routing "
             "preflight ran and killed a lane that has no MLLM question"
         )

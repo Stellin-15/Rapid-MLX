@@ -1,0 +1,391 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Best-effort telemetry-v2 inference and capability emitters."""
+
+from __future__ import annotations
+
+import atexit
+import os
+import queue
+import threading
+from collections.abc import AsyncIterable, AsyncIterator, Callable
+from functools import partial
+from typing import Any
+from urllib.parse import urlsplit
+
+from rapid_mlx.telemetry import model_id, redact, registry, store
+from rapid_mlx.telemetry import track as track_module
+
+_MODEL_TYPES = frozenset(
+    {
+        "llm",
+        "vlm",
+        "embedding",
+        "image-gen",
+        "video-gen",
+        "text-diffusion",
+        "audio",
+        "other",
+    }
+)
+
+_MAX_PENDING = 64
+_QUEUE: queue.Queue[Callable[[], None]] = queue.Queue(maxsize=_MAX_PENDING)
+_WORKER: threading.Thread | None = None
+_WORKER_LOCK = threading.Lock()
+_SHUTTING_DOWN = False
+_AT_FORK_INSTALLED = globals().get("_AT_FORK_INSTALLED", False)
+_ATEXIT_INSTALLED = globals().get("_ATEXIT_INSTALLED", False)
+
+
+def _worker_main(work_queue: queue.Queue[Callable[[], None]]) -> None:
+    """Run queued writes serially on a daemon that never owns process exit."""
+    while True:
+        callback = work_queue.get()
+        try:
+            callback()
+        except Exception:
+            pass
+        finally:
+            work_queue.task_done()
+
+
+def _ensure_worker() -> bool:
+    """Lazily start the process-local daemon worker."""
+    global _WORKER
+    with _WORKER_LOCK:
+        if _SHUTTING_DOWN:
+            return False
+        if _WORKER is not None and _WORKER.is_alive():
+            return True
+        try:
+            worker = threading.Thread(
+                target=_worker_main,
+                args=(_QUEUE,),
+                name="rapid-mlx-inference-telemetry",
+                daemon=True,
+            )
+            worker.start()
+        except Exception:
+            return False
+        _WORKER = worker
+        return True
+
+
+def _submit(callback: Callable[[], None]) -> bool:
+    """Submit without blocking; drop when the bounded lane is saturated."""
+    if not _ensure_worker():
+        return False
+    try:
+        _QUEUE.put_nowait(callback)
+    except queue.Full:
+        return False
+    return True
+
+
+def _drop_pending_at_exit() -> None:
+    """Discard queued writes without waiting for a blocked daemon worker."""
+    global _SHUTTING_DOWN
+    _SHUTTING_DOWN = True
+    while True:
+        try:
+            _QUEUE.get_nowait()
+        except queue.Empty:
+            return
+        else:
+            _QUEUE.task_done()
+
+
+def _after_fork_child() -> None:
+    """Forget inherited thread state; only the forking thread survives."""
+    global _QUEUE, _WORKER, _WORKER_LOCK, _SHUTTING_DOWN
+    _QUEUE = queue.Queue(maxsize=_MAX_PENDING)
+    _WORKER = None
+    _WORKER_LOCK = threading.Lock()
+    _SHUTTING_DOWN = False
+
+
+def _install_lifecycle_hooks() -> None:
+    global _ATEXIT_INSTALLED, _AT_FORK_INSTALLED
+    if not _ATEXIT_INSTALLED:
+        atexit.register(_drop_pending_at_exit)
+        _ATEXIT_INSTALLED = True
+    if not _AT_FORK_INSTALLED and hasattr(os, "register_at_fork"):
+        os.register_at_fork(after_in_child=_after_fork_child)
+        _AT_FORK_INSTALLED = True
+
+
+_install_lifecycle_hooks()
+
+
+def model_type_token(source: object | None) -> str:
+    """Classify a resolved engine/profile into the registry vocabulary."""
+    try:
+        if source is None:
+            return "other"
+        if isinstance(source, str):
+            return source if source in _MODEL_TYPES else "other"
+
+        modality = getattr(source, "modality", None)
+        if modality == "text":
+            return "vlm" if getattr(source, "supports_image_input", False) else "llm"
+        if isinstance(modality, str) and modality in _MODEL_TYPES - {
+            "llm",
+            "vlm",
+            "other",
+        }:
+            return modality
+        if getattr(source, "is_image_gen", False):
+            return "image-gen"
+        if getattr(source, "is_video_gen", False):
+            return "video-gen"
+        if getattr(source, "is_embedding", False):
+            return "embedding"
+        if getattr(source, "is_audio", False):
+            return "audio"
+        return "vlm" if getattr(source, "is_mllm", False) else "llm"
+    except Exception:
+        return "other"
+
+
+#: ``request.inference_aborted_error_code`` category -> ``inference_error_class``.
+_ABORT_CODE_CLASSES = {
+    "insufficient_memory": "insufficient_memory",
+    "engine_aborted": "engine_aborted",
+    "model_replacement": "model_replaced",
+}
+
+
+def classify_inference_failure(
+    exc: BaseException | None, *, abort_first: bool = True
+) -> str:
+    """Map a failed request's exception onto the closed ``inference_error_class``.
+
+    Mirrors the decisions the routes already make, through the SAME predicates
+    (``rapid_mlx.request``), in the SAME order as the calling handler:
+
+    * ``abort_first=True`` (chat, completions, stream wrappers): engine abort
+      category first, then chat-template, media-input and per-batch-cap
+      errors -- the chat handler's order.
+    * ``abort_first=False`` (the anthropic and non-stream /v1/responses
+      handlers): those handlers test the template / media / batch-cap
+      predicates BEFORE anything else, so an abort whose text matches one is
+      answered as that 400 and must be classified as it; the abort category
+      applies only after them.
+
+    The exception text is read here, inside the process, but only a registry
+    enum value is ever returned — never ``str(exc)``. Total: any unexpected
+    input or internal failure yields ``"other"``.
+    """
+    try:
+        if exc is None:
+            return "other"
+        from rapid_mlx import request as request_module
+
+        def abort_class() -> str | None:
+            if isinstance(exc, request_module.InferenceAbortedError):
+                code = request_module.inference_aborted_error_code(exc)
+                return _ABORT_CODE_CLASSES.get(code, "other")
+            return None
+
+        if abort_first:
+            aborted = abort_class()
+            if aborted is not None:
+                return aborted
+        if request_module.is_chat_template_error(exc):
+            return "template_error"
+        if request_module.is_media_input_error(exc):
+            return "media_input_invalid"
+        if request_module.is_batch_cap_error(exc):
+            return "prompt_too_large"
+        return abort_class() or "other"
+    except Exception:
+        return "other"
+
+
+def _record_completed_request(
+    *,
+    model: str,
+    endpoint: str,
+    caller_agent: str | None,
+    caller_client: str | None,
+    result: str,
+    error_class: str | None = None,
+) -> None:
+    """Worker-thread half of :func:`emit_completed_request`.
+
+    Callers pass the resolved telemetry model id, never the request's model
+    field. Every operation is best effort; no exception can escape the worker.
+    A failure carries one ``inference_error_class`` value (anything outside the
+    registry, including a missing class, collapses to ``"other"``) and is
+    counted under its own local key, so thresholds are per class.
+    """
+    try:
+        safe_model = model_id.telemetry_model_id(model)
+        try:
+            endpoint_path = urlsplit(endpoint).path
+        except (TypeError, ValueError):
+            endpoint_path = ""
+        allowed_endpoints = registry.load_registry()["enums"]["endpoint"]["values"]
+        safe_endpoint = endpoint_path if endpoint_path in allowed_endpoints else "other"
+        caller = redact.normalize_caller_agent(caller_agent, caller_client)
+        allowed_callers = registry.load_registry()["enums"]["caller"]["values"]
+        if caller not in allowed_callers:
+            caller = "other"
+        outcome = result if result in ("ok", "failed") else "failed"
+        key = f"inf|{safe_model}|{safe_endpoint}|{caller}|{outcome}"
+        failure_class: str | None = None
+        if outcome == "failed":
+            allowed_classes = registry.load_registry()["enums"][
+                "inference_error_class"
+            ]["values"]
+            failure_class = error_class if error_class in allowed_classes else "other"
+            key = f"{key}|{failure_class}"
+        crossing = store.record(key)
+        if crossing is not None:
+            props = {
+                "model": safe_model,
+                "endpoint": safe_endpoint,
+                "caller": caller,
+                "result": outcome,
+                "count_bucket": crossing.bucket,
+                "bucket_source": crossing.bucket_source,
+            }
+            if failure_class is not None:
+                props["error_class"] = failure_class
+            track_module.track("inference_bucket_reached", props)
+        if outcome == "ok":
+            track_module.emit_active_day()
+    except Exception:
+        return
+
+
+def emit_completed_request(
+    *,
+    model: str,
+    endpoint: str,
+    caller_agent: str | None,
+    caller_client: str | None,
+    result: str,
+    error_class: str | None = None,
+) -> None:
+    """Gate, then enqueue one completed-request update without blocking.
+
+    The official-build and live-consent checks intentionally happen before
+    submitting work. Ineligible processes therefore create no telemetry state.
+    SQLite and capture work always run outside the request coroutine.
+    """
+    try:
+        if not track_module._upload_allowed():
+            return
+        _submit(
+            partial(
+                _record_completed_request,
+                model=model,
+                endpoint=endpoint,
+                caller_agent=caller_agent,
+                caller_client=caller_client,
+                result=result,
+                error_class=error_class,
+            )
+        )
+    except Exception:
+        return
+
+
+async def emit_failed_on_stream_error(
+    source: AsyncIterable[Any],
+    *,
+    model: str,
+    endpoint: str,
+    caller_agent: str | None,
+    caller_client: str | None,
+    failure_latch: list[bool] | None = None,
+) -> AsyncIterator[Any]:
+    """Forward a generation stream and count only non-cancellation failures."""
+    try:
+        async for item in source:
+            yield item
+    except Exception as exc:
+        if failure_latch is not None:
+            failure_latch[:] = [True]
+        emit_completed_request(
+            model=model,
+            endpoint=endpoint,
+            caller_agent=caller_agent,
+            caller_client=caller_client,
+            result="failed",
+            error_class=classify_inference_failure(exc),
+        )
+        raise
+
+
+def emit_capability_rejected(
+    capability: str,
+    *,
+    reject_reason: str | None = None,
+    model_type: str = "other",
+    model: str | None = None,
+    caller_agent: str | None = None,
+    caller_client: str | None = None,
+) -> None:
+    """Enqueue one closed-vocabulary capability rejection without blocking."""
+    try:
+        if not track_module._upload_allowed():
+            return
+        _submit(
+            partial(
+                _record_capability_rejected,
+                capability=capability,
+                reject_reason=reject_reason,
+                model_type=model_type,
+                model=model,
+                caller_agent=caller_agent,
+                caller_client=caller_client,
+            )
+        )
+    except Exception:
+        return
+
+
+def _record_capability_rejected(
+    *,
+    capability: str,
+    reject_reason: str | None = None,
+    model_type: str,
+    model: str | None = None,
+    caller_agent: str | None = None,
+    caller_client: str | None = None,
+) -> None:
+    """Worker-thread half of :func:`emit_capability_rejected`."""
+    try:
+        allowed = registry.load_registry()["enums"]["capability"]["values"]
+        if capability not in allowed:
+            return
+        props = {
+            "capability": capability,
+            "model_type": model_type_token(model_type),
+        }
+        if reject_reason is not None:
+            props["reject_reason"] = reject_reason
+        if model is not None:
+            props["model"] = model_id.telemetry_model_id(model)
+        if caller_agent is not None or caller_client is not None:
+            caller = redact.normalize_caller_agent(caller_agent, caller_client)
+            allowed_callers = registry.load_registry()["enums"]["caller"]["values"]
+            props["caller"] = caller if caller in allowed_callers else "other"
+        track_module.track("capability_rejected", props)
+    except Exception:
+        return
+
+
+def request_caller_headers(request: Any | None) -> tuple[str | None, str | None]:
+    """Return the raw caller headers shared by every inference route."""
+    try:
+        if request is None:
+            return None, None
+        return (
+            request.headers.get("user-agent"),
+            request.headers.get("x-rapid-client"),
+        )
+    except Exception:
+        return None, None

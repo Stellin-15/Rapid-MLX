@@ -28,7 +28,7 @@ rapid_mlx/bench/pflash_replication.py 1
 rapid_mlx/bench/tier_runner.py 2
 rapid_mlx/benchmark.py 8
 rapid_mlx/chat_mcp.py 2
-rapid_mlx/cli.py 26
+rapid_mlx/cli.py 23
 rapid_mlx/community_bench/submission.py 1
 rapid_mlx/disk_stream_patch.py 2
 rapid_mlx/doctor/env_health.py 1
@@ -60,7 +60,7 @@ rapid_mlx/models/gemma4_vendored/language.py 6
 rapid_mlx/models/gpt_oss_puzzle.py 3
 rapid_mlx/models/hy_v3.py 1
 rapid_mlx/models/mllm.py 22
-rapid_mlx/models/mlx_vlm_vendored/apc.py 37
+rapid_mlx/models/mlx_vlm_vendored/apc.py 36
 rapid_mlx/models/mlx_vlm_vendored/fp8.py 1
 rapid_mlx/models/mlx_vlm_vendored/generate/ar.py 48
 rapid_mlx/models/mlx_vlm_vendored/generate/types.py 1
@@ -112,7 +112,7 @@ rapid_mlx/runtime/diffusion_lane.py 3
 rapid_mlx/runtime/disk_kv_checkpoint.py 1
 rapid_mlx/runtime/radix_index.py 2
 rapid_mlx/runtime/ubc_evict.py 1
-rapid_mlx/runtime/video_lane.py 4
+rapid_mlx/runtime/video_lane.py 2
 rapid_mlx/scheduler.py 35
 rapid_mlx/server.py 21
 rapid_mlx/service/helpers.py 4
@@ -126,7 +126,6 @@ rapid_mlx/spec_decode/mtp/qwen3_5_inject.py 5
 rapid_mlx/speculative/ddtree/runtime.py 2
 rapid_mlx/speculative/ddtree/server.py 3
 rapid_mlx/speculative/dflash/server.py 5
-rapid_mlx/telemetry/transport.py 2
 rapid_mlx/tool_parsers/abstract_tool_parser.py 2
 rapid_mlx/tool_parsers/auto_tool_parser.py 1
 rapid_mlx/tool_parsers/deepseek_tool_parser.py 1

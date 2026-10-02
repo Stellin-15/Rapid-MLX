@@ -10,7 +10,7 @@ from importlib.util import find_spec
 from typing import Any
 
 logger = logging.getLogger(__name__)
-QUALIFIED_MLX_VLM_VERSION = "0.7.1"
+QUALIFIED_MLX_VLM_VERSION = "0.7.2"
 GLM_CACHE_RUNTIME_LABEL = "cache-owned GLM runtime"
 
 
@@ -25,7 +25,10 @@ def have_glm_cache_runtime() -> bool:
         install_glm5_mtp_compatibility()
         # VENDOR-DEVIATION(redirect): vendored text-AR core (step 3a) and
         # vendored drafter registry (step 3c); the remaining mlx_vlm imports
-        # below move in later step-3 slices.
+        # below move in later step-3 slices. Keep probing the upstream AR module
+        # because generation hooks still patch both registries during the
+        # staged transition.
+        from mlx_vlm.generate import ar as upstream_ar
         from mlx_vlm.models.cache import ArraysCache, PoolingCache
         from mlx_vlm.models.glm5_next import language
 
@@ -52,13 +55,16 @@ def have_glm_cache_runtime() -> bool:
             and all(hasattr(ArraysCache, name) for name in cache_methods)
             and all(hasattr(PoolingCache, name) for name in cache_methods)
             and all(
-                hasattr(ar, name)
-                for name in (
-                    "generate_step",
-                    "SpeculativePrefill",
-                    "run_speculative_rounds",
-                    "speculative_prefill_kwargs",
+                all(
+                    hasattr(module, name)
+                    for name in (
+                        "generate_step",
+                        "SpeculativePrefill",
+                        "run_speculative_rounds",
+                        "speculative_prefill_kwargs",
+                    )
                 )
+                for module in (ar, upstream_ar)
             )
         )
     except Exception:  # noqa: BLE001 - optional runtime must fail closed

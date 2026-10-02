@@ -36,6 +36,10 @@ FAKE_IMAGE_ALIAS="fake-image-alias"
 # (16/24/32 GB hosts fold qwen3.5-4b into the recommended row instead).
 GOLDEN_RAM_GB=8
 GOLDEN_BRAND="Apple M1"
+# The telemetry v2 notice begins at 0.15.0. Pin the throwaway fresh-install
+# bundle to the cutoff so this baseline cannot silently disappear while the
+# source Info.plist still carries an older release version in CI.
+FRESH_INSTALL_APP_VERSION="0.15.0"
 UPDATE_BASELINES=0
 FLOW="all"
 KEEP=0
@@ -178,6 +182,58 @@ wait_fake_sidecar_health() {
 require_observed_phase() {
     local observed="$1" phase="$2"
     [[ "$observed" == 1 ]] || die "required $phase phase was not observed"
+}
+
+assert_marker_only_consent() {
+    "${PYTHON:-python3}" -c 'import ast, json, pathlib, re, sys, time
+
+def scalar(raw):
+    raw = raw.strip()
+    if raw[:1] in ("\"", "\x27"):
+        try:
+            value = ast.literal_eval(raw)
+        except (SyntaxError, ValueError):
+            return raw
+        return value if isinstance(value, str) else raw
+    raw = raw.split("#", 1)[0].strip()
+    lowered = raw.lower()
+    if lowered in {"true", "yes"}:
+        return True
+    if lowered in {"false", "no"}:
+        return False
+    if re.fullmatch(r"[+-]?\d+", raw):
+        return int(raw)
+    return raw
+
+def load_flat_record(text):
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        data = {}
+        for line in text.splitlines():
+            if not line.strip() or line.lstrip().startswith("#") or line[:1].isspace():
+                continue
+            key, separator, raw = line.partition(":")
+            if not separator or not raw.strip() or raw.lstrip().startswith("#"):
+                continue
+            data[key.strip()] = scalar(raw)
+        return data
+
+path = pathlib.Path(sys.argv[1])
+deadline = time.monotonic() + 5.0
+while True:
+    try:
+        data = load_flat_record(path.read_text(encoding="utf-8"))
+    except OSError:
+        data = None
+    if (isinstance(data, dict)
+            and type(data.get("notice_revision_seen")) is int
+            and data["notice_revision_seen"] == 1
+            and "consent" not in data):
+        raise SystemExit(0)
+    if time.monotonic() >= deadline:
+        raise SystemExit(1)
+    time.sleep(0.1)' "$1"
 }
 
 recorded_process_has_argv_pair() {
@@ -651,7 +707,7 @@ assert_one_telemetry_request() {
           requests: map({method, path, bytes, event, timestamp})}' \
         "$TELEMETRY_SINK_LOG" > "$evidence"
     [[ "$count" == 1 ]] \
-        || die "Settings opt-in did not produce exactly one telemetry request during $stage"
+        || die "telemetry enablement did not produce exactly one request during $stage"
     jq -e '(.request_count == 1)
               and (.requests[0].method == "POST")
               and (.requests[0].path == "/v1/events")
@@ -659,7 +715,7 @@ assert_one_telemetry_request() {
               and (.requests[0].event == "session_start")
               and (.requests[0].timestamp >= .not_before)' \
         "$evidence" >/dev/null \
-        || die "Settings opt-in did not produce a new session_start during $stage"
+        || die "telemetry enablement did not produce a new session_start during $stage"
 }
 
 assert_share_activation_requests() {
@@ -684,7 +740,7 @@ assert_share_activation_requests() {
           expected_activation_kind: $expected_kind, requests: .}' \
         "$TELEMETRY_SINK_LOG" > "$evidence"
     [[ "$count" == 2 ]] \
-        || die "Share produced $count telemetry requests instead of session_start plus one activation"
+        || die "$stage produced $count telemetry requests instead of session_start plus one activation"
     jq -e '. as $evidence |
         ([.requests[] | select(.event == "session_start")] | length) == 1
         and ([.requests[] | select(.event == "activation")] | length) == 1
@@ -698,7 +754,7 @@ assert_share_activation_requests() {
             and .activation_keys == ["activation_kind", "surface"]
         )] | length) == 1' \
         "$evidence" >/dev/null \
-        || die "Share did not produce exactly one valid $expected_kind Desktop activation"
+        || die "$stage did not produce exactly one valid $expected_kind Desktop activation"
 }
 
 trap finish EXIT
@@ -798,8 +854,14 @@ start_persona() {
     PERSONA_ENV=("$@")
     PERSONA="$(mktemp -d "/tmp/rapid-golden-${name}.XXXXXX")"
     mkdir -p "$OUT"
-    "$ROOT/scripts/dogfood-isolate.sh" "$APP_SOURCE" "$PERSONA" \
-        > "$OUT/isolated-app.txt" 2> "$OUT/isolate.log"
+    if [[ "$name" == "fresh-install" ]]; then
+        RAPID_TEST_APP_VERSION="$FRESH_INSTALL_APP_VERSION" \
+            "$ROOT/scripts/dogfood-isolate.sh" "$APP_SOURCE" "$PERSONA" \
+            > "$OUT/isolated-app.txt" 2> "$OUT/isolate.log"
+    else
+        "$ROOT/scripts/dogfood-isolate.sh" "$APP_SOURCE" "$PERSONA" \
+            > "$OUT/isolated-app.txt" 2> "$OUT/isolate.log"
+    fi
     local isolated_app
     isolated_app="$(cat "$OUT/isolated-app.txt")"
     BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$isolated_app/Contents/Info.plist")"
@@ -2013,16 +2075,23 @@ flow_fresh_install() {
     # The real engine registry always contains the starter. Without this row,
     # the fake catalog makes the app correctly fall back to its only chat row
     # and the assertion below can never prove the production first-run rule.
+    # The throwaway bundle is pinned to FRESH_INSTALL_APP_VERSION, so the
+    # moment a newer desktop release is published the live update manifest
+    # would paint UpdateCard into this persona and break the AX baseline
+    # (first hit: the 0.15.1 release, merge-queue candidate #3719). The
+    # update path has its own flows (update-state, update-busy); keep this
+    # baseline independent of what dl.rapidmlx.com serves today.
     start_persona fresh-install FAKE_INCLUDE_STARTER=1 \
         RAPID_GUI_HARDWARE_FIXTURE=1 RAPID_HARDWARE_RAM_GB=$GOLDEN_RAM_GB \
         RAPID_HARDWARE_BRAND="$GOLDEN_BRAND" \
+        RAPIDMLX_NO_UPDATE_CHECK=1 \
         "${TELEMETRY_SINK_ENV[@]}" \
         RAPID_MLX_TELEMETRY_ENDPOINT="http://127.0.0.1:$TELEMETRY_SINK_PORT/v1/events"
     wait_identifier Quickstart.GetStarted "$OUT/welcome.json"
     assert_no_telemetry_requests before-onboarding
-    if jq -e '.data.ui_elements[]? | select((.identifier? // "") | startswith("TelemetryConsent."))' \
+    if jq -e '.data.ui_elements[]? | select((.identifier? // "") | startswith("TelemetryNotice."))' \
         "$OUT/welcome.json" >/dev/null; then
-        die "fresh install asked for telemetry before Rapid delivered product value"
+        die "telemetry notice appeared behind onboarding instead of in the production shell"
     fi
 
     # Direction D owns the window rather than mounting production controls
@@ -2048,21 +2117,41 @@ flow_fresh_install() {
     baseline onboarding-direction-d.compact-chooser "$OUT/chooser-settled.json"
     press "$OUT/chooser-settled.json" Quickstart.Footer.Back "$OUT/chooser-back.json"
     wait_identifier Quickstart.Skip "$OUT/welcome-returned.json"
+    local boundary_second notice_not_before
+    boundary_second="$(date -u +%s)"
+    while [[ "$(date -u +%s)" == "$boundary_second" ]]; do sleep 0.05; done
+    notice_not_before="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     press "$OUT/welcome-returned.json" Quickstart.Skip "$OUT/quickstart-skip.json"
-    wait_identifier rapid.chat.compose "$OUT/steady.json"
-    selected_model="$(element_field "$OUT/steady.json" ModelPickerBar.ModelMenu value)"
+    wait_identifier TelemetryNotice.Banner "$OUT/launch-notice-visible.json"
+    wait_identifier rapid.chat.compose "$OUT/launch-notice-visible.json"
+    selected_model="$(element_field "$OUT/launch-notice-visible.json" ModelPickerBar.ModelMenu value)"
     [[ "$selected_model" == *"lfm2.5-1b-4bit"* ]] \
         || die "#2219: 8 GB onboarding selected '$selected_model' instead of the compact starter"
     for id in Sidebar.NewChat Sidebar.Launch rapid.chat.compose ChatView.SendOrStopButton ModelPickerBar.ModelMenu; do
-        jq -e --arg id "$id" '.data.ui_elements[]? | select(.identifier == $id)' "$OUT/steady.json" >/dev/null \
+        jq -e --arg id "$id" '.data.ui_elements[]? | select(.identifier == $id)' "$OUT/launch-notice-visible.json" >/dev/null \
             || die "post-onboarding shell missing $id"
     done
-    baseline fresh-install.steady "$OUT/steady.json"
-    if jq -e '.data.ui_elements[]? | select((.identifier? // "") | startswith("TelemetryConsent."))' \
+    baseline fresh-install.launch-telemetry-notice "$OUT/launch-notice-visible.json"
+    assert_marker_only_consent \
+        "$PERSONA/home/.rapid-mlx/telemetry-consent.yaml" \
+        || die "launch notice did not persist marker-only default-on state"
+    assert_one_telemetry_request launch-notice "$notice_not_before"
+    press "$OUT/launch-notice-visible.json" TelemetryNotice.Acknowledge \
+        "$OUT/launch-notice-acknowledged.json" \
+        || die "telemetry notice acknowledgement was not actionable"
+    for _ in {1..40}; do
+        see_main "$OUT/steady.json"
+        if ! jq -e '.data.ui_elements[]? | select(.identifier == "TelemetryNotice.Banner")' \
+            "$OUT/steady.json" >/dev/null; then
+            break
+        fi
+        sleep 0.25
+    done
+    if jq -e '.data.ui_elements[]? | select(.identifier == "TelemetryNotice.Banner")' \
         "$OUT/steady.json" >/dev/null; then
-        die "fresh install asked for telemetry before the first working feature"
+        die "Got it did not dismiss the telemetry launch notice"
     fi
-    assert_no_telemetry_requests before-first-value
+    baseline fresh-install.steady "$OUT/steady.json"
     # Exercise the scene/content contract, not only the constant. Before the
     # fix the declared floor was never applied and AppKit accepted ~616pt.
     # Asking for 500pt must be clamped by the live window to at least 720pt.
@@ -2073,105 +2162,13 @@ flow_fresh_install() {
         "$OUT/window-floor.json" >/dev/null \
         || die "the live main window did not enforce its 720x560 floor: $(jq -c .actual "$OUT/window-floor.json")"
 
-    # Consent follows proof of value instead of blocking first launch. A real
-    # completed assistant turn is the trigger; the answer remains visible and
-    # usable under the non-modal invitation.
+    # Default-on activation follows the already-presented notice without a
+    # second prompt. The sink must receive exactly session_start plus the one
+    # content-free first-chat milestone.
     start_model
-    send_prompt "Say hello in one short sentence." "post-value-consent"
-    wait_identifier TelemetryConsent.PostValueBanner "$OUT/post-value-consent-visible.json"
-    # The first reply can expose its final text and the consent banner before
-    # the streaming task releases model residency.  A structural baseline
-    # taken in that interval records the transient disabled Unload control and
-    # flakes according to scheduler speed.  Prove the send state is idle, then
-    # recapture the still-visible invitation before comparing the steady UI.
-    wait_send_idle "$OUT/post-value-consent-complete.json"
-    wait_identifier TelemetryConsent.PostValueBanner "$OUT/post-value-consent-visible.json"
-    # Streaming completion and scroll anchoring settle independently. Capture
-    # the structural baseline only after the transcript reaches its stable tail.
-    settle_transcript_at_bottom "$OUT/post-value-consent-visible.json" \
-        "$OUT/post-value-consent-jump-press.json"
-    assert_tree_text "$OUT/post-value-consent-visible.json" "Hello"
-    [[ "$(jq '[.data.ui_elements[]? | select(.identifier == "TelemetryConsent.PostValueBanner")] | length' \
-        "$OUT/post-value-consent-visible.json")" == 1 ]] \
-        || die "the first successful reply did not show exactly one telemetry invitation"
-    assert_no_telemetry_requests post-value-before-decision
-    baseline fresh-install.post-value-consent "$OUT/post-value-consent-visible.json"
-    # The invitation is part of the main window, not a modal. Escape belongs
-    # to the active app interaction and must never answer a permanent privacy
-    # choice on the user's behalf.
-    "$AX_DRIVER" key "$APP_PID" escape > "$OUT/post-value-consent-escape.json"
-    wait_identifier TelemetryConsent.PostValueBanner "$OUT/post-value-consent-after-escape.json"
-    press "$OUT/post-value-consent-after-escape.json" \
-        TelemetryConsent.PostValue.Decline \
-        "$OUT/post-value-consent-explicit-decline.json"
-    for _ in {1..40}; do
-        see_main "$OUT/post-value-consent-declined.json"
-        if ! jq -e '.data.ui_elements[]? | select(.identifier == "TelemetryConsent.PostValueBanner")' \
-            "$OUT/post-value-consent-declined.json" >/dev/null; then
-            break
-        fi
-        sleep 0.25
-    done
-    if jq -e '.data.ui_elements[]? | select(.identifier == "TelemetryConsent.PostValueBanner")' \
-        "$OUT/post-value-consent-declined.json" >/dev/null; then
-        die "explicit No thanks did not dismiss the telemetry invitation"
-    fi
-    assert_no_telemetry_requests after-decline
-    relaunch_persona
-    wait_identifier rapid.chat.compose "$OUT/post-value-consent-relaunch.json"
-    if jq -e '.data.ui_elements[]? | select(.identifier == "TelemetryConsent.PostValueBanner")' \
-        "$OUT/post-value-consent-relaunch.json" >/dev/null; then
-        die "dismissed telemetry invitation returned after relaunch"
-    fi
-    assert_no_telemetry_requests declined-relaunch
-    # Positive control for the five quiet checkpoints above: use the promised
-    # reversible Settings path and require the app to reach this exact sink.
-    # Without this, a dropped endpoint override could make every negative
-    # assertion pass while telemetry escaped to a different destination.
-    open_settings
-    wait_settings_stable "$OUT/telemetry-settings-rail.json" Settings.Category.privacy
-    press "$OUT/telemetry-settings-rail.json" Settings.Category.privacy \
-        "$OUT/telemetry-open-privacy.json" \
-        || die "Privacy category is not pressable after declined consent"
-    wait_settings_stable "$OUT/telemetry-settings-privacy.json" Settings.Privacy.TelemetryToggle
-    [[ "$(element_field "$OUT/telemetry-settings-privacy.json" \
-        Settings.Privacy.TelemetryToggle value)" == "0" ]] \
-        || die "declined telemetry decision was not still off in Settings"
-    # TelemetryEvent timestamps have whole-second precision. Cross a UTC
-    # second boundary before the toggle so a request created during launch but
-    # delayed in URLSession cannot masquerade as this positive control.
-    local boundary_second opt_in_not_before
-    boundary_second="$(date -u +%s)"
-    while [[ "$(date -u +%s)" == "$boundary_second" ]]; do sleep 0.05; done
-    opt_in_not_before="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    press "$OUT/telemetry-settings-privacy.json" Settings.Privacy.TelemetryToggle \
-        "$OUT/telemetry-settings-opt-in.json" \
-        || die "Settings telemetry opt-in is not pressable"
-    assert_one_telemetry_request settings-opt-in "$opt_in_not_before"
-    cleanup_persona
-    cleanup_telemetry_sink
-
-    # A second pristine profile takes the affirmative path. Keep it separate
-    # so the decline/no-re-ask contract above remains intact while this lane
-    # proves that a success retained before consent becomes one accepted,
-    # content-free activation only after Share.
-    log "  consent Share emits one accepted first-chat activation"
-    start_telemetry_sink "$OUT_ROOT/fresh-install-share"
-    start_persona fresh-install-share FAKE_INCLUDE_STARTER=1 \
-        RAPID_GUI_HARDWARE_FIXTURE=1 RAPID_HARDWARE_RAM_GB=$GOLDEN_RAM_GB \
-        RAPID_HARDWARE_BRAND="$GOLDEN_BRAND" \
-        "${TELEMETRY_SINK_ENV[@]}" \
-        RAPID_MLX_TELEMETRY_ENDPOINT="http://127.0.0.1:$TELEMETRY_SINK_PORT/v1/events"
-    dismiss_first_run
-    assert_no_telemetry_requests share-before-first-value
-    start_model
-    send_prompt "Say hello in one short sentence." "share-activation"
-    wait_identifier TelemetryConsent.PostValueBanner "$OUT/share-consent-visible.json"
-    assert_no_telemetry_requests share-before-decision
-    press "$OUT/share-consent-visible.json" TelemetryConsent.PostValue.Share \
-        "$OUT/share-consent-accepted.json" \
-        || die "Share was not actionable after the first successful reply"
-    assert_share_activation_requests share-accepted first_chat_reply
+    send_prompt "Say hello in one short sentence." "default-on-activation"
+    wait_send_idle "$OUT/default-on-activation-complete.json"
+    assert_share_activation_requests default-on-activation first_chat_reply
     [[ -f "$PERSONA/home/.rapid-mlx/activation_seen_desktop_first_chat_reply" ]] \
         || die "accepted first_chat_reply did not claim its once-per-install marker"
     cleanup_persona
@@ -2306,7 +2303,12 @@ flow_cached_quickstart() {
         "$OUT/start-chatting.json"
     wait_identifier rapid.chat.compose "$OUT/ready.json"
     assert_tree_text "$OUT/ready.json" "chatting with fake-alias, running entirely on your Mac."
-    [[ "$(jq '[.data.ui_elements[]? | select(.value? | strings | startswith("You’re chatting with fake-alias, running entirely on your Mac."))] | length' "$OUT/ready.json")" == 1 ]] \
+    # This PR deliberately disables Markdown smart typography so the
+    # transcript preserves the bytes emitted by the model. Keep this AX
+    # contract on the straight apostrophe the product now renders; matching
+    # the pre-fix curly spelling made a correct, exactly-once welcome look
+    # absent in the merge candidate.
+    [[ "$(jq '[.data.ui_elements[]? | select(.value? | strings | startswith("You\u0027re chatting with fake-alias, running entirely on your Mac."))] | length' "$OUT/ready.json")" == 1 ]] \
         || die "Quickstart welcome was not seeded exactly once after confirmation"
     if jq -e -s 'any(.[]; .event == "command" and .subcommand == "pull")' \
         "$OUT/fake-events.jsonl" >/dev/null; then
@@ -3196,12 +3198,19 @@ flow_no_dead_controls() {
     press "$OUT/dead-appearance-light.json" Settings.Category.privacy "$OUT/dead-open-privacy-actions.json" \
         || die "Privacy category is not pressable"
     see_main "$OUT/dead-privacy-before.json"
-    local telemetry_before telemetry_after
+    local telemetry_before telemetry_after attempt
     telemetry_before="$(element_field "$OUT/dead-privacy-before.json" Settings.Privacy.TelemetryToggle value)"
     press "$OUT/dead-privacy-before.json" Settings.Privacy.TelemetryToggle "$OUT/dead-privacy-toggle.json" \
         || die "Telemetry toggle is not pressable"
-    see_main "$OUT/dead-privacy-after.json"
-    telemetry_after="$(element_field "$OUT/dead-privacy-after.json" Settings.Privacy.TelemetryToggle value)"
+    telemetry_after=""
+    for attempt in {0..50}; do
+        [[ "$attempt" == 0 ]] || sleep 0.1
+        see_main "$OUT/dead-privacy-after.json"
+        telemetry_after="$(element_field "$OUT/dead-privacy-after.json" Settings.Privacy.TelemetryToggle value)"
+        if [[ -n "$telemetry_after" && "$telemetry_after" != "$telemetry_before" ]]; then
+            break
+        fi
+    done
     [[ -n "$telemetry_before" && -n "$telemetry_after" && "$telemetry_before" != "$telemetry_after" ]] \
         || die "Telemetry toggle accepted AXPress but its value did not change"
     press "$OUT/dead-privacy-after.json" Settings.Privacy.TelemetryToggle "$OUT/dead-privacy-restore.json" \
@@ -4882,26 +4891,54 @@ flow_launch_integrations() {
     dismiss_first_run
     see_main "$OUT/main.json"
     press "$OUT/main.json" Sidebar.Launch "$OUT/launch.json"
-    wait_tree_text "Connect your agents" "$OUT/launch.json" 40
+    wait_tree_text "Connect an agent" "$OUT/launch.json" 40
 
     # ``ConnectToolsView`` renders the three-entry compatibility fallback
     # first, then replaces it with the sidecar's authoritative integration
     # registry. The heading appears before that asynchronous load completes,
     # so capturing immediately makes the baseline race between two valid UI
-    # states. Settle on the fake sidecar's complete 14-entry registry before
-    # asserting or recording the stopped-state structure.
+    # states. The page now leads with the connection contract and three common
+    # integrations, with the rest behind one disclosure in both stopped and
+    # ready states. Wait for that disclosure before asserting structure.
     local i count=0
     for ((i=0; i<80; i++)); do
         see_main "$OUT/launch.json"
         count="$(jq '[.data.ui_elements[]?
-                      | (.identifier // "")
-                      | select(startswith("Launch.Integration.Copy."))]
-                     | unique | length' "$OUT/launch.json")"
-        [[ "$count" == 14 ]] && break
+                      | select(.identifier == "ConnectTools.MoreIntegrations")]
+                     | length' "$OUT/launch.json")"
+        [[ "$count" == 1 ]] && break
         sleep 0.1
     done
-    [[ "$count" == 14 ]] \
-        || die "Cold Launch did not settle on the 14-entry integration registry (got $count)"
+    [[ "$count" == 1 ]] \
+        || die "Cold Agent page did not settle on its integration registry"
+
+    # The Agent-page baseline owns the connection surface, not the independent
+    # first-launch telemetry notice.  A prior journey may already have
+    # acknowledged that notice when matrix flows share the runner's defaults,
+    # while an isolated run may still show it.  Normalize both legitimate
+    # entry states before taking the structural snapshot so queue order cannot
+    # make this flow alternate between two baselines.
+    if jq -e '.data.ui_elements[]?
+              | select(.identifier == "TelemetryNotice.Banner")' \
+            "$OUT/launch.json" >/dev/null; then
+        press "$OUT/launch.json" TelemetryNotice.Acknowledge \
+            "$OUT/launch-notice-acknowledged.json" \
+            || die "Agent flow could not dismiss the unrelated telemetry notice"
+        for ((i=0; i<40; i++)); do
+            see_main "$OUT/launch.json"
+            if ! jq -e '.data.ui_elements[]?
+                        | select(.identifier == "TelemetryNotice.Banner")' \
+                    "$OUT/launch.json" >/dev/null; then
+                break
+            fi
+            sleep 0.25
+        done
+        if jq -e '.data.ui_elements[]?
+                  | select(.identifier == "TelemetryNotice.Banner")' \
+                "$OUT/launch.json" >/dev/null; then
+            die "Agent flow telemetry notice did not dismiss before its baseline"
+        fi
+    fi
 
     # Cold Launch is a beginner path, not a wall of live (copyable) commands.
     # The stopped state now stays a useful setup destination (#2297): the
@@ -4923,6 +4960,37 @@ flow_launch_integrations() {
     # indistinguishable). Assert the popup itself is present.
     jq -e '.data.ui_elements[]? | select(.identifier == "ModelPickerBar.ModelMenu")' "$OUT/launch.json" >/dev/null \
         || die "Cold Launch offered no inline model picker"
+
+    # Expand once while stopped to prove every registry target remains
+    # discoverable but none can copy a placeholder command.
+    press "$OUT/launch.json" ConnectTools.MoreIntegrations "$OUT/launch-cold-more-press.json" \
+        || die "Cold Agent page's More integrations disclosure is not pressable"
+    for ((i=0; i<80; i++)); do
+        see_main "$OUT/launch.json"
+        count="$(jq '[.data.ui_elements[]?
+                      | (.identifier // "")
+                      | select(startswith("Launch.Integration.Copy."))]
+                     | unique | length' "$OUT/launch.json")"
+        [[ "$count" == 14 ]] && break
+        sleep 0.1
+    done
+    [[ "$count" == 14 ]] \
+        || die "Cold Agent page omitted registry integrations (got $count of 14)"
+    enabled_count="$(jq '[.data.ui_elements[]? | select(((.identifier // "") | startswith("Launch.Integration.Copy.")) and .enabled == true)] | length' "$OUT/launch.json")"
+    [[ "$enabled_count" == 0 ]] \
+        || die "Cold Agent page enabled $enabled_count placeholder commands after expansion"
+    press "$OUT/launch.json" ConnectTools.MoreIntegrations "$OUT/launch-cold-more-collapse.json" \
+        || die "Cold Agent page's More integrations disclosure did not collapse"
+    for ((i=0; i<80; i++)); do
+        see_main "$OUT/launch.json"
+        count="$(jq '[.data.ui_elements[]?
+                      | (.identifier // "")
+                      | select(startswith("Launch.Integration.Copy."))]
+                     | unique | length' "$OUT/launch.json")"
+        [[ "$count" == 3 ]] && break
+        sleep 0.1
+    done
+    [[ "$count" == 3 ]] || die "Cold Agent page did not return to 3 primary integrations"
     baseline launch-integrations.complete "$OUT/launch.json"
 
     press "$OUT/launch.json" Sidebar.NewChat "$OUT/launch-chat.json" \
@@ -4941,6 +5009,29 @@ flow_launch_integrations() {
                                   and .enabled == true)] | length' "$OUT/launch-ready.json")"
     [[ "$ready_copies" == 3 ]] \
         || die "Ready Launch should lead with 3 common integrations, got $ready_copies"
+
+    # Compact cards keep shell syntax out of the first scan, while still
+    # letting a user inspect the exact command before copying it.
+    press "$OUT/launch-ready.json" Launch.Integration.Command.claude-code \
+        "$OUT/launch-command-open.json" \
+        || die "Agent page could not expand a launch command"
+    wait_identifier Launch.Integration.Snippet.claude-code \
+        "$OUT/launch-command-expanded.json" 40
+    press "$OUT/launch-command-expanded.json" Launch.Integration.Command.claude-code \
+        "$OUT/launch-command-close.json" \
+        || die "Agent page could not collapse a launch command"
+    local snippet_count=1
+    for ((i=0; i<40; i++)); do
+        see_main "$OUT/launch-command-collapsed.json"
+        snippet_count="$(jq '[.data.ui_elements[]?
+                              | select(.identifier == "Launch.Integration.Snippet.claude-code")]
+                             | length' "$OUT/launch-command-collapsed.json")"
+        [[ "$snippet_count" == 0 ]] && break
+        sleep 0.1
+    done
+    [[ "$snippet_count" == 0 ]] \
+        || die "Agent page kept a launch command visible after collapse"
+
     press "$OUT/launch-ready.json" ConnectTools.MoreIntegrations \
         "$OUT/launch-more-press.json" \
         || die "More integrations disclosure is not pressable"

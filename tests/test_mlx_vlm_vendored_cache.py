@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regression tests for the three documented upstream-bugfix deviations in the
 vendored mlx-vlm cache module (see the package ``__init__.py`` provenance).
-Each test fails against the byte-verbatim upstream 0.7.1 source.
+Each test fails against the byte-verbatim upstream 0.7.2 source.
 """
 
 import pytest
@@ -14,12 +14,21 @@ import mlx.core as mx
 from rapid_mlx.models.mlx_vlm_vendored.cache import (
     BatchPoolingCache,
     BatchRotatingKVCache,
+    BufferedRotatingKVCache,
 )
 
 
+def test_buffered_rotating_extract_rejects_an_invalid_row():
+    cache = BufferedRotatingKVCache(max_size=8)
+    item = mx.zeros((1, 1, 1, 4))
+    cache.update_and_fetch(item, item)
+
+    with pytest.raises(IndexError):
+        cache.extract(1)
+
+
 def test_batch_rotating_merge_with_content():
-    """Upstream passed ``c.keys`` to the zero-arg in-place
-    ``_temporal_order``, so every merge with content raised TypeError."""
+    """Rapid's one-row batch input uses the zero-arg in-place contract."""
     a = BatchRotatingKVCache(16, [0])
     keys_a = mx.arange(2 * 6 * 8, dtype=mx.float32).reshape(1, 2, 6, 8)
     a._update_concat(keys_a, mx.zeros((1, 2, 6, 8)))

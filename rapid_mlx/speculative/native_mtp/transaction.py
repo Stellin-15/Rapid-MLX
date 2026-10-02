@@ -36,13 +36,14 @@ def _last_sequence(tokens, sequence) -> int:
 
 
 class _ThinkingBudgetLogitsProcessor:
-    """Reproduce 0.7.1's reasoning close from immutable committed context."""
+    """Reproduce 0.7.2's reasoning close from immutable committed context."""
 
     def __init__(self, criteria, prompt_length: int):
         self.budget = int(criteria.thinking_budget)
         if self.budget < 0:
             raise ValueError("thinking_budget must be non-negative")
-        self.start_ids = [int(criteria.thinking_start_token_id)]
+        start_token_id = criteria.thinking_start_token_id
+        self.start_ids = [] if start_token_id is None else [int(start_token_id)]
         self.end_ids = [int(criteria.thinking_end_token_id)]
         forced = getattr(criteria, "_forced_sequence", None)
         self.forced_ids = [int(token) for token in (forced or self.end_ids)]
@@ -59,6 +60,12 @@ class _ThinkingBudgetLogitsProcessor:
             if _last_sequence(context[first:], self.end_ids) >= 0:
                 return logits
         else:
+            # The released criteria documents ``thinking_start_token=None``
+            # as a supported default. Without a preopened prompt there is no
+            # observable boundary from which to start counting, so leave the
+            # logits untouched instead of manufacturing a token id.
+            if not self.start_ids:
+                return logits
             start = _last_sequence(context, self.start_ids)
             if start < 0:
                 return logits
@@ -66,7 +73,7 @@ class _ThinkingBudgetLogitsProcessor:
                 return logits
             first = start + len(self.start_ids)
 
-        # mlx-vlm 0.7.1 lets the token that takes the count over budget land,
+        # mlx-vlm 0.7.2 lets the token that takes the count over budget land,
         # then replaces subsequent samples with its forced sequence (normally
         # newline, then </think>). Derive the forced cursor from committed
         # positions so verifier retries cannot advance mutable policy state.
@@ -636,7 +643,7 @@ def install_generation_hooks() -> None:
 
         @wraps(released_generate_step)
         def generate_step(*args, **kwargs):
-            """Carry policy state omitted by mlx-vlm 0.7.1's MTP call."""
+            """Carry policy state omitted by mlx-vlm 0.7.2's MTP call."""
             drafter = kwargs.get("draft_model")
             if not (
                 kwargs.get("draft_kind") == "mtp"

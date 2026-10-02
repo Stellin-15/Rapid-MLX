@@ -58,7 +58,7 @@ class DFlashConfig(BaseModelConfig):
         runtime_block_size = flat.get("runtime_block_size")
         if runtime_block_size is not None:
             # Rapid upstream-bugfix (documented deviation): validate and
-            # coerce together — pinned 0.7.1 kept the original value, so a
+            # coerce together — pinned 0.7.2 kept the original value, so a
             # numeric string passed validation and reached runtime code as
             # a str.
             flat["runtime_block_size"] = int(runtime_block_size)

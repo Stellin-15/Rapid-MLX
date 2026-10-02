@@ -902,7 +902,11 @@ async def test_ensure_engine_ready_releases_on_cancel_and_failure():
     with pytest.raises(HTTPException) as raised:
         await ensure_engine_ready(engine)
     assert raised.value.status_code == 503
+    # A 503 keeps its standard ``Retry-After`` hint; the client tells the OOM
+    # case apart from a generic load failure by the envelope ``code``, not the
+    # header (see tests/test_faithful_error_codes.py).
     assert raised.value.headers == {"Retry-After": "5"}
+    assert raised.value.detail["error"]["code"] == "model_load_failed"
     assert lifecycle.snapshot()["active_request_owners"] == 0
 
     other = FakeEngine(loaded=True)
@@ -1165,6 +1169,7 @@ async def test_lifespan_primary_lifecycle_modes(
     monkeypatch.setattr(server, "_model_registry", registry)
     monkeypatch.setattr(server, "_residency_manager", manager)
     monkeypatch.setattr(server, "_primary_model_lifecycle", None)
+    monkeypatch.setattr(server, "_telemetry_model_served_state", "idle")
     monkeypatch.setattr(server, "_primary_lazy_load", lazy_load)
     monkeypatch.setattr(server, "_primary_idle_unload_seconds", idle_seconds)
     monkeypatch.setattr(server, "_warmup_primary_engine", AsyncMock())
@@ -1186,6 +1191,90 @@ async def test_lifespan_primary_lifecycle_modes(
     with pytest.raises(StopAsyncIteration):
         await lifespan.__anext__()
     assert cfg.ready is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lazy_load", [False, True], ids=["eager", "lazy"])
+async def test_real_lifespan_emits_model_served_after_completed_load_once(
+    monkeypatch, lazy_load
+):
+    from types import SimpleNamespace
+
+    from rapid_mlx import server
+    from rapid_mlx.config import reset_config
+    from rapid_mlx.routes import audio, video
+    from rapid_mlx.runtime import audio_worker
+    from rapid_mlx.telemetry import model_events
+
+    engine = FakeEngine()
+    if not lazy_load:
+        engine.is_text_diffusion = True
+    manager = SimpleNamespace(
+        start=AsyncMock(),
+        shutdown=AsyncMock(),
+        contains=Mock(return_value=False),
+        register_primary=Mock(),
+        set_primary_lifecycle_state=Mock(),
+    )
+    cfg = reset_config()
+    cfg.bind_host = None
+    cfg.bind_port = None
+    monkeypatch.setattr(server, "_engine", engine)
+    monkeypatch.setattr(
+        server, "_model_registry", SimpleNamespace(list_entries=Mock(return_value=[]))
+    )
+    monkeypatch.setattr(server, "_residency_manager", manager)
+    monkeypatch.setattr(server, "_primary_model_lifecycle", None)
+    monkeypatch.setattr(server, "_telemetry_model_served_state", "idle")
+    monkeypatch.setattr(server, "_primary_lazy_load", lazy_load)
+    monkeypatch.setattr(server, "_primary_idle_unload_seconds", 1.0)
+    monkeypatch.setattr(server, "_model_alias", "tmax-9b")
+    monkeypatch.setattr(server, "_telemetry_auto_selected", True)
+    monkeypatch.setattr(server, "_warmup_primary_engine", AsyncMock())
+    monkeypatch.setattr(server, "_warmup_tool_grammar", AsyncMock())
+    monkeypatch.setattr(server, "_drain_deferred_prefix_cache_load", AsyncMock())
+    monkeypatch.setattr(server, "_shutdown_save_prefix_cache", AsyncMock())
+    monkeypatch.setattr(audio, "audio_routes_should_register", Mock(return_value=False))
+    monkeypatch.setattr(audio, "shutdown_audio_lanes", AsyncMock())
+    monkeypatch.setattr(video, "start_video_jobs", Mock())
+    monkeypatch.setattr(video, "shutdown_video_jobs", AsyncMock())
+    monkeypatch.setattr(audio_worker, "bind_audio_worker", Mock())
+    calls = []
+
+    def record_served(loaded_engine, alias, auto_selected, **_kwargs):
+        assert loaded_engine._loaded is True
+        calls.append((alias, auto_selected))
+        return True
+
+    monkeypatch.setattr(model_events, "emit_model_served", record_served)
+
+    lifespan = server.lifespan(server.app)
+    await lifespan.__anext__()
+    if lazy_load:
+        assert calls == []
+        await server._primary_model_lifecycle.ensure_loaded()
+        await server._primary_model_lifecycle.ensure_loaded()
+    await engine.stop()
+    await server._primary_model_lifecycle.ensure_loaded()
+    assert calls == [("tmax-9b", True)]
+    with pytest.raises(StopAsyncIteration):
+        await lifespan.__anext__()
+
+
+def test_model_served_hook_failure_never_changes_server_load(monkeypatch):
+    from rapid_mlx import server
+    from rapid_mlx.telemetry import model_events
+
+    monkeypatch.setattr(server, "_telemetry_model_served_state", "idle")
+    monkeypatch.setattr(
+        model_events,
+        "emit_model_served",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("telemetry failed")),
+    )
+
+    server._emit_primary_model_served_once(object())
+
+    assert server._telemetry_model_served_state == "idle"
 
 
 @pytest.mark.asyncio

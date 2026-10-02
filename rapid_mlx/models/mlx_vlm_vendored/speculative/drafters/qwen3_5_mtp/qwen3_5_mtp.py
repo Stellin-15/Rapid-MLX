@@ -38,7 +38,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
             hidden_size, eps=text_config.rms_norm_eps
         )
         self.pre_fc_norm_hidden = nn.RMSNorm(hidden_size, eps=text_config.rms_norm_eps)
-        # Rapid upstream-bugfix (documented deviation): pinned 0.7.1 keyed
+        # Rapid upstream-bugfix (documented deviation): pinned 0.7.2 keyed
         # the decoder class on "moe" appearing in the model type, so the
         # Qwen3-Next family instantiated dense layers over MoE checkpoints.
         cfg_model_type = getattr(text_config, "model_type", "")
@@ -364,7 +364,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
                     if callable(finalize):
                         finalize()
                 # Rapid upstream-bugfix (documented deviation): pinned
-                # 0.7.1 skips the padding correction for a scalar
+                # 0.7.2 skips the padding correction for a scalar
                 # _next_position, so shorter rows keep too-large position
                 # ids for the next round. Promote to per-row positions when
                 # the padding is heterogeneous.
@@ -374,11 +374,14 @@ class Qwen3_5MTPDraftModel(nn.Module):
                 elif int(padding.min()) == int(padding.max()):
                     self._next_position = self._next_position - int(padding.min())
                 else:
-                    self._next_position = mx.full(
-                        (len(right_padding),),
-                        self._next_position,
-                        dtype=mx.int32,
-                    ) - padding
+                    self._next_position = (
+                        mx.full(
+                            (len(right_padding),),
+                            self._next_position,
+                            dtype=mx.int32,
+                        )
+                        - padding
+                    )
 
             last_idx = mx.array([length - 1 for length in lengths], dtype=mx.int32)
             last_hidden = mx.take_along_axis(h, last_idx[:, None, None], axis=1)
@@ -434,7 +437,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
         tokens: List[mx.array] = []
         self._round_appended = 0
 
-        # Rapid upstream-bugfix (documented deviation): pinned 0.7.1
+        # Rapid upstream-bugfix (documented deviation): pinned 0.7.2
         # crashes on mx.concatenate with an empty token list when
         # block_size <= 1; return the DFlash2-shaped empty proposal
         # BEFORE any seed-state consumption so a rejected round keeps the
@@ -501,7 +504,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
                 out[f"{prefix}.switch_mlp.gate_proj.scales"] = gate_scales
                 out[f"{prefix}.switch_mlp.up_proj.scales"] = up_scales
 
-            # Rapid upstream-bugfix (documented deviation): pinned 0.7.1
+            # Rapid upstream-bugfix (documented deviation): pinned 0.7.2
             # moves the fused scales but leaves the fused biases behind, so
             # affine-quantized experts lose required quantization metadata.
             gate_up_biases_key = f"{gate_up_key}_biases"
@@ -535,7 +538,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
                     int(expert)
                 ] = key
 
-        # Rapid upstream-bugfix (documented deviation): pinned 0.7.1 only
+        # Rapid upstream-bugfix (documented deviation): pinned 0.7.2 only
         # checks that discovered indexes are contiguous from zero, so a
         # checkpoint with experts 0..k (k < num_experts - 1) stacked
         # undersized switch_mlp tensors; compare against the configured

@@ -3,7 +3,7 @@
 Mechanical guarantee: every function/class body in the vendored
 ``speculative/`` coordinator modules, ``models/base.py``,
 ``models/linear.py``, ``fp8.py``, and ``quant_utils.py`` is
-byte-identical to the pinned upstream ``mlx-vlm==0.7.1`` source. The
+byte-identical to the pinned upstream ``mlx-vlm==0.7.2`` source. The
 only permitted differences are the documented module-level import
 redirects (see the package inventory), which never enter a function's
 ``getsource``, plus two inventoried function-level lazy-import redirects
@@ -12,6 +12,9 @@ mla/switch_layers resolution — both pinned upstream until step 3c) and
 one set of documented bugfix hunks (``build_ddtree``'s ``ValueError``
 validation; ``_dflash_rounds_batch``/``_mtp_rounds_batch``'s unfinished-row
 budget). The walker compares function/class name sets in both directions.
+The vendored processor installer also differs in one security hunk: a matching
+remote ``model_type`` is intercepted only after explicit
+``trust_remote_code=True`` consent.
 Two exemption mechanisms exist and must not be confused: ``documented``
 filters strict-compare divergences for REAL permitted behavioral hunks;
 ``normalized`` entries compare on behavior only (comments, blanks, and
@@ -20,14 +23,23 @@ emitted with a marker the documented filter cannot match — they always
 fail.
 
 Behavioral guarantee: the vendored coordinator binds the vendored cache
-and model foundations; the two deliberately-pinned dependencies (the
-quantized verifier and the eagle3 backend) resolve upstream and are
-pure-array functions, so the cross-namespace calls are identity-safe.
+and model foundations while recognizing cache trees returned by still-pinned
+model implementations in the upstream namespace. The two deliberately-pinned
+dependencies (the quantized verifier and the eagle3 backend) resolve upstream;
+their permitted cross-namespace calls are identity-safe.
 """
 
 import inspect
+from types import SimpleNamespace
 
 import pytest
+
+# This file is part of the explicit Apple-Silicon lane, but the ordinary Linux
+# shard discovers every test module before marker deselection.  Skip before any
+# vendored import can transitively import ``mlx.core``.
+pytest.importorskip("mlx")
+pytest.importorskip("mlx_vlm")
+pytestmark = pytest.mark.requires_mlx
 
 import rapid_mlx.models.mlx_vlm_vendored.cache as vendored_cache
 import rapid_mlx.models.mlx_vlm_vendored.fp8 as vendored_fp8
@@ -42,15 +54,137 @@ import rapid_mlx.models.mlx_vlm_vendored.speculative.dflash as vs_dflash
 import rapid_mlx.models.mlx_vlm_vendored.speculative.mtp as vs_mtp
 import rapid_mlx.models.mlx_vlm_vendored.speculative.utils as vs_utils
 
-pytest.importorskip("mlx_vlm")
-
-
 # Documented behavioral hunks, specified EXACTLY: applying each
 # (vendored → upstream) replacement to the vendored body must reproduce
 # the pinned upstream body byte-for-byte; any other edit inside the
 # function diverges. Each hunk is inventoried in the package
 # ``__init__.py`` and behavior-tested in this module.
 _HUNK_SPECS = {
+    "_RotatingCacheTransaction": (
+        (
+            "        # VENDOR-DEVIATION(dual-namespace): transactions may wrap caches\n"
+            "        # returned by either the vendored fallback or a pinned model.\n"
+            "        if len(set(lengths)) > 1 and not isinstance(\n"
+            "            self.cache, (BatchRotatingKVCache, UpstreamBatchRotatingKVCache)\n"
+            "        ):\n",
+            "        if len(set(lengths)) > 1 and not isinstance(self.cache, BatchRotatingKVCache):\n",
+        ),
+    ),
+    "iter_leaf_caches": (
+        (
+            "        # VENDOR-DEVIATION(dual-namespace): pinned model-owned cache trees use\n"
+            "        # the upstream container while fallback trees use the vendored one.\n"
+            "        if isinstance(cache, (CacheList, UpstreamCacheList)):\n",
+            "        if isinstance(cache, CacheList):\n",
+        ),
+    ),
+    "start_speculative_cache": (
+        (
+            "            # VENDOR-DEVIATION(dual-namespace): a pinned model's make_cache()\n"
+            "            # returns upstream rotating caches, which need the same replay\n"
+            "            # transaction as vendored fallbacks after a partial acceptance.\n"
+            "            if isinstance(\n"
+            "                cache,\n"
+            "                (\n"
+            "                    RotatingKVCache,\n"
+            "                    BatchRotatingKVCache,\n"
+            "                    UpstreamRotatingKVCache,\n"
+            "                    UpstreamBatchRotatingKVCache,\n"
+            "                ),\n"
+            "            ):\n",
+            "            if isinstance(cache, (RotatingKVCache, BatchRotatingKVCache)):\n",
+        ),
+    ),
+    "rollback_speculative_cache": (
+        (
+            "    # VENDOR-DEVIATION(dual-namespace): still-upstream target hooks can start\n"
+            "    # and return their coordinator's transaction around model-owned caches.\n"
+            "    if isinstance(\n"
+            "        transaction,\n"
+            "        (SpeculativeCacheTransaction, UpstreamSpeculativeCacheTransaction),\n"
+            "    ):\n",
+            "    if isinstance(transaction, SpeculativeCacheTransaction):\n",
+        ),
+    ),
+    "abort_speculative_round": (
+        (
+            "    # VENDOR-DEVIATION(dual-namespace): finalize transactions returned by\n"
+            "    # either vendored fallback verification or a still-upstream target hook.\n"
+            "    if isinstance(\n"
+            "        state,\n"
+            "        (SpeculativeCacheTransaction, UpstreamSpeculativeCacheTransaction),\n"
+            "    ):\n",
+            "    if isinstance(state, SpeculativeCacheTransaction):\n",
+        ),
+    ),
+    "commit_speculative_round": (
+        (
+            "    # VENDOR-DEVIATION(dual-namespace): Qwen4/Qwen3.5-style upstream hooks\n"
+            "    # return their own transaction class. Commit it directly instead of\n"
+            "    # falling through to an optional legacy model rollback method.\n"
+            "    if isinstance(\n"
+            "        state,\n"
+            "        (SpeculativeCacheTransaction, UpstreamSpeculativeCacheTransaction),\n"
+            "    ):\n",
+            "    if isinstance(state, SpeculativeCacheTransaction):\n",
+        ),
+    ),
+    "_mtp_shared_kv_from_prompt_cache": (
+        (
+            "            # VENDOR-DEVIATION(dual-namespace): preserve temporal ordering for\n"
+            "            # rotating caches produced by either cache namespace.\n"
+            "            isinstance(\n"
+            "                layer_cache,\n"
+            "                (cache.RotatingKVCache, upstream_cache.RotatingKVCache),\n"
+            "            )\n"
+            "            and not isinstance(\n"
+            "                layer_cache,\n"
+            "                (\n"
+            "                    cache.BufferedRotatingKVCache,\n"
+            "                    upstream_cache.BufferedRotatingKVCache,\n"
+            "                ),\n"
+            "            )\n",
+            "            isinstance(layer_cache, cache.RotatingKVCache)\n"
+            "            and not isinstance(layer_cache, cache.BufferedRotatingKVCache)\n",
+        ),
+    ),
+    "_buffer_mtp_target_cache": (
+        (
+            "        # VENDOR-DEVIATION(dual-namespace): recurse through both model-owned\n"
+            "        # upstream trees and vendored fallback trees.\n"
+            "        if isinstance(entry, (cache.CacheList, upstream_cache.CacheList)):\n",
+            "        if isinstance(entry, cache.CacheList):\n",
+        ),
+        (
+            "        if isinstance(\n"
+            "            entry,\n"
+            "            (\n"
+            "                cache.BufferedRotatingKVCache,\n"
+            "                upstream_cache.BufferedRotatingKVCache,\n"
+            "            ),\n"
+            "        ):\n",
+            "        if isinstance(entry, cache.BufferedRotatingKVCache):\n",
+        ),
+        (
+            "            isinstance(\n"
+            "                entry,\n"
+            "                (cache.RotatingKVCache, upstream_cache.RotatingKVCache),\n"
+            "            )\n"
+            '            and getattr(entry, "keep", 0) == 0\n',
+            '            isinstance(entry, cache.RotatingKVCache) and getattr(entry, "keep", 0) == 0\n',
+        ),
+        (
+            "            # Keep the replacement in the producer's namespace; downstream\n"
+            "            # model code can use exact-type dispatch for its cache classes.\n"
+            "            namespace = (\n"
+            "                upstream_cache\n"
+            "                if isinstance(entry, upstream_cache.RotatingKVCache)\n"
+            "                else cache\n"
+            "            )\n"
+            "            return namespace.BufferedRotatingKVCache.from_cache(\n",
+            "            return cache.BufferedRotatingKVCache.from_cache(\n",
+        ),
+    ),
     "build_ddtree": (
         (
             "    # VENDOR-DEVIATION(bugfix): pinned upstream validates with ``assert``,\n"
@@ -62,6 +196,88 @@ _HUNK_SPECS = {
             '            f"shape {tuple(drafter_logits.shape)}"\n'
             "        )\n",
             "    assert drafter_logits.ndim == 3 and drafter_logits.shape[0] == 1\n",
+        ),
+    ),
+    "install_auto_processor_patch": (
+        (
+            "            # VENDOR-DEVIATION(security): discovering a matching remote model\n"
+            "            # type is not consent to execute repository code. Only intercept\n"
+            "            # after the caller explicitly opts in.\n"
+            "            if (\n"
+            "                model_type in target_model_types\n"
+            '                and kwargs.get("trust_remote_code") is True\n'
+            "            ):\n",
+            "            if model_type in target_model_types:\n"
+            '                kwargs.setdefault("trust_remote_code", True)\n',
+        ),
+    ),
+    "_mtp_verify_without_logits": (
+        (
+            '    layers = getattr(getattr(lm, "model", None), "layers", [])\n'
+            "    if len(prompt_cache) == len(layers):\n"
+            "        # VENDOR-DEVIATION(bugfix): the hook-less fallback must participate in\n"
+            "        # the same cache transaction as every other speculative verifier.\n"
+            "        transaction = start_speculative_cache(prompt_cache, verify_input.shape[1])\n"
+            "        try:\n"
+            "            hidden = lm.model(\n"
+            "                verify_input,\n"
+            "                cache=prompt_cache,\n"
+            "                skip_final_norm=True,\n"
+            "            )\n"
+            "            shared_kv_states = _mtp_shared_kv_from_prompt_cache(lm, prompt_cache)\n"
+            "            if shared_kv_states:\n"
+            "                return _MTPVerifyResult(\n"
+            "                    hidden=hidden,\n"
+            "                    shared_kv_states=shared_kv_states,\n"
+            "                    rollback_state=transaction,\n"
+            "                )\n"
+            "        except BaseException:\n"
+            "            transaction.abort()\n"
+            "            raise\n"
+            "        # The sink retry must not append the same verifier block a second time.\n"
+            "        transaction.abort()\n"
+            "\n"
+            "    shared_kv_sink: dict = {}\n"
+            "    transaction = start_speculative_cache(prompt_cache, verify_input.shape[1])\n"
+            "    try:\n"
+            "        hidden = lm.model(\n"
+            "            verify_input,\n"
+            "            cache=prompt_cache,\n"
+            "            shared_kv_sink=shared_kv_sink,\n"
+            "            skip_final_norm=True,\n"
+            "        )\n"
+            "    except BaseException:\n"
+            "        transaction.abort()\n"
+            "        raise\n"
+            "    if not shared_kv_sink:\n"
+            "        transaction.abort()\n"
+            "        return None\n"
+            "    return _MTPVerifyResult(\n"
+            "        hidden=hidden,\n"
+            "        shared_kv_states=shared_kv_sink,\n"
+            "        rollback_state=transaction,\n"
+            "    )\n",
+            '    layers = getattr(getattr(lm, "model", None), "layers", [])\n'
+            "    if len(prompt_cache) == len(layers):\n"
+            "        hidden = lm.model(\n"
+            "            verify_input,\n"
+            "            cache=prompt_cache,\n"
+            "            skip_final_norm=True,\n"
+            "        )\n"
+            "        shared_kv_states = _mtp_shared_kv_from_prompt_cache(lm, prompt_cache)\n"
+            "        if shared_kv_states:\n"
+            "            return _MTPVerifyResult(hidden=hidden, shared_kv_states=shared_kv_states)\n"
+            "\n"
+            "    shared_kv_sink: dict = {}\n"
+            "    hidden = lm.model(\n"
+            "        verify_input,\n"
+            "        cache=prompt_cache,\n"
+            "        shared_kv_sink=shared_kv_sink,\n"
+            "        skip_final_norm=True,\n"
+            "    )\n"
+            "    if not shared_kv_sink:\n"
+            "        return None\n"
+            "    return _MTPVerifyResult(hidden=hidden, shared_kv_states=shared_kv_sink)\n",
         ),
     ),
     "_speculative_walk_batch_uniform_acceptance": (
@@ -408,20 +624,137 @@ def test_vendored_foundations_bodies_match_upstream():
             {"dequantize_model"},
         ),
     ):
-        divergences = _body_divergences(vendored, upstream, normalized=normalized)
+        divergences = _body_divergences(
+            vendored,
+            upstream,
+            hunk_specs=_HUNK_SPECS,
+            normalized=normalized,
+        )
         divergences = [d for d in divergences if d not in documented]
         assert divergences == []
 
 
 def test_speculative_core_binds_vendored_foundations():
+    from mlx_vlm.models import cache as upstream_cache
+    from mlx_vlm.speculative import cache_state as upstream_cache_state
+
     assert vs_mtp.cache is vendored_cache
+    assert vs_mtp.upstream_cache is upstream_cache
     assert vs_cache_state.BatchRotatingKVCache is (vendored_cache.BatchRotatingKVCache)
     assert vs_cache_state.RotatingKVCache is vendored_cache.RotatingKVCache
+    assert vs_cache_state.UpstreamBatchRotatingKVCache is (
+        upstream_cache.BatchRotatingKVCache
+    )
+    assert vs_cache_state.UpstreamRotatingKVCache is upstream_cache.RotatingKVCache
+    assert vs_cache_state.UpstreamSpeculativeCacheTransaction is (
+        upstream_cache_state.SpeculativeCacheTransaction
+    )
     assert vs_common.LanguageModelOutput is vendored_base.LanguageModelOutput
     assert vs_utils._dflash_rounds.__module__.endswith("vendored.speculative.dflash")
     assert vs_utils.get_speculative_rounds_batch("mtp").__module__.endswith(
         "vendored.speculative.mtp"
     )
+
+
+def test_speculative_core_preserves_upstream_model_cache_namespace():
+    """Pinned model caches must get the same rotating replay and buffering
+    behavior as vendored fallback caches, without changing their namespace."""
+    import mlx.core as mx
+    from mlx_vlm.models import cache as upstream_cache
+
+    rotating = upstream_cache.RotatingKVCache(max_size=4)
+    initial = mx.array([[[[0.0], [1.0], [2.0], [3.0]]]])
+    rotating.update_and_fetch(initial, initial)
+    tree = upstream_cache.CacheList(rotating)
+
+    assert list(vs_cache_state.iter_leaf_caches([tree])) == [rotating]
+    transaction = vs_cache_state.start_speculative_cache([tree], length=3)
+    assert id(rotating) in transaction._rotating
+
+    speculative = mx.array([[[[4.0], [5.0], [6.0]]]])
+    rotating.update_and_fetch(speculative, speculative)
+    transaction.commit([1])
+
+    # Only the first verifier token is retained. Restoring and replaying is
+    # essential here: a simple cursor trim cannot recover the ring entries
+    # overwritten by the rejected tokens.
+    assert rotating.offset == 5
+    ordered = rotating._temporal_order(rotating.keys)
+    assert ordered.reshape(-1).tolist() == [1.0, 2.0, 3.0, 4.0]
+
+    lm = SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(layer_type="attention")])
+    )
+    shared = vs_mtp._mtp_shared_kv_from_prompt_cache(lm, [rotating])
+    assert shared["attention"][0].reshape(-1).tolist() == [1.0, 2.0, 3.0, 4.0]
+
+    prompt_cache = [upstream_cache.CacheList(upstream_cache.RotatingKVCache(8))]
+    draft_model = SimpleNamespace(config=SimpleNamespace(block_size=4))
+    vs_mtp._buffer_mtp_target_cache(prompt_cache, draft_model, draft_block_size=4)
+    buffered = prompt_cache[0].caches[0]
+    assert type(buffered) is upstream_cache.BufferedRotatingKVCache
+
+    batch = upstream_cache.BatchRotatingKVCache(max_size=8, left_padding=[0, 0])
+    batch_transaction = vs_cache_state._RotatingCacheTransaction(batch)
+    batch_transaction.validate([1, 2])
+    batch_transaction.abort()
+
+
+def test_speculative_core_finalizes_upstream_model_transactions():
+    """Model hooks still imported from mlx-vlm return their namespace's
+    transaction object; vendored ownership must commit or abort it directly."""
+    from mlx_vlm.speculative import cache_state as upstream_cache_state
+
+    class NoLegacyRollback:
+        def rollback_speculative_cache(self, *_args):
+            raise AssertionError("upstream transaction used legacy rollback")
+
+    model = NoLegacyRollback()
+
+    partial = upstream_cache_state.SpeculativeCacheTransaction([], {}, [], length=3)
+    vs_cache_state.commit_speculative_round(
+        model, [], partial, accepted=0, block_size=3
+    )
+    assert partial.active is False
+
+    complete = upstream_cache_state.SpeculativeCacheTransaction([], {}, [], length=3)
+    vs_cache_state.commit_speculative_round(
+        model, [], complete, accepted=2, block_size=3
+    )
+    assert complete.active is False
+
+    aborted = upstream_cache_state.SpeculativeCacheTransaction([], {}, [], length=3)
+    vs_cache_state.abort_speculative_round(aborted)
+    assert aborted.active is False
+
+
+def test_vendored_auto_processor_patch_requires_explicit_remote_code_opt_in(
+    monkeypatch, tmp_path
+):
+    from transformers import AutoProcessor
+
+    (tmp_path / "config.json").write_text('{"model_type":"glm5_next"}')
+    calls = []
+
+    def previous(cls, path, **kwargs):
+        calls.append(("previous", path, kwargs))
+        return "previous"
+
+    class Processor:
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            calls.append(("custom", path, kwargs))
+            return "custom"
+
+    monkeypatch.setattr(AutoProcessor, "from_pretrained", classmethod(previous))
+    vendored_base.install_auto_processor_patch("glm5_next", Processor)
+
+    assert AutoProcessor.from_pretrained(tmp_path) == "previous"
+    assert (
+        AutoProcessor.from_pretrained(tmp_path, trust_remote_code=False) == "previous"
+    )
+    assert AutoProcessor.from_pretrained(tmp_path, trust_remote_code=True) == "custom"
+    assert [kind for kind, _, _ in calls] == ["previous", "previous", "custom"]
 
 
 def test_pinned_redirects_resolve_upstream():
@@ -553,3 +886,103 @@ def test_uniform_acceptance_clamps_over_positive_budgets():
     )
     assert out_accepted == [0, 0]
     assert out_tokens == [[], []]
+
+
+def test_hookless_mtp_verify_aborts_before_sink_retry(monkeypatch):
+    """The hook-less verifier retries with a shared-KV sink only after
+    rolling back its first forward, and returns the second transaction to the
+    speculative-round owner."""
+    mx = pytest.importorskip("mlx.core")
+
+    class _Cache:
+        def __init__(self):
+            self.offset = 0
+
+        def update_and_fetch(self, keys, values):
+            self.offset += keys.shape[2]
+            return keys, values
+
+        def trim(self, count):
+            self.offset -= count
+
+    class _Model:
+        layers = [SimpleNamespace(layer_type="attention")]
+
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(
+            self,
+            inputs,
+            *,
+            cache,
+            shared_kv_sink=None,
+            skip_final_norm=False,
+        ):
+            self.calls += 1
+            width = inputs.shape[1]
+            kv = mx.zeros((1, 1, width, 2))
+            cache[0].update_and_fetch(kv, kv)
+            if shared_kv_sink is not None:
+                shared_kv_sink["attention"] = (kv, kv)
+            return mx.zeros((1, width, 4))
+
+    model = _Model()
+    lm = SimpleNamespace(model=model)
+    prompt_cache = [_Cache()]
+    width = vs_common.DECODE_BLOCK_SIZE + 1
+    result = vs_mtp._mtp_verify_without_logits(
+        lm,
+        mx.zeros((1, width), dtype=mx.int32),
+        prompt_cache,
+    )
+
+    assert result is not None
+    assert model.calls == 2
+    assert prompt_cache[0].offset == width
+    assert result.rollback_state.active is True
+    result.abort()
+    assert prompt_cache[0].offset == 0
+
+    def fail_shared_kv(*_args):
+        raise RuntimeError("bad shared KV")
+
+    monkeypatch.setattr(vs_mtp, "_mtp_shared_kv_from_prompt_cache", fail_shared_kv)
+    with pytest.raises(RuntimeError, match="bad shared KV"):
+        vs_mtp._mtp_verify_without_logits(
+            lm,
+            mx.zeros((1, width), dtype=mx.int32),
+            prompt_cache,
+        )
+    assert model.calls == 3
+    assert prompt_cache[0].offset == 0
+
+
+def test_server_singleton_dflash_threads_nonzero_row_identity(monkeypatch):
+    """The server coordinator owns stable request row IDs. The separate
+    ``run_speculative_rounds`` helper serves standalone generation, whose sole
+    request intentionally owns row zero."""
+    mx = pytest.importorskip("mlx.core")
+    captured = {}
+
+    def fake_rounds(*_args, **kwargs):
+        captured["row_id"] = kwargs.get("row_id")
+        yield 9, None
+
+    monkeypatch.setattr(vs_utils, "_dflash_rounds", fake_rounds)
+    output = list(
+        vs_utils.run_speculative_server_rounds(
+            SimpleNamespace(),
+            SimpleNamespace(requires_greedy_sampling=False),
+            [],
+            mx.zeros((1, 1, 1)),
+            draft_kind="dflash",
+            first_bonus=mx.array([7]),
+            max_tokens=2,
+            sampler=lambda logits: logits,
+            row_ids=[41],
+        )
+    )
+
+    assert output == [([9], None)]
+    assert captured["row_id"] == 41

@@ -48,7 +48,7 @@ def _weight_map(model_path: Path) -> Dict[str, str]:
         return {}
     with open(index_path) as f:
         index = json.load(f)
-    # Rapid upstream-bugfix (documented deviation): pinned 0.7.1 assumes
+    # Rapid upstream-bugfix (documented deviation): pinned 0.7.2 assumes
     # both the index document and ``weight_map`` are objects; a malformed
     # index crashed with ``AttributeError`` instead of a clear error.
     weight_map = index.get("weight_map") if isinstance(index, dict) else None
@@ -170,9 +170,11 @@ class MTPSplitter:
         # descriptor pinned by ``iter_selected`` so the weight read cannot
         # be redirected by a concurrent path swap; the direct path is kept
         # for callers that iterate without confinement.
-        fd = self._pinned_shard_fds.pop(file, None) if getattr(
-            self, "_pinned_shard_fds", None
-        ) else None
+        fd = (
+            self._pinned_shard_fds.pop(file, None)
+            if getattr(self, "_pinned_shard_fds", None)
+            else None
+        )
         if fd is not None:
             with os.fdopen(fd, "rb") as f:
                 shard = mx.load(f, format="safetensors")
@@ -334,12 +336,9 @@ class MTPSplitter:
         allowed_roots = _allowed_checkpoint_roots(source_path)
         for file in _safetensor_files(source_path):
             resolved_file = file.resolve()
-            if not any(
-                resolved_file.is_relative_to(root) for root in allowed_roots
-            ):
+            if not any(resolved_file.is_relative_to(root) for root in allowed_roots):
                 raise ValueError(
-                    "safetensors shard escapes the checkpoint directory: "
-                    f"{file.name!r}"
+                    f"safetensors shard escapes the checkpoint directory: {file.name!r}"
                 )
             fd = _open_confined(
                 resolved_file, _containing_root(resolved_file, allowed_roots)
@@ -399,7 +398,7 @@ class MTPSplitter:
         if output_path.resolve() == source_path.resolve():
             raise ValueError("output must differ from the source checkpoint")
 
-        # Rapid upstream-bugfix (documented deviation): pinned 0.7.1 writes
+        # Rapid upstream-bugfix (documented deviation): pinned 0.7.2 writes
         # directly into the destination, so a pre-existing directory keeps
         # stale tokenizer files and a failure after the weight save leaves
         # new weights paired with an old config.json. Build the complete
@@ -416,7 +415,7 @@ class MTPSplitter:
         )
         try:
             selected: Dict[str, mx.array] = {}
-            # Rapid upstream-bugfix (documented deviation): pinned 0.7.1
+            # Rapid upstream-bugfix (documented deviation): pinned 0.7.2
             # took the MLX-source path when ANY selected shard carried MLX
             # metadata, so a mixed-format sharded checkpoint skipped
             # sanitization for every shard; require a uniform format.
@@ -480,7 +479,9 @@ class MTPSplitter:
                 "text_config": text_config,
                 "block_size": resolved_block_size,
                 "tie_word_embeddings": bool(
-                    text_config.get("tie_word_embeddings", self.tie_word_embeddings_default)
+                    text_config.get(
+                        "tie_word_embeddings", self.tie_word_embeddings_default
+                    )
                 ),
             }
             draft_config.update(self.extra_config(text_config))
@@ -505,8 +506,7 @@ class MTPSplitter:
                 resolved = src.resolve()
                 if not any(resolved.is_relative_to(root) for root in allowed_roots):
                     raise ValueError(
-                        f"tokenizer sidecar escapes the checkpoint "
-                        f"directory: {name!r}"
+                        f"tokenizer sidecar escapes the checkpoint directory: {name!r}"
                     )
                 # Copy through a no-follow-opened descriptor so the bytes
                 # read are the pinned file's, not whatever the path
@@ -514,7 +514,10 @@ class MTPSplitter:
                 src_fd = _open_confined(
                     resolved, _containing_root(resolved, allowed_roots)
                 )
-                with os.fdopen(src_fd, "rb") as fsrc, open(staging / name, "wb") as fdst:
+                with (
+                    os.fdopen(src_fd, "rb") as fsrc,
+                    open(staging / name, "wb") as fdst,
+                ):
                     shutil.copyfileobj(fsrc, fdst)
 
             # Install under a per-destination advisory lock: concurrent
@@ -537,9 +540,7 @@ class MTPSplitter:
             try:
                 lock_stat = os.fstat(lock_fd)
                 if not stat_module.S_ISREG(lock_stat.st_mode):
-                    raise RuntimeError(
-                        f"split lock {lock_path} is not a regular file"
-                    )
+                    raise RuntimeError(f"split lock {lock_path} is not a regular file")
                 if lock_stat.st_uid != os.getuid():
                     raise RuntimeError(
                         f"split lock {lock_path} is not owned by the current user"

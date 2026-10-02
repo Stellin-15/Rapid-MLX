@@ -21,6 +21,10 @@ from ..kv_quant import from_legacy as kv_quant_from_legacy
 # VENDOR-DEVIATION(redirect): vendored cache lives at the package root.
 from .. import cache
 
+# VENDOR-DEVIATION(dual-namespace): model implementations remain pinned
+# upstream during step 3a and their make_cache() methods return these classes.
+from mlx_vlm.models import cache as upstream_cache
+
 # VENDOR-DEVIATION(redirect): prompt_utils templating stays on the pinned
 # upstream dependency (design doc step-2 boundary).
 from mlx_vlm.prompt_utils import apply_chat_template
@@ -77,18 +81,18 @@ from .types import GenerateKwargs, ProcessorLike, Unpack
 logger = logging.getLogger("mlx_vlm.generate")
 
 DEFAULT_TOP_N_SIGMA = 0.0
-DEFAULT_BATCH_CACHE_EVAL_INTERVAL = 50
+DEFAULT_CACHE_EVAL_INTERVAL = 50
 
 
 def _get_batch_cache_eval_interval() -> int:
     raw = os.environ.get("MLX_VLM_BATCH_CACHE_EVAL_INTERVAL")
     if raw is None:
-        return DEFAULT_BATCH_CACHE_EVAL_INTERVAL
+        return DEFAULT_CACHE_EVAL_INTERVAL
     try:
         return max(0, int(raw))
     except ValueError:
         logger.warning("Ignoring invalid MLX_VLM_BATCH_CACHE_EVAL_INTERVAL=%r", raw)
-        return DEFAULT_BATCH_CACHE_EVAL_INTERVAL
+        return DEFAULT_CACHE_EVAL_INTERVAL
 
 
 def _position_seed(seed: int, row_id: int, position: int) -> int:
@@ -180,8 +184,16 @@ class _PositionedTargetSampler:
 
 
 def _generate_module_override(name: str, fallback):
+    # VENDOR-DEVIATION(dual-namespace): the upstream package exports its own
+    # AR symbols by default. Treat only a public symbol patched away from that
+    # default as an override; otherwise keep this vendored module's fallback.
     generate_module = sys.modules.get("mlx_vlm.generate")
-    return getattr(generate_module, name, fallback) if generate_module else fallback
+    if generate_module is None:
+        return fallback
+    candidate = getattr(generate_module, name, fallback)
+    upstream_ar = sys.modules.get("mlx_vlm.generate.ar")
+    upstream_default = getattr(upstream_ar, name, None) if upstream_ar else None
+    return fallback if candidate is upstream_default else candidate
 
 
 def normalize_resize_shape(values):
@@ -297,8 +309,13 @@ def generate_step(
           one token and a vector of log probabilities.
     """
 
+    # VENDOR-DEVIATION(dual-namespace): this function creates fallback caches
+    # from the vendored cache module.  Resolving the quantizer through the
+    # already-loaded upstream ``mlx_vlm.generate`` package silently skips
+    # those cache objects because its isinstance checks use upstream classes.
+    # Keep quantization in the same namespace as cache construction.
     quantize_cache_fn = functools.partial(
-        _generate_module_override("maybe_quantize_kv_cache", maybe_quantize_kv_cache),
+        maybe_quantize_kv_cache,
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
@@ -569,6 +586,9 @@ def generate_step(
             mx.eval(y)
         if n == max_tokens:
             break
+
+        if (n + 1) % DEFAULT_CACHE_EVAL_INTERVAL == 0:
+            mx.eval([c.state for c in prompt_cache])
 
         yield y.item(), logprobs
         if n % 256 == 0:
@@ -863,6 +883,14 @@ def _merge_prefill_prompt_kwargs(
             elif k not in merged_kwargs:
                 merged_kwargs[k] = v
     for k, vs in per_row_keys.items():
+        # VENDOR-DEVIATION(upstream-bugfix): concatenating only the rows that
+        # carry a tensor kwarg silently shifts that kwarg onto different
+        # requests.  A mixed batch cannot synthesize a generally valid value
+        # for a missing row, so fail before the model sees misaligned inputs.
+        if len(vs) != batch_size:
+            raise ValueError(
+                f"batched prompt kwarg {k!r} must be present for every row"
+            )
         merged_kwargs[k] = _concat_prompt_kwarg_rows(k, vs)
 
     return inputs_embeds, merged_kwargs
@@ -870,7 +898,9 @@ def _merge_prefill_prompt_kwargs(
 
 def _is_batch_cache_entry(entry) -> bool:
     """Return whether a cache entry already owns a batch dimension."""
-    if isinstance(entry, cache.CacheList):
+    # VENDOR-DEVIATION(dual-namespace): model-owned cache trees still use the
+    # pinned upstream cache classes during step 3a.
+    if isinstance(entry, (cache.CacheList, upstream_cache.CacheList)):
         return all(_is_batch_cache_entry(child) for child in entry.caches)
     return callable(getattr(entry, "filter", None)) and callable(
         getattr(entry, "extend", None)
@@ -889,6 +919,9 @@ def _extend_cache(cache_a, cache_b):
             ca = ca.__class__.merge([ca])
         if not _is_batch_cache_entry(cb) and hasattr(cb.__class__, "merge"):
             cb = cb.__class__.merge([cb])
+        for entry in (ca, cb):
+            if not callable(getattr(entry, "extend", None)):
+                raise ValueError(f"{type(entry)} does not yet support batching")
         ca.extend(cb)
         extended.append(ca)
     return extended
@@ -945,14 +978,36 @@ def _make_cache(
         use_turbo and quantized_kv_start > 0 and prefill_length < quantized_kv_start
     )
 
-    def _make_quant_cache(lp):
+    # VENDOR-DEVIATION(dual-namespace): model.make_cache() still returns
+    # upstream classes, while fallback construction returns vendored classes.
+    # Preserve the producer namespace for every batch cache/container we build.
+    def _cache_module(c):
+        upstream_types = (
+            upstream_cache.KVCache,
+            upstream_cache.ChunkedKVCache,
+            upstream_cache.SimpleKVCache,
+            upstream_cache.ArraysCache,
+            upstream_cache.PoolingCache,
+            upstream_cache.RotatingKVCache,
+            upstream_cache.CacheList,
+        )
+        if isinstance(c, upstream_types):
+            return upstream_cache
+        if isinstance(c, (tuple, list)):
+            for child in c:
+                namespace = _cache_module(child)
+                if namespace is upstream_cache:
+                    return namespace
+        return cache
+
+    def _make_quant_cache(lp, cache_module=cache):
         if use_turbo:
             if defer_turbo:
-                return cache.BatchKVCache(lp)
+                return cache_module.BatchKVCache(lp)
             return BatchTurboQuantKVCache(
                 lp, bits=kv_bits, key_bits=kv_key_bits, value_bits=kv_value_bits
             )
-        return cache.BatchQuantizedKVCache(
+        return cache_module.BatchQuantizedKVCache(
             lp, group_size=kv_group_size, bits=int(kv_bits)
         )
 
@@ -967,31 +1022,34 @@ def _make_cache(
                     "disable KV quantization for continuous batching"
                 )
             return c.to_batch(left_padding)
-        if isinstance(c, cache.KVCache):
+        cache_module = _cache_module(c)
+        if isinstance(c, (cache.KVCache, upstream_cache.KVCache)):
             if kv_bits is not None and quantize:
-                return _make_quant_cache(left_padding)
-            return cache.BatchKVCache(left_padding)
-        elif isinstance(c, cache.ChunkedKVCache):
+                return _make_quant_cache(left_padding, cache_module)
+            return cache_module.BatchKVCache(left_padding)
+        elif isinstance(c, (cache.ChunkedKVCache, upstream_cache.ChunkedKVCache)):
             if kv_bits is not None and quantize:
-                return _make_quant_cache(left_padding)
-            return cache.BatchKVCache(left_padding)
-        elif isinstance(c, cache.SimpleKVCache):
+                return _make_quant_cache(left_padding, cache_module)
+            return cache_module.BatchKVCache(left_padding)
+        elif isinstance(c, (cache.SimpleKVCache, upstream_cache.SimpleKVCache)):
             if kv_bits is not None and quantize:
-                return _make_quant_cache(left_padding)
-            return cache.BatchKVCache(left_padding)
-        elif isinstance(c, cache.ArraysCache):
+                return _make_quant_cache(left_padding, cache_module)
+            return cache_module.BatchKVCache(left_padding)
+        elif isinstance(c, (cache.ArraysCache, upstream_cache.ArraysCache)):
             c.left_padding = mx.array(left_padding)
             return c
-        elif isinstance(c, cache.PoolingCache):
-            return cache.BatchPoolingCache(c.ratio, left_padding)
-        elif isinstance(c, cache.RotatingKVCache):
+        elif isinstance(c, (cache.PoolingCache, upstream_cache.PoolingCache)):
+            return cache_module.BatchPoolingCache(c.ratio, left_padding)
+        elif isinstance(c, (cache.RotatingKVCache, upstream_cache.RotatingKVCache)):
             if c.keep > 0:
                 raise ValueError("RotatingKVCache with keep tokens is not supported.")
-            return cache.BatchRotatingKVCache(c.max_size, left_padding)
-        elif isinstance(c, cache.CacheList):
-            return cache.CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
+            return cache_module.BatchRotatingKVCache(c.max_size, left_padding)
+        elif isinstance(c, (cache.CacheList, upstream_cache.CacheList)):
+            return cache_module.CacheList(
+                *(to_batch_cache(sub_c) for sub_c in c.caches)
+            )
         elif isinstance(c, tuple):
-            return cache.CacheList(*(to_batch_cache(sub_c) for sub_c in c))
+            return cache_module.CacheList(*(to_batch_cache(sub_c) for sub_c in c))
         else:
             raise ValueError(f"{type(c)} does not yet support batching")
 
@@ -1937,6 +1995,13 @@ class PromptProcessingBatch:
             ):
                 self.prefill_step_size = None
 
+        if self._apc_coordinator is not None:
+            self._apc_coordinator.prepare_prefill(
+                self._prompt_tokens_per_row,
+                prefix_lengths=self._cached_tokens_per_row,
+                prefill_step_size=self.prefill_step_size,
+            )
+
     def __len__(self):
         return len(self.uids)
 
@@ -2120,6 +2185,12 @@ class PromptProcessingBatch:
         eval_targets.extend(self._finished_prompt_logits[i] for i in finished_rows)
         mx.async_eval(eval_targets)
         self._processed_prompt_columns += n
+        if self._apc_coordinator is not None:
+            self._apc_coordinator.observe_cache(
+                self.prompt_cache,
+                max(self._cached_tokens_per_row) + self._processed_prompt_columns,
+                batch_size=len(self.uids),
+            )
         self._store_apc_exact_checkpoints()
         self._inputs_embeds = self._inputs_embeds[:, n:]
         self._input_ids = self._input_ids[:, n:]
@@ -2753,6 +2824,13 @@ class BatchGenerator:
                 elif k not in merged_kwargs:
                     merged_kwargs[k] = v
         for k, vs in per_row_keys.items():
+            # VENDOR-DEVIATION(upstream-bugfix): keep the warm/cold APC path
+            # aligned with the cold-only batching contract.  Concatenating a
+            # tensor key from only some rows shifts it onto other requests.
+            if len(vs) != batch_size:
+                raise ValueError(
+                    f"batched prompt kwarg {k!r} must be present for every row"
+                )
             merged_kwargs[k] = _concat_prompt_kwarg_rows(k, vs)
 
         apc_mode = getattr(self, "apc_mode", "block")
@@ -3069,7 +3147,13 @@ class BatchGenerator:
         )
         if len(self._generation_batch) > 0:
             generation_responses = self._generation_batch.next()
-            self._gen_tokens_counter += len(generation_responses)
+            # VENDOR-DEVIATION(upstream-bugfix): speculative iterator
+            # exhaustion emits one completion-only response (token=None) per
+            # unfinished row. Those sentinels carry terminal state but no
+            # generated token and must not inflate token/TPS statistics.
+            self._gen_tokens_counter += sum(
+                response.token is not None for response in generation_responses
+            )
             self._steps_counter += 1
             if (
                 self._cache_eval_interval > 0
@@ -3129,7 +3213,10 @@ class BatchGenerator:
             sequences = self._unprocessed_sequences[:n]
             coordinator = getattr(self, "apc", None)
             if coordinator is not None:
-                coordinator.prepare_prefill(sum(len(s[1]) for s in sequences))
+                coordinator.prepare_prefill(
+                    [len(s[1]) for s in sequences],
+                    prefill_step_size=self.prefill_step_size,
+                )
             if logger.isEnabledFor(logging.DEBUG) and os.environ.get("APC_DEBUG"):
                 logger.warning(
                     "APC admit n=%d (pending=%d)",

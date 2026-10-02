@@ -41,7 +41,7 @@ DRAFTER_KIND_BY_MODEL_TYPE = {
     "laguna": "dflash",
     "muse_glimmer_assistant": "dflash",
     "qwen3_dspark": "dflash",
-    # Rapid upstream-bugfix (documented deviation): pinned 0.7.1 omits the
+    # Rapid upstream-bugfix (documented deviation): pinned 0.7.2 omits the
     # served DFlash families' model types, so an explicit wrong --draft-kind
     # (e.g. "mtp") dispatched them through the wrong round loop instead of
     # being overridden here.
@@ -211,7 +211,7 @@ def _read_drafter_config(model_path) -> dict:
             config = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {}
-    # Rapid upstream-bugfix (documented deviation): pinned 0.7.1 returns
+    # Rapid upstream-bugfix (documented deviation): pinned 0.7.2 returns
     # any decoded JSON value; a non-object config crashes resolve_drafter_kind
     # on config.get(). Degrade to the documented empty-dict contract.
     return config if isinstance(config, dict) else {}
@@ -299,7 +299,7 @@ def resolve_drafter_kind(model_path, kind: Optional[str] = None) -> str:
     """
     config = _read_drafter_config(model_path)
     # Rapid upstream-bugfix (documented deviation): resolve against the
-    # normalized model type — pinned 0.7.1 examined the raw backbone type,
+    # normalized model type — pinned 0.7.2 examined the raw backbone type,
     # so an explicit wrong --draft-kind (e.g. "mtp") on a backbone-declared
     # sidecar was returned unchanged and dispatched the DFlash drafter
     # through the MTP loop.
@@ -368,14 +368,12 @@ def _sidecar_weight_shards(path) -> Iterator[int]:
         shard = Path(name)
         if shard.is_absolute() or ".." in shard.parts:
             raise ValueError(
-                f"safetensors index entry escapes the checkpoint "
-                f"directory: {name!r}"
+                f"safetensors index entry escapes the checkpoint directory: {name!r}"
             )
         resolved_shard = (path / shard).resolve()
         if not any(resolved_shard.is_relative_to(root) for root in allowed_roots):
             raise ValueError(
-                f"safetensors index entry escapes the checkpoint "
-                f"directory: {name!r}"
+                f"safetensors index entry escapes the checkpoint directory: {name!r}"
             )
         yield _open_confined(
             resolved_shard, _containing_root(resolved_shard, allowed_roots)
@@ -419,9 +417,7 @@ def load_drafter(
                 "sidecar loading does not support loader options: "
                 + ", ".join(sorted(kwargs))
             )
-        quantization = config.get("quantization") or config.get(
-            "quantization_config"
-        )
+        quantization = config.get("quantization") or config.get("quantization_config")
         if quantization is not None:
             # Validate before constructing the model: malformed or legacy
             # metadata must fail with an actionable error, not an opaque
@@ -432,9 +428,7 @@ def load_drafter(
                     f"got {type(quantization).__name__}"
                 )
             missing = [
-                field
-                for field in ("group_size", "bits")
-                if field not in quantization
+                field for field in ("group_size", "bits") if field not in quantization
             ]
             if missing:
                 raise ValueError(
@@ -457,8 +451,9 @@ def load_drafter(
                 group_size=quantization["group_size"],
                 bits=quantization["bits"],
                 mode=quantization.get("mode", "affine"),
-                class_predicate=lambda p, m: f"{p}.scales" in weights
-                and hasattr(m, "to_quantized"),
+                class_predicate=lambda p, m: (
+                    f"{p}.scales" in weights and hasattr(m, "to_quantized")
+                ),
             )
         family_model.load_weights(list(weights.items()), strict=True)
         mx.eval(family_model.parameters())
