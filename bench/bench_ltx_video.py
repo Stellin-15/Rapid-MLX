@@ -547,6 +547,70 @@ def annotate_step_boundaries(step_events: list[dict[str, Any]]) -> None:
             current["stage_transition_s"] = gap
 
 
+def _wait_for_process_group_exit(process_group_id: int, timeout: float = 10) -> bool:
+    """Observe group exit without signaling an identity that may be reused."""
+    deadline_ns = time.monotonic_ns() + int(timeout * 1e9)
+    while True:
+        try:
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            return True
+        if time.monotonic_ns() >= deadline_ns:
+            return False
+        time.sleep(0.2)
+
+
+def _terminate_process_group(
+    process: subprocess.Popen[str],
+    events: list[dict[str, Any]],
+    started_ns: int,
+) -> bool:
+    """Stop a worker group without signaling a PGID after its leader is reaped."""
+    process_group_id = process.pid
+    if process.poll() is not None:
+        # Once the leader is reaped, its numeric PID/PGID can be reused between
+        # an existence probe and a later signal. Only observe bounded cleanup;
+        # never signal that unpinned numeric identity again.
+        return _wait_for_process_group_exit(process_group_id)
+
+    try:
+        # poll() above confirmed the leader was not reaped. Even if it exits
+        # before this call, the unreaped PID pins the numeric group identity.
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            return False
+        return _wait_for_process_group_exit(process_group_id)
+
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        # wait() timed out without reaping the leader, so its PID still pins
+        # this process-group identity and escalation cannot target a reused
+        # unrelated group.
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            events.append(
+                {
+                    "kind": "cleanup_failed",
+                    "observed_elapsed_s": (time.monotonic_ns() - started_ns) / 1e9,
+                }
+            )
+            return False
+
+    # The leader is now reaped. The initial group-wide signal should also end
+    # inherited descendants; only probe for that result because a later signal
+    # could race PGID reuse.
+    return _wait_for_process_group_exit(process_group_id)
+
+
 def _run_once(args: argparse.Namespace, run_index: int) -> dict[str, Any]:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -717,81 +781,13 @@ def _run_once(args: argparse.Namespace, run_index: int) -> dict[str, Any]:
 
     def _terminate_worker() -> bool:
         # A controller exception (Ctrl-C, probe failure) must never orphan the
-        # worker's process group: descendants that inherited the group can
-        # outlive the direct child while holding the GPU. Attempt group
-        # termination even after the child itself has exited. POSIX only
-        # reuses a PGID after the whole group dies: a surviving group under
-        # this PGID is provably ours, and a vanished one makes killpg raise.
+        # worker's process group. Once the leader has been reaped, however, its
+        # numeric PGID is no longer a stable identity and must not be signaled.
         nonlocal terminated
         if terminated:
             return True
-        if process.poll() is not None:
-            # The leader was reaped, but POSIX only reuses a PGID after the
-            # whole group dies. So a group that still exists under this PGID
-            # is provably ours (surviving descendants), and signaling it is
-            # safe; a vanished group makes killpg raise and we are done.
-            try:
-                os.killpg(process.pid, 0)
-            except ProcessLookupError:
-                terminated = True
-                return True
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            # The worker exited between the last poll() and termination:
-            # still reap it so no zombie survives and returncode is set.
-            terminated = True
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                pass
-            return True
         terminated = True
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            pass
-        # Descendants that inherited the group can outlive the reaped direct
-        # child while holding the GPU: escalate only once the whole group is
-        # gone (killpg(pid, 0) probes group existence).
-        deadline_ns = time.monotonic_ns() + int(10 * 1e9)
-        while time.monotonic_ns() < deadline_ns:
-            try:
-                os.killpg(process.pid, 0)
-            except ProcessLookupError:
-                return True
-            time.sleep(0.2)
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return True
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            events.append(
-                {
-                    "kind": "cleanup_failed",
-                    "observed_elapsed_s": (time.monotonic_ns() - started_ns) / 1e9,
-                }
-            )
-            return False
-        # SIGKILL reaped the leader, but descendants can keep the group —
-        # and its GPU allocations — alive: probe until a bounded deadline.
-        deadline_ns = time.monotonic_ns() + int(10 * 1e9)
-        while time.monotonic_ns() < deadline_ns:
-            try:
-                os.killpg(process.pid, 0)
-            except ProcessLookupError:
-                return True
-            time.sleep(0.2)
-        events.append(
-            {
-                "kind": "cleanup_failed",
-                "observed_elapsed_s": (time.monotonic_ns() - started_ns) / 1e9,
-            }
-        )
-        return False
-        return True
+        return _terminate_process_group(process, events, started_ns)
 
     try:
         while process.poll() is None:

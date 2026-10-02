@@ -695,6 +695,37 @@ def test_run_deadline_terminates_wedged_worker(monkeypatch, tmp_path) -> None:
     assert killed == [MODULE.signal.SIGTERM, MODULE.signal.SIGKILL]
 
 
+def test_reaped_leader_never_signals_stale_process_group(monkeypatch) -> None:
+    class ReapedProcess:
+        pid = 4242
+        returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+    signals: list[object] = []
+    probes = 0
+
+    def fake_killpg(pid, sig):
+        nonlocal probes
+        assert pid == 4242
+        if sig != 0:
+            signals.append(sig)
+            return
+        probes += 1
+        if probes > 1:
+            raise ProcessLookupError
+
+    clock = iter((0, 1, 2))
+    monkeypatch.setattr(MODULE.os, "killpg", fake_killpg)
+    monkeypatch.setattr(MODULE.time, "monotonic_ns", lambda: next(clock) * int(1e9))
+    monkeypatch.setattr(MODULE.time, "sleep", lambda _seconds: None)
+
+    assert MODULE._terminate_process_group(ReapedProcess(), [], 0) is True
+    assert probes == 2
+    assert signals == []
+
+
 def test_model_snapshot_pins_hf_layouts_and_rejects_bare_dirs(
     monkeypatch, tmp_path
 ) -> None:
