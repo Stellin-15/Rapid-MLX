@@ -173,16 +173,18 @@ def _fake_mlx_vlm_modules(monkeypatch, drafter, kind: str = "mtp") -> None:
     utils = ModuleType("mlx_vlm.utils")
     utils.get_model_path = lambda repo, revision: f"/{repo}@{revision}"
     utils.load_model = lambda repo, **kwargs: drafter
-    # The registry is vendored (step 3c): the fake drafter must enter
-    # through the registry's own load_drafter seam.
-    from rapid_mlx.models.mlx_vlm_vendored.speculative import (
-        drafters as vendored_registry,
+    # The registry is vendored (step 3c): install the fake at that exact
+    # import seam. Do not import the real registry here: its MLX-backed
+    # model modules are intentionally unavailable in Linux no-MLX CI.
+    vendored_registry = ModuleType(
+        "rapid_mlx.models.mlx_vlm_vendored.speculative.drafters"
     )
-
-    monkeypatch.setattr(
+    vendored_registry.__path__ = []
+    vendored_registry.load_drafter = lambda source, kind: (drafter, kind)
+    monkeypatch.setitem(
+        sys.modules,
+        "rapid_mlx.models.mlx_vlm_vendored.speculative.drafters",
         vendored_registry,
-        "load_drafter",
-        lambda source, kind: (drafter, kind),
     )
     monkeypatch.setitem(sys.modules, "mlx_vlm", root)
     monkeypatch.setitem(sys.modules, "mlx_vlm.speculative", speculative)
@@ -924,6 +926,8 @@ def test_glm_adapter_reaches_products_of_the_pinned_loader(monkeypatch, tmp_path
     class object is read from the pinned drafter package at construction.
     """
     import json as _json
+
+    pytest.importorskip("mlx.core")
 
     from rapid_mlx.speculative.native_mtp import glm5_compat
 

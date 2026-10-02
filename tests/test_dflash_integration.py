@@ -2703,11 +2703,10 @@ def test_load_runtime_fails_closed_on_algorithm_mismatch(monkeypatch) -> None:
     import types
     from types import SimpleNamespace
 
-    from rapid_mlx.models.mlx_vlm_vendored.speculative import (
-        drafters as vendored_drafters,
-    )
     from rapid_mlx.speculative.dflash import runtime as runtime_module
 
+    fake_root = types.ModuleType("mlx_vlm")
+    fake_root.__path__ = []
     fake_speculative = types.ModuleType("mlx_vlm.speculative")
     fake_drafters = types.ModuleType("mlx_vlm.speculative.drafters")
     load_drafter = lambda _repo, kind: (
@@ -2715,9 +2714,19 @@ def test_load_runtime_fails_closed_on_algorithm_mismatch(monkeypatch) -> None:
         kind,
     )
     fake_drafters.load_drafter = load_drafter
-    monkeypatch.setattr(vendored_drafters, "load_drafter", load_drafter)
+    fake_vendored_drafters = types.ModuleType(
+        "rapid_mlx.models.mlx_vlm_vendored.speculative.drafters"
+    )
+    fake_vendored_drafters.__path__ = []
+    fake_vendored_drafters.load_drafter = load_drafter
+    monkeypatch.setitem(sys.modules, "mlx_vlm", fake_root)
     monkeypatch.setitem(sys.modules, "mlx_vlm.speculative", fake_speculative)
     monkeypatch.setitem(sys.modules, "mlx_vlm.speculative.drafters", fake_drafters)
+    monkeypatch.setitem(
+        sys.modules,
+        "rapid_mlx.models.mlx_vlm_vendored.speculative.drafters",
+        fake_vendored_drafters,
+    )
     monkeypatch.setattr(runtime_module, "have_runtime", lambda: True)
 
     loaded = runtime_module.load_runtime("known/drafter", expected_algorithm="dflash2")
@@ -2731,12 +2740,11 @@ def test_load_runtime_resolves_pinned_drafter_revision(monkeypatch) -> None:
     import types
     from types import SimpleNamespace
 
-    from rapid_mlx.models.mlx_vlm_vendored.speculative import (
-        drafters as vendored_drafters,
-    )
     from rapid_mlx.speculative.dflash import runtime as runtime_module
 
     calls: dict[str, object] = {}
+    fake_root = types.ModuleType("mlx_vlm")
+    fake_root.__path__ = []
     fake_speculative = types.ModuleType("mlx_vlm.speculative")
     fake_drafters = types.ModuleType("mlx_vlm.speculative.drafters")
     fake_utils = types.ModuleType("mlx_vlm.utils")
@@ -2751,10 +2759,20 @@ def test_load_runtime_resolves_pinned_drafter_revision(monkeypatch) -> None:
 
     fake_utils.get_model_path = _get_model_path
     fake_drafters.load_drafter = _load_drafter
-    monkeypatch.setattr(vendored_drafters, "load_drafter", _load_drafter)
+    fake_vendored_drafters = types.ModuleType(
+        "rapid_mlx.models.mlx_vlm_vendored.speculative.drafters"
+    )
+    fake_vendored_drafters.__path__ = []
+    fake_vendored_drafters.load_drafter = _load_drafter
+    monkeypatch.setitem(sys.modules, "mlx_vlm", fake_root)
     monkeypatch.setitem(sys.modules, "mlx_vlm.speculative", fake_speculative)
     monkeypatch.setitem(sys.modules, "mlx_vlm.speculative.drafters", fake_drafters)
     monkeypatch.setitem(sys.modules, "mlx_vlm.utils", fake_utils)
+    monkeypatch.setitem(
+        sys.modules,
+        "rapid_mlx.models.mlx_vlm_vendored.speculative.drafters",
+        fake_vendored_drafters,
+    )
     monkeypatch.setattr(runtime_module, "have_runtime", lambda: True)
 
     loaded = runtime_module.load_runtime(
