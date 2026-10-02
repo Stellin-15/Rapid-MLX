@@ -89,6 +89,13 @@ its direct-runtime `thinking_budget` field is translated to the public API's
 equivalent `reasoning_max_tokens` field and the model name is changed to the
 shipped alias; both request bodies are retained and hashed.
 
+The source checkout must be clean. The harness binds both console-script
+launches to the distributions installed in the invoking Python interpreter and
+records wrapper/interpreter hashes, rather than trusting an unrelated command
+found on `PATH`. A terminating signal unwinds through owned-process cleanup;
+forced, nonzero, premature, or listener-leaking shutdowns invalidate the
+artifact set.
+
 After a clean Rapid shutdown, the harness starts the pinned direct runtime with
 the same context, generation cap, lane, MTP, prefill, and pass-cache settings.
 It submits drafted and `draft:false` variants before stopping that server. The

@@ -12,6 +12,7 @@ Model resolution is local-only.  This program never opts into a Hub download.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
 import hashlib
 import importlib.metadata
@@ -19,6 +20,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -59,6 +61,56 @@ SENSITIVE_ENV_NAME = re.compile(
 
 class CaptureError(RuntimeError):
     """The capture contract could not be satisfied."""
+
+
+class TerminationSignalError(CaptureError):
+    """A terminating signal received while owned processes need cleanup."""
+
+    def __init__(self, signum: int) -> None:
+        self.signum = signum
+        self.exit_code = 128 + signum
+        super().__init__(f"interrupted by signal {signal.Signals(signum).name}")
+
+
+class ShutdownError(CaptureError):
+    """An owned server did not complete a clean, expected shutdown."""
+
+    def __init__(self, message: str, facts: dict[str, Any]) -> None:
+        self.facts = facts
+        super().__init__(message)
+
+
+@contextlib.contextmanager
+def termination_signal_handlers():
+    """Turn terminating signals into cleanup-aware exceptions.
+
+    The first signal unwinds through ``run_capture`` so its ``finally`` block
+    can terminate the owned server and verify the listener is gone. Further
+    terminating signals are ignored during that bounded cleanup. The caller
+    then exits with the conventional ``128 + signal`` status.
+    """
+
+    watched = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+    previous = {item: signal.getsignal(item) for item in watched}
+    handling = False
+
+    def terminate(signum: int, _frame: object) -> None:
+        nonlocal handling
+        if handling:
+            return
+        handling = True
+        for item in watched:
+            signal.signal(item, signal.SIG_IGN)
+        raise TerminationSignalError(signum)
+
+    for item in watched:
+        signal.signal(item, terminate)
+    try:
+        yield
+    finally:
+        if not handling:
+            for item, handler in previous.items():
+                signal.signal(item, handler)
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -253,6 +305,80 @@ def package_provenance(name: str) -> dict[str, Any]:
     return record
 
 
+@dataclass(frozen=True)
+class LaunchBinding:
+    command: str
+    distribution: str
+    executable: Path
+    version: str
+    entry_point: str
+    executable_sha256: str
+
+    def provenance(self) -> dict[str, Any]:
+        return {
+            "command": self.command,
+            "distribution": self.distribution,
+            "version": self.version,
+            "entry_point": self.entry_point,
+            "executable_sha256": self.executable_sha256,
+            "interpreter": Path(sys.executable).name,
+            "interpreter_sha256": sha256_bytes(Path(sys.executable).read_bytes()),
+        }
+
+
+def resolve_console_binding(command: str, distribution_name: str) -> LaunchBinding:
+    """Bind a console script to the distribution in this Python interpreter."""
+
+    executable_text = shutil.which(command)
+    if executable_text is None:
+        raise CaptureError(f"required console command is unavailable: {command}")
+    executable = Path(executable_text).resolve()
+    try:
+        distribution = importlib.metadata.distribution(distribution_name)
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise CaptureError(
+            f"required distribution is unavailable: {distribution_name}"
+        ) from exc
+    entry_points = [
+        item
+        for item in distribution.entry_points
+        if item.group == "console_scripts" and item.name == command
+    ]
+    if len(entry_points) != 1:
+        raise CaptureError(
+            f"{distribution_name} does not expose exactly one {command} console script"
+        )
+    try:
+        source = executable.read_text()
+    except (OSError, UnicodeError) as exc:
+        raise CaptureError(f"cannot inspect console command: {command}") from exc
+    first_line = source.splitlines()[0] if source else ""
+    if not first_line.startswith("#!"):
+        raise CaptureError(f"{command} console script has no interpreter shebang")
+    try:
+        shebang = shlex.split(first_line[2:])
+    except ValueError as exc:
+        raise CaptureError(f"{command} console script has an invalid shebang") from exc
+    if len(shebang) != 1 or Path(shebang[0]).resolve() != Path(sys.executable).resolve():
+        raise CaptureError(
+            f"{command} is not bound to the capture interpreter {Path(sys.executable).name}"
+        )
+    entry_point = entry_points[0]
+    expected_import = f"from {entry_point.module} import {entry_point.attr}"
+    if entry_point.attr is None or expected_import not in source:
+        raise CaptureError(
+            f"{command} wrapper does not match {distribution_name} entry-point metadata"
+        )
+    return LaunchBinding(
+        command=command,
+        distribution=distribution_name,
+        executable=executable,
+        version=distribution.version,
+        entry_point=entry_point.value,
+        executable_sha256=sha256_bytes(executable.read_bytes()),
+    )
+
+
 def git_provenance() -> dict[str, Any]:
     def git(*args: str) -> str:
         result = subprocess.run(
@@ -265,6 +391,13 @@ def git_provenance() -> dict[str, Any]:
         "tree": git("rev-parse", "HEAD^{tree}"),
         "dirty": bool(git("status", "--short")),
     }
+
+
+def require_clean_source() -> dict[str, Any]:
+    provenance = git_provenance()
+    if provenance["dirty"]:
+        raise CaptureError("capture source tree must be clean")
+    return provenance
 
 
 def model_contract() -> dict[str, Any]:
@@ -446,11 +579,103 @@ def parsed_json(result: HTTPResult, label: str) -> dict[str, Any]:
     return value
 
 
-def require_models_identity(value: dict[str, Any], expected: str) -> None:
+def require_models_identity(
+    value: dict[str, Any], expected: str, *, require_tensorfold_mtp: bool = False
+) -> dict[str, Any]:
     models = value.get("data")
-    identities = {item.get("id") for item in models or [] if isinstance(item, dict)}
-    if expected not in identities:
+    if not isinstance(models, list) or len(models) != 1:
+        raise CaptureError("/v1/models did not expose exactly one model")
+    model = models[0]
+    if not isinstance(model, dict) or model.get("id") != expected:
         raise CaptureError(f"/v1/models did not expose {expected!r}")
+    projection: dict[str, Any] = {"id": expected}
+    if require_tensorfold_mtp:
+        speculative = model.get("speculative_decoding")
+        require_speculative_identity(speculative, label="/v1/models")
+        projection["speculative_decoding"] = expected_speculative_identity()
+    return projection
+
+
+def expected_speculative_identity() -> dict[str, Any]:
+    return {
+        "configured": True,
+        "method": "mtp",
+        "runtime_state": "active",
+        "backend": "tensorfold",
+    }
+
+
+def require_speculative_identity(value: Any, *, label: str) -> None:
+    if not isinstance(value, dict):
+        raise CaptureError(f"{label} omitted speculative-decoding identity")
+    expected = expected_speculative_identity()
+    if any(value.get(key) != item for key, item in expected.items()):
+        raise CaptureError(f"{label} did not expose active TensorFold MTP")
+
+
+def require_product_identity(
+    health: dict[str, Any], status: dict[str, Any], model: dict[str, Any]
+) -> dict[str, Any]:
+    if (
+        health.get("status") != "ok"
+        or health.get("algorithm") != "mtp"
+        or health.get("engine") != "tensorfold-glm-5.3-flash"
+    ):
+        raise CaptureError("product /healthz did not expose ready TensorFold MTP")
+    if status.get("status") != "ready" or status.get("model") != ALIAS:
+        raise CaptureError("product /v1/status readiness or model identity mismatch")
+    require_speculative_identity(
+        status.get("speculative_decoding"), label="product /v1/status"
+    )
+    profile = status.get("profile")
+    if not isinstance(profile, dict) or profile.get("id") != ALIAS:
+        raise CaptureError("product profile identity mismatch")
+    compatibility = profile.get("compatibility")
+    runtime = profile.get("runtime")
+    profile_models = profile.get("models")
+    target = (
+        profile_models.get("target") if isinstance(profile_models, dict) else None
+    )
+    if profile.get("mode") != "accelerated":
+        raise CaptureError("product profile mode is not accelerated")
+    if not isinstance(compatibility, dict) or (
+        compatibility.get("state"),
+        compatibility.get("reason"),
+        compatibility.get("action"),
+    ) != ("ready", None, None):
+        raise CaptureError("product profile compatibility is not ready")
+    if not isinstance(runtime, dict) or (
+        runtime.get("extra") != "manual-source-install"
+        or runtime.get("installed") is not True
+    ):
+        raise CaptureError("product TensorFold runtime is not installed and qualified")
+    if not isinstance(target, dict) or (
+        target.get("repository") != model["repository"]
+        or target.get("revision") != model["target_revision"]
+        or target.get("ready") is not True
+    ):
+        raise CaptureError("product target provenance or readiness mismatch")
+    return {
+        "health": {
+            "status": "ok",
+            "engine": "tensorfold-glm-5.3-flash",
+            "algorithm": "mtp",
+        },
+        "status": "ready",
+        "model": ALIAS,
+        "speculative_decoding": expected_speculative_identity(),
+        "profile": {
+            "id": ALIAS,
+            "mode": "accelerated",
+            "compatibility": {"state": "ready", "reason": None, "action": None},
+            "runtime": {"extra": "manual-source-install", "installed": True},
+            "target": {
+                "repository": model["repository"],
+                "revision": model["target_revision"],
+                "ready": True,
+            },
+        },
+    }
 
 
 def token_sha256(token_ids: Sequence[int]) -> str:
@@ -475,8 +700,13 @@ def _find_token_ids(value: dict[str, Any]) -> tuple[list[int], str] | None:
             if isinstance(message, dict):
                 candidates.append((message.get(field), f"choices[0].message.{field}"))
     for candidate, source in candidates:
-        if isinstance(candidate, list) and all(type(item) is int for item in candidate):
-            return candidate, source
+        if candidate is None:
+            continue
+        if not isinstance(candidate, list) or not all(
+            type(item) is int and item >= 0 for item in candidate
+        ):
+            raise CaptureError(f"explicit token IDs at {source} were malformed")
+        return candidate, source
     return None
 
 
@@ -491,7 +721,9 @@ def load_audit_token_ids(path: Path) -> tuple[list[int], str] | None:
     record = records[0]
     tokens = record.get("token_ids")
     digest = record.get("token_sha256")
-    if not isinstance(tokens, list) or not all(type(item) is int for item in tokens):
+    if not isinstance(tokens, list) or not all(
+        type(item) is int and item >= 0 for item in tokens
+    ):
         raise CaptureError("TensorFold audit did not expose integer token IDs")
     if digest != token_sha256(tokens):
         raise CaptureError("TensorFold audit token SHA-256 did not verify")
@@ -503,22 +735,45 @@ def response_summary(
     timing: HTTPResult,
     *,
     audit_tokens: tuple[list[int], str] | None = None,
+    require_opaque_fingerprint: bool = False,
 ) -> dict[str, Any]:
-    choices = value.get("choices") or []
-    if not choices or not isinstance(choices[0], dict):
-        raise CaptureError("completion response did not contain a first choice")
+    if not isinstance(value.get("id"), str) or not value["id"]:
+        raise CaptureError("completion response did not contain a response ID")
+    choices = value.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1:
+        raise CaptureError("completion response did not contain exactly one choice")
+    if not isinstance(choices[0], dict):
+        raise CaptureError("completion response choice was not an object")
     choice = choices[0]
-    message = choice.get("message") or {}
+    if choice.get("index") != 0:
+        raise CaptureError("completion response choice index was not zero")
+    message = choice.get("message")
     if not isinstance(message, dict):
         raise CaptureError("completion response did not contain a message object")
+    if message.get("role") != "assistant":
+        raise CaptureError("completion response message role was not assistant")
     content = message.get("content")
     reasoning = message.get("reasoning_content", message.get("reasoning"))
+    if content is not None and not isinstance(content, str):
+        raise CaptureError("completion content was not text or null")
+    if reasoning is not None and not isinstance(reasoning, str):
+        raise CaptureError("completion reasoning was not text or null")
     if not isinstance(content, str) and not isinstance(reasoning, str):
         raise CaptureError("completion response exposed neither content nor reasoning")
-    if not isinstance(choice.get("finish_reason"), str):
-        raise CaptureError("completion response did not expose a finish reason")
-    if not isinstance(value.get("usage"), dict):
+    finish_reason = choice.get("finish_reason")
+    if finish_reason not in {"stop", "length"}:
+        raise CaptureError("completion response exposed an unexpected finish reason")
+    usage_raw = value.get("usage")
+    if not isinstance(usage_raw, dict):
         raise CaptureError("completion response did not expose usage")
+    usage: dict[str, int] = {}
+    for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        item = usage_raw.get(field)
+        if type(item) is not int or item < 0:
+            raise CaptureError(f"completion usage {field} was not a nonnegative integer")
+        usage[field] = item
+    if usage["total_tokens"] != usage["prompt_tokens"] + usage["completion_tokens"]:
+        raise CaptureError("completion usage total did not match prompt plus completion")
     exposed = _find_token_ids(value) or audit_tokens
     if exposed is None:
         tokens: dict[str, Any] = {
@@ -537,14 +792,25 @@ def response_summary(
             "sha256": token_sha256(ids),
             "sha256_encoding": "ascii comma-separated decimal token IDs",
         }
+        if len(ids) != usage["completion_tokens"]:
+            raise CaptureError("complete token ID count did not match completion usage")
     opaque = None
     tensorfold = value.get("tensorfold")
-    if isinstance(tensorfold, dict) and isinstance(tensorfold.get("token_sha"), str):
+    if tensorfold is not None and not isinstance(tensorfold, dict):
+        raise CaptureError("TensorFold response metadata was not an object")
+    if isinstance(tensorfold, dict) and tensorfold.get("token_sha") is not None:
+        fingerprint = tensorfold.get("token_sha")
+        if not isinstance(fingerprint, str) or re.fullmatch(
+            r"[0-9a-f]{12}", fingerprint
+        ) is None:
+            raise CaptureError("TensorFold opaque token fingerprint was not 12-hex")
         opaque = {
-            "value": tensorfold["token_sha"],
+            "value": fingerprint,
             "kind": "tensorfold_opaque_token_fingerprint",
             "is_sha256": False,
         }
+    if require_opaque_fingerprint and opaque is None:
+        raise CaptureError("direct TensorFold response omitted its opaque fingerprint")
     return {
         "content_sha256": (
             sha256_bytes(content.encode()) if isinstance(content, str) else None
@@ -554,8 +820,8 @@ def response_summary(
         ),
         "content_present": isinstance(content, str),
         "reasoning_present": isinstance(reasoning, str),
-        "finish_reason": choice.get("finish_reason"),
-        "usage": value.get("usage"),
+        "finish_reason": finish_reason,
+        "usage": usage,
         "full_token_ids": tokens,
         "opaque_token_fingerprint": opaque,
         "timing": {
@@ -644,26 +910,60 @@ def start_server(
 
 def stop_server(server: ManagedServer, *, timeout: float = 120) -> dict[str, Any]:
     forced = False
-    if server.process.poll() is None:
-        os.killpg(server.process.pid, signal.SIGTERM)
+    was_running = server.process.poll() is None
+    termination_sent = False
+    if was_running:
+        try:
+            os.killpg(server.process.pid, signal.SIGTERM)
+            termination_sent = True
+        except ProcessLookupError:
+            pass
         try:
             server.process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             forced = True
-            os.killpg(server.process.pid, signal.SIGKILL)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(server.process.pid, signal.SIGKILL)
             server.process.wait(timeout=15)
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + 5
     while listener_open(server.port) and time.monotonic() < deadline:
         time.sleep(0.1)
     gone = not listener_open(server.port)
     if not gone:
-        raise CaptureError(f"{server.name} listener remained after process shutdown")
-    return {
+        # The leader can exit while a child retains the listener. The whole
+        # session is ours, so force the remaining owned process group down,
+        # retain that fact, and still fail the capture.
+        forced = True
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(server.process.pid, signal.SIGKILL)
+        deadline = time.monotonic() + 15
+        while listener_open(server.port) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        gone = not listener_open(server.port)
+    facts = {
+        "process_was_running_at_shutdown": was_running,
         "process_exited": True,
         "exit_code": server.process.returncode,
+        "termination_signal_sent": termination_sent,
         "forced_kill_of_owned_process_group": forced,
         "listener_gone": gone,
     }
+    if not was_running or not termination_sent:
+        raise ShutdownError(
+            f"{server.name} exited before requested shutdown", facts
+        )
+    if forced:
+        raise ShutdownError(f"{server.name} required a forced kill", facts)
+    if server.process.returncode != 0:
+        raise ShutdownError(
+            f"{server.name} exited with unexpected status {server.process.returncode}",
+            facts,
+        )
+    if not gone:
+        raise ShutdownError(
+            f"{server.name} listener remained after process shutdown", facts
+        )
+    return facts
 
 
 def retain_log(server: ManagedServer, destination: Path, sanitizer: Sanitizer) -> None:
@@ -671,9 +971,9 @@ def retain_log(server: ManagedServer, destination: Path, sanitizer: Sanitizer) -
     write_bytes(destination, sanitizer.bytes(raw))
 
 
-def default_product_command(port: int) -> list[str]:
+def product_command(executable: Path, port: int) -> list[str]:
     return [
-        "rapid-mlx",
+        str(executable),
         "serve",
         ALIAS,
         "--host",
@@ -683,9 +983,9 @@ def default_product_command(port: int) -> list[str]:
     ]
 
 
-def default_direct_command(port: int, target: Path) -> list[str]:
+def direct_command(executable: Path, port: int, target: Path) -> list[str]:
     return [
-        "tensorfold",
+        str(executable),
         "serve",
         str(target),
         "--name",
@@ -821,10 +1121,12 @@ def run_capture(
     output: Path,
     *,
     target: Path,
+    product_builder: ProductBuilder,
+    direct_builder: DirectBuilder,
+    launch_provenance: dict[str, Any],
+    source_provenance: dict[str, Any],
     load_timeout: float = 1800,
     request_timeout: float = 1800,
-    product_builder: ProductBuilder = default_product_command,
-    direct_builder: DirectBuilder = default_direct_command,
     probe: HostProbe = host_snapshot,
 ) -> dict[str, Any]:
     if output.exists() and any(output.iterdir()):
@@ -853,9 +1155,10 @@ def run_capture(
         "status": "running",
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
         "clock": "time.monotonic_ns",
-        "main": git_provenance(),
+        "main": source_provenance,
         "model": model,
         "runtime": runtime_provenance(),
+        "launch_bindings": launch_provenance,
         "host_lock": {
             "wrapper": "scripts/large-model-run.py",
             "command_lifetime_marker_present": (
@@ -922,7 +1225,9 @@ def run_capture(
                 timeout=load_timeout,
             )
             models = parsed_json(models_result, "product /v1/models")
-            require_models_identity(models, ALIAS)
+            models_identity = require_models_identity(
+                models, ALIAS, require_tensorfold_mtp=True
+            )
             health_result = http_request(
                 f"http://127.0.0.1:{product_port}/healthz",
                 origin_ns=origin_ns,
@@ -935,19 +1240,17 @@ def run_capture(
             )
             health = parsed_json(health_result, "product /healthz")
             status = parsed_json(status_result, "product /v1/status")
-            if health.get("status") != "ok":
-                raise CaptureError("product /healthz was not ready")
-            if status.get("model") != ALIAS:
-                raise CaptureError("product /v1/status model identity mismatch")
-            profile = status.get("profile") or {}
-            if profile.get("id") != ALIAS:
-                raise CaptureError("product profile identity mismatch")
-            target_status = (profile.get("models") or {}).get("target") or {}
-            if (
-                target_status.get("repository") != model["repository"]
-                or target_status.get("revision") != model["target_revision"]
-            ):
-                raise CaptureError("product target provenance mismatch")
+            phase_dir = output / "product"
+            raw_contract = {
+                "models": retain_http(phase_dir, "models", models_result, sanitizer),
+                "health": retain_http(phase_dir, "health", health_result, sanitizer),
+                "status": retain_http(phase_dir, "status", status_result, sanitizer),
+            }
+            manifest["phases"]["product"] = {
+                "command": sanitizer.argv(product_command),
+                "raw_responses": raw_contract,
+            }
+            product_identity = require_product_identity(health, status, model)
             completion_result = http_request(
                 f"http://127.0.0.1:{product_port}/v1/chat/completions",
                 origin_ns=origin_ns,
@@ -959,33 +1262,29 @@ def run_capture(
             product_summary = response_summary(
                 completion, completion_result, audit_tokens=audit_tokens
             )
-            phase_dir = output / "product"
-            raw_contract = {
-                "models": retain_http(phase_dir, "models", models_result, sanitizer),
-                "health": retain_http(phase_dir, "health", health_result, sanitizer),
-                "status": retain_http(phase_dir, "status", status_result, sanitizer),
-                "completion": retain_http(
-                    phase_dir, "completion", completion_result, sanitizer
-                ),
-            }
+            raw_contract["completion"] = retain_http(
+                phase_dir, "completion", completion_result, sanitizer
+            )
             write_json(phase_dir / "completion.summary.json", product_summary)
-            product_shutdown = stop_server(product_server)
-            retain_log(product_server, phase_dir / "server.sanitized.log", sanitizer)
-            manifest["phases"]["product"] = {
-                "command": sanitizer.argv(product_command),
-                "process": {
+            manifest["phases"]["product"].update(
+                {
+                    "identity": {"models": models_identity, **product_identity},
+                    "completion": product_summary,
+                }
+            )
+            try:
+                product_shutdown = stop_server(product_server)
+            except ShutdownError as exc:
+                product_shutdown = exc.facts
+                raise
+            finally:
+                manifest["phases"]["product"]["process"] = {
                     "started_offset_ns": product_server.started_offset_ns,
-                    **product_shutdown,
-                },
-                "identity": {
-                    "health_status": health.get("status"),
-                    "model": status.get("model"),
-                    "profile": profile.get("id"),
-                    "target": target_status,
-                },
-                "raw_responses": raw_contract,
-                "completion": product_summary,
-            }
+                    **(product_shutdown or {}),
+                }
+                retain_log(
+                    product_server, phase_dir / "server.sanitized.log", sanitizer
+                )
 
             direct_command = direct_builder(direct_port, target)
             direct_server = start_server(
@@ -1003,7 +1302,9 @@ def run_capture(
                 timeout=load_timeout,
             )
             direct_models = parsed_json(direct_models_result, "direct /v1/models")
-            require_models_identity(direct_models, DIRECT_SERVED_NAME)
+            direct_identity = require_models_identity(
+                direct_models, DIRECT_SERVED_NAME
+            )
             drafted_result = http_request(
                 f"http://127.0.0.1:{direct_port}/v1/chat/completions",
                 origin_ns=origin_ns,
@@ -1019,9 +1320,12 @@ def run_capture(
             drafted = response_summary(
                 parsed_json(drafted_result, "direct drafted completion"),
                 drafted_result,
+                require_opaque_fingerprint=True,
             )
             serial = response_summary(
-                parsed_json(serial_result, "direct serial completion"), serial_result
+                parsed_json(serial_result, "direct serial completion"),
+                serial_result,
+                require_opaque_fingerprint=True,
             )
             direct_dir = output / "direct"
             direct_raw_contract = {
@@ -1035,8 +1339,6 @@ def run_capture(
             }
             write_json(direct_dir / "drafted.summary.json", drafted)
             write_json(direct_dir / "serial.summary.json", serial)
-            direct_shutdown = stop_server(direct_server)
-            retain_log(direct_server, direct_dir / "server.sanitized.log", sanitizer)
             comparisons = {
                 "product_vs_direct_drafted": compare_summaries(
                     product_summary, drafted
@@ -1045,16 +1347,25 @@ def run_capture(
             }
             manifest["phases"]["direct"] = {
                 "command": sanitizer.argv(direct_command, target),
-                "process": {
-                    "started_offset_ns": direct_server.started_offset_ns,
-                    **direct_shutdown,
-                },
-                "identity": {"model": DIRECT_SERVED_NAME},
+                "identity": {"models": direct_identity},
                 "raw_responses": direct_raw_contract,
                 "drafted": drafted,
                 "serial": serial,
                 "comparisons": comparisons,
             }
+            try:
+                direct_shutdown = stop_server(direct_server)
+            except ShutdownError as exc:
+                direct_shutdown = exc.facts
+                raise
+            finally:
+                manifest["phases"]["direct"]["process"] = {
+                    "started_offset_ns": direct_server.started_offset_ns,
+                    **(direct_shutdown or {}),
+                }
+                retain_log(
+                    direct_server, direct_dir / "server.sanitized.log", sanitizer
+                )
             if not all(comparisons["product_vs_direct_drafted"].values()):
                 raise CaptureError("product and direct drafted outputs differ")
             if not all(comparisons["direct_drafted_vs_serial"].values()):
@@ -1077,10 +1388,20 @@ def run_capture(
                 if server is not None:
                     if stopped is None:
                         try:
-                            stop_server(server)
+                            stopped = stop_server(server)
+                        except ShutdownError as stop_exc:
+                            stopped = stop_exc.facts
+                            if capture_error is None:
+                                capture_error = stop_exc
                         except BaseException as stop_exc:
                             if capture_error is None:
                                 capture_error = stop_exc
+                    if stopped is not None:
+                        phase = manifest["phases"].setdefault(server.name, {})
+                        phase["process"] = {
+                            "started_offset_ns": server.started_offset_ns,
+                            **stopped,
+                        }
                     retain_log(server, destination, sanitizer)
             after = probe(ports, sanitizer)
             write_json(output / "host/post.json", after)
@@ -1147,15 +1468,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     output = args.output.resolve()
     if Path("/private/tmp") not in (output, *output.parents):
         raise CaptureError("capture output must be under /private/tmp")
-    model = model_contract()
-    require_qualified_runtime(model)
-    target = resolve_local_target(model)
-    run_capture(
-        output,
-        target=target,
-        load_timeout=args.load_timeout,
-        request_timeout=args.request_timeout,
-    )
+    with termination_signal_handlers():
+        source_provenance = require_clean_source()
+        model = model_contract()
+        require_qualified_runtime(model)
+        rapid_binding = resolve_console_binding("rapid-mlx", "rapid-mlx")
+        tensorfold_binding = resolve_console_binding("tensorfold", "tensorfold")
+        target = resolve_local_target(model)
+        run_capture(
+            output,
+            target=target,
+            product_builder=lambda port: product_command(
+                rapid_binding.executable, port
+            ),
+            direct_builder=lambda port, local_target: direct_command(
+                tensorfold_binding.executable, port, local_target
+            ),
+            launch_provenance={
+                "rapid-mlx": rapid_binding.provenance(),
+                "tensorfold": tensorfold_binding.provenance(),
+            },
+            source_provenance=source_provenance,
+            load_timeout=args.load_timeout,
+            request_timeout=args.request_timeout,
+        )
     print(output)
     return 0
 
@@ -1163,6 +1499,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except TerminationSignalError as exc:
+        print(f"glm53-product-capture: {exc}", file=sys.stderr)
+        raise SystemExit(exc.exit_code) from exc
     except CaptureError as exc:
         print(f"glm53-product-capture: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc

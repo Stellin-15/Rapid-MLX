@@ -4,10 +4,13 @@ import hashlib
 import importlib.util
 import json
 import os
+import signal
+import socket
 import subprocess
 import sys
 import textwrap
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -20,6 +23,12 @@ assert SPEC is not None and SPEC.loader is not None
 capture = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = capture
 SPEC.loader.exec_module(capture)
+
+SOURCE_PROVENANCE = {"commit": "test-commit", "tree": "test-tree", "dirty": False}
+LAUNCH_PROVENANCE = {
+    "rapid-mlx": {"command": "rapid-mlx", "executable_sha256": "0" * 64},
+    "tensorfold": {"command": "tensorfold", "executable_sha256": "1" * 64},
+}
 
 
 def _fake_probe(ports, _sanitizer):
@@ -57,12 +66,20 @@ def _write_fake_server(path: Path) -> None:
             import hashlib
             import json
             import os
+            import signal
+            import sys
             from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
             parser = argparse.ArgumentParser()
             parser.add_argument("--mode", choices=("product", "direct"), required=True)
             parser.add_argument("--port", type=int, required=True)
+            parser.add_argument("--scenario", default="valid")
+            parser.add_argument("--marker")
             args = parser.parse_args()
+            signal.signal(signal.SIGTERM, lambda *_args: sys.exit(0))
+            if args.marker:
+                with open(args.marker, "w") as marker:
+                    json.dump({"pid":os.getpid(), "port":args.port}, marker)
 
             class Handler(BaseHTTPRequestHandler):
                 def log_message(self, *_args):
@@ -78,30 +95,53 @@ def _write_fake_server(path: Path) -> None:
 
                 def do_GET(self):
                     if self.path == "/v1/models":
+                        if args.scenario == "wait_models":
+                            return self.send_error(503)
                         model = (
                             "glm5.3-flash-tensorfold"
                             if args.mode == "product"
                             else "glm53-tf-v06"
                         )
-                        return self.send_json({"object":"list","data":[{"id":model}]})
+                        record = {"id":model}
+                        if args.mode == "product":
+                            record["speculative_decoding"] = {
+                                "configured":True,"method":"mtp",
+                                "runtime_state":"active","backend":"tensorfold",
+                            }
+                        return self.send_json({"object":"list","data":[record]})
                     if self.path == "/healthz":
                         return self.send_json({
                             "status":"ok",
-                            "profile":{"id":"glm5.3-flash-tensorfold"},
+                            "engine":"tensorfold-glm-5.3-flash",
+                            "algorithm":"mtp",
                         })
                     if self.path == "/v1/status":
-                        return self.send_json({
+                        status = {
                             "status":"ready",
                             "model":"glm5.3-flash-tensorfold",
+                            "speculative_decoding":{
+                                "configured":True,"method":"mtp",
+                                "runtime_state":"active","backend":"tensorfold",
+                            },
                             "profile":{
                                 "id":"glm5.3-flash-tensorfold",
+                                "mode":"accelerated",
+                                "compatibility":{
+                                    "state":"ready","reason":None,"action":None,
+                                },
+                                "runtime":{
+                                    "extra":"manual-source-install","installed":True,
+                                },
                                 "models":{"target":{
                                     "repository":"Vontra/GLM-5.3-Flash-MLX-4bit-MTP",
                                     "revision":"76add2a341a1cd90ad0e86bb69839ea9c35827c6",
                                     "ready":True,
                                 }},
                             },
-                        })
+                        }
+                        if args.scenario == "wrong_status":
+                            status["status"] = "/Users/private/not-ready"
+                        return self.send_json(status)
                     self.send_error(404)
 
                 def do_POST(self):
@@ -129,7 +169,7 @@ def _write_fake_server(path: Path) -> None:
                             "reasoning_content":"reason",
                             "content":"answer",
                         },"finish_reason":"length"}],
-                        "usage":{"prompt_tokens":460,"completion_tokens":768,"total_tokens":1228},
+                        "usage":{"prompt_tokens":460,"completion_tokens":3,"total_tokens":463},
                     }
                     if args.mode == "direct":
                         response["tensorfold"] = {"token_sha":"abcdef123456"}
@@ -166,6 +206,8 @@ def test_capture_contract_with_fake_product_and_direct_servers(tmp_path: Path) -
         request_timeout=10,
         product_builder=product_builder,
         direct_builder=direct_builder,
+        launch_provenance=LAUNCH_PROVENANCE,
+        source_provenance=SOURCE_PROVENANCE,
         probe=_fake_probe,
     )
 
@@ -221,13 +263,17 @@ def test_capture_contract_with_fake_product_and_direct_servers(tmp_path: Path) -
 
 
 def test_production_commands_pin_alias_and_direct_settings(tmp_path: Path) -> None:
-    product = capture.default_product_command(18162)
-    assert product[:3] == ["rapid-mlx", "serve", "glm5.3-flash-tensorfold"]
+    product = capture.product_command(Path("/verified/rapid-mlx"), 18162)
+    assert product[:3] == [
+        "/verified/rapid-mlx",
+        "serve",
+        "glm5.3-flash-tensorfold",
+    ]
     assert product[-2:] == ["--port", "18162"]
 
     target = tmp_path / "target"
-    direct = capture.default_direct_command(18163, target)
-    assert direct[:2] == ["tensorfold", "serve"]
+    direct = capture.direct_command(Path("/verified/tensorfold"), 18163, target)
+    assert direct[:2] == ["/verified/tensorfold", "serve"]
     assert direct[2] == str(target)
     assert direct[direct.index("--context") + 1] == "8192"
     assert direct[direct.index("--max-tokens") + 1] == "4096"
@@ -327,6 +373,9 @@ def test_nonzero_swap_discards_before_starting_a_server(tmp_path: Path) -> None:
             output,
             target=target,
             product_builder=product_builder,
+            direct_builder=lambda _port, _target: ["must-not-run"],
+            launch_provenance=LAUNCH_PROVENANCE,
+            source_provenance=SOURCE_PROVENANCE,
             probe=swapped_probe,
         )
 
@@ -355,6 +404,48 @@ def test_runtime_contract_requires_exact_noneditable_vcs_revision(monkeypatch) -
     )
     with pytest.raises(capture.CaptureError, match="exact qualified"):
         capture.require_qualified_runtime(model)
+
+
+def test_console_binding_requires_current_interpreter_and_distribution_metadata(
+    tmp_path: Path, monkeypatch
+) -> None:
+    executable = tmp_path / "rapid-mlx"
+    executable.write_text(
+        f"#!{sys.executable}\nfrom rapid_mlx.cli import main\nmain()\n"
+    )
+
+    class EntryPoint:
+        group = "console_scripts"
+        name = "rapid-mlx"
+        module = "rapid_mlx.cli"
+        attr = "main"
+        value = "rapid_mlx.cli:main"
+
+    class Distribution:
+        version = "test-version"
+        entry_points = [EntryPoint()]
+
+    monkeypatch.setattr(capture.shutil, "which", lambda _command: str(executable))
+    monkeypatch.setattr(
+        capture.importlib.metadata, "distribution", lambda _name: Distribution()
+    )
+    binding = capture.resolve_console_binding("rapid-mlx", "rapid-mlx")
+    assert binding.executable == executable.resolve()
+    assert binding.executable_sha256 == hashlib.sha256(executable.read_bytes()).hexdigest()
+
+    executable.write_text("#!/usr/bin/python3\nfrom rapid_mlx.cli import main\nmain()\n")
+    with pytest.raises(capture.CaptureError, match="capture interpreter"):
+        capture.resolve_console_binding("rapid-mlx", "rapid-mlx")
+
+
+def test_capture_fails_closed_on_dirty_source(monkeypatch) -> None:
+    monkeypatch.setattr(
+        capture,
+        "git_provenance",
+        lambda: {"commit": "test", "tree": "test", "dirty": True},
+    )
+    with pytest.raises(capture.CaptureError, match="must be clean"):
+        capture.require_clean_source()
 
 
 def test_sanitizer_redacts_json_credentials_private_urls_and_pids(
@@ -406,3 +497,387 @@ def test_comparison_uses_full_token_hash_when_both_paths_expose_ids() -> None:
     )
     assert comparison["full_token_ids_sha256"] is False
     assert comparison["usage_counts"] is True
+
+
+def _valid_product_identity():
+    model = capture.model_contract()
+    health = {
+        "status": "ok",
+        "engine": "tensorfold-glm-5.3-flash",
+        "algorithm": "mtp",
+    }
+    speculative = capture.expected_speculative_identity()
+    status = {
+        "status": "ready",
+        "model": capture.ALIAS,
+        "speculative_decoding": dict(speculative),
+        "profile": {
+            "id": capture.ALIAS,
+            "mode": "accelerated",
+            "compatibility": {"state": "ready", "reason": None, "action": None},
+            "runtime": {"extra": "manual-source-install", "installed": True},
+            "models": {
+                "target": {
+                    "repository": model["repository"],
+                    "revision": model["target_revision"],
+                    "ready": True,
+                }
+            },
+        },
+    }
+    return health, status, model
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda h, _s, _m: h.update(status="bad"), "healthz"),
+        (lambda _h, s, _m: s.update(model="wrong"), "identity"),
+        (lambda _h, s, _m: s["profile"].update(id="wrong"), "profile"),
+        (
+            lambda _h, s, _m: s["profile"]["models"]["target"].update(
+                revision="wrong"
+            ),
+            "provenance",
+        ),
+        (lambda _h, s, _m: s.update(status="loading"), "readiness"),
+        (
+            lambda _h, s, _m: s["speculative_decoding"].update(backend="wrong"),
+            "TensorFold MTP",
+        ),
+        (lambda _h, s, _m: s["profile"].update(mode="fallback"), "accelerated"),
+        (
+            lambda _h, s, _m: s["profile"]["compatibility"].update(state="blocked"),
+            "compatibility",
+        ),
+        (
+            lambda _h, s, _m: s["profile"]["models"]["target"].update(
+                ready=False
+            ),
+            "readiness",
+        ),
+    ],
+)
+def test_product_identity_rejects_adversarial_status(mutation, message: str) -> None:
+    health, status, model = _valid_product_identity()
+    mutation(health, status, model)
+    with pytest.raises(capture.CaptureError, match=message):
+        capture.require_product_identity(health, status, model)
+
+
+def test_product_identity_projects_only_validated_constants() -> None:
+    health, status, model = _valid_product_identity()
+    health["private_path"] = "/Users/private/secret"
+    status["private_url"] = "https://private.invalid/path"
+    identity = capture.require_product_identity(health, status, model)
+    serialized = json.dumps(identity)
+    assert "/Users/" not in serialized
+    assert "private.invalid" not in serialized
+    assert identity["profile"]["target"]["revision"] == model["target_revision"]
+
+
+def test_models_identity_rejects_wrong_model_backend_and_readiness() -> None:
+    valid = {
+        "data": [
+            {
+                "id": capture.ALIAS,
+                "speculative_decoding": capture.expected_speculative_identity(),
+            }
+        ]
+    }
+    assert capture.require_models_identity(
+        valid, capture.ALIAS, require_tensorfold_mtp=True
+    )["id"] == capture.ALIAS
+    wrong_model = json.loads(json.dumps(valid))
+    wrong_model["data"][0]["id"] = "wrong"
+    with pytest.raises(capture.CaptureError, match="did not expose"):
+        capture.require_models_identity(
+            wrong_model, capture.ALIAS, require_tensorfold_mtp=True
+        )
+    wrong_backend = json.loads(json.dumps(valid))
+    wrong_backend["data"][0]["speculative_decoding"]["backend"] = "wrong"
+    with pytest.raises(capture.CaptureError, match="TensorFold MTP"):
+        capture.require_models_identity(
+            wrong_backend, capture.ALIAS, require_tensorfold_mtp=True
+        )
+
+
+def _timing() -> object:
+    return capture.HTTPResult(
+        status=200,
+        headers={},
+        raw=b"{}",
+        started_offset_ns=1,
+        first_byte_offset_ns=2,
+        ended_offset_ns=3,
+        ttft_ns=None,
+        ttft_basis=None,
+    )
+
+
+def _valid_completion() -> dict:
+    return {
+        "id": "chatcmpl-test",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+        "tensorfold": {"token_sha": "abcdef123456"},
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda value: value.update(choices=[]),
+        lambda value: value.update(usage={}),
+        lambda value: value["usage"].update(completion_tokens="1"),
+        lambda value: value["usage"].update(total_tokens=99),
+        lambda value: value["choices"][0].update(finish_reason="private/path"),
+        lambda value: value["tensorfold"].update(token_sha="a" * 64),
+        lambda value: value.update(token_ids=[1, -2]),
+    ],
+)
+def test_response_summary_rejects_malformed_completion_and_usage(mutation) -> None:
+    completion = _valid_completion()
+    mutation(completion)
+    with pytest.raises(capture.CaptureError):
+        capture.response_summary(
+            completion, _timing(), require_opaque_fingerprint=True
+        )
+
+
+def test_start_server_rejects_port_collision(tmp_path: Path) -> None:
+    with socket.socket() as occupied:
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen()
+        port = occupied.getsockname()[1]
+        with pytest.raises(capture.CaptureError, match="occupied"):
+            capture.start_server(
+                "collision",
+                [sys.executable, "-c", "raise SystemExit(99)"],
+                port=port,
+                env=dict(os.environ),
+                raw_dir=tmp_path,
+                origin_ns=time.monotonic_ns(),
+            )
+
+
+def _write_shutdown_server(path: Path) -> None:
+    path.write_text(
+        textwrap.dedent(
+            """
+            import argparse
+            import signal
+            import sys
+            from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--port", type=int, required=True)
+            parser.add_argument("--behavior", choices=("clean", "nonzero", "ignore"))
+            args = parser.parse_args()
+            if args.behavior == "clean":
+                signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+            elif args.behavior == "nonzero":
+                signal.signal(signal.SIGTERM, lambda *_: sys.exit(7))
+            else:
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            class Handler(BaseHTTPRequestHandler):
+                def log_message(self, *_args):
+                    pass
+            ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+            """
+        )
+    )
+
+
+def _start_shutdown_server(tmp_path: Path, behavior: str):
+    script = tmp_path / f"shutdown-{behavior}.py"
+    _write_shutdown_server(script)
+    port = capture.allocate_loopback_port()
+    server = capture.start_server(
+        behavior,
+        [sys.executable, str(script), "--port", str(port), "--behavior", behavior],
+        port=port,
+        env=dict(os.environ),
+        raw_dir=tmp_path,
+        origin_ns=time.monotonic_ns(),
+    )
+    deadline = time.monotonic() + 5
+    while not capture.listener_open(port) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert capture.listener_open(port)
+    return server
+
+
+def test_stop_server_accepts_only_clean_shutdown(tmp_path: Path) -> None:
+    facts = capture.stop_server(_start_shutdown_server(tmp_path, "clean"), timeout=2)
+    assert facts["exit_code"] == 0
+    assert facts["listener_gone"] is True
+
+
+def test_stop_server_rejects_unexpected_prior_exit(tmp_path: Path) -> None:
+    port = capture.allocate_loopback_port()
+    process = subprocess.Popen(
+        [sys.executable, "-c", "raise SystemExit(0)"], start_new_session=True
+    )
+    process.wait(timeout=5)
+    server = capture.ManagedServer(
+        name="prior-exit",
+        process=process,
+        port=port,
+        command=[],
+        raw_log=tmp_path / "empty.log",
+        started_offset_ns=0,
+    )
+    with pytest.raises(capture.ShutdownError, match="before requested") as raised:
+        capture.stop_server(server)
+    assert raised.value.facts["process_was_running_at_shutdown"] is False
+    assert raised.value.facts["listener_gone"] is True
+
+
+@pytest.mark.parametrize("behavior", ["nonzero", "ignore"])
+def test_stop_server_rejects_abnormal_or_forced_shutdown(
+    tmp_path: Path, behavior: str
+) -> None:
+    server = _start_shutdown_server(tmp_path, behavior)
+    with pytest.raises(capture.ShutdownError) as raised:
+        capture.stop_server(server, timeout=0.1)
+    assert raised.value.facts["listener_gone"] is True
+    if behavior == "nonzero":
+        assert raised.value.facts["exit_code"] == 7
+        assert raised.value.facts["forced_kill_of_owned_process_group"] is False
+    else:
+        assert raised.value.facts["forced_kill_of_owned_process_group"] is True
+
+
+def test_phase_validation_failure_still_cleans_listener_and_sanitizes_raw_status(
+    tmp_path: Path,
+) -> None:
+    fake = tmp_path / "fake_server.py"
+    _write_fake_server(fake)
+    output = tmp_path / "invalid-artifacts"
+    target = tmp_path / "target"
+    target.mkdir()
+
+    def product_builder(port: int) -> list[str]:
+        return [
+            sys.executable,
+            str(fake),
+            "--mode",
+            "product",
+            "--scenario",
+            "wrong_status",
+            "--port",
+            str(port),
+        ]
+
+    with pytest.raises(capture.CaptureError, match="readiness"):
+        capture.run_capture(
+            output,
+            target=target,
+            product_builder=product_builder,
+            direct_builder=lambda _port, _target: ["must-not-run"],
+            launch_provenance=LAUNCH_PROVENANCE,
+            source_provenance=SOURCE_PROVENANCE,
+            load_timeout=5,
+            request_timeout=5,
+            probe=_fake_probe,
+        )
+
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["status"] == "invalid"
+    assert manifest["phases"]["product"]["process"]["exit_code"] == 0
+    assert manifest["final_listeners_gone"] is True
+    assert "/Users/private" not in (output / "product/status.sanitized.body").read_text()
+    capture.verify_hash_map(output)
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
+def test_termination_signal_cleans_owned_server_and_listener(
+    tmp_path: Path, signum: int
+) -> None:
+    fake = tmp_path / "fake_server.py"
+    _write_fake_server(fake)
+    marker = tmp_path / "server.json"
+    output = tmp_path / "signal-artifacts"
+    target = tmp_path / "target"
+    target.mkdir()
+    runner = tmp_path / "runner.py"
+    runner.write_text(
+        textwrap.dedent(
+            f"""
+            import importlib.util
+            import json
+            import sys
+            from pathlib import Path
+
+            script = Path({str(SCRIPT)!r})
+            spec = importlib.util.spec_from_file_location("signal_capture", script)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+
+            def probe(ports, _sanitizer):
+                return {{
+                    "swap": {{"used_bytes": 0}},
+                    "listeners": {{str(port): module.listener_open(port) for port in ports}},
+                }}
+
+            def product_builder(port):
+                return [
+                    sys.executable, {str(fake)!r}, "--mode", "product",
+                    "--scenario", "wait_models", "--marker", {str(marker)!r},
+                    "--port", str(port),
+                ]
+
+            try:
+                with module.termination_signal_handlers():
+                    module.run_capture(
+                        Path({str(output)!r}),
+                        target=Path({str(target)!r}),
+                        product_builder=product_builder,
+                        direct_builder=lambda _port, _target: ["must-not-run"],
+                        launch_provenance={{}},
+                        source_provenance={{"commit":"test","tree":"test","dirty":False}},
+                        load_timeout=60,
+                        request_timeout=5,
+                        probe=probe,
+                    )
+            except module.TerminationSignalError as exc:
+                raise SystemExit(exc.exit_code)
+            """
+        )
+    )
+    harness = subprocess.Popen(
+        [sys.executable, str(runner)],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not marker.is_file() and time.monotonic() < deadline:
+            if harness.poll() is not None:
+                break
+            time.sleep(0.02)
+        assert marker.is_file(), harness.communicate(timeout=1)
+        owned = json.loads(marker.read_text())
+        os.kill(harness.pid, signum)
+        stdout, stderr = harness.communicate(timeout=10)
+        assert harness.returncode == 128 + signum, (stdout, stderr)
+        with pytest.raises(ProcessLookupError):
+            os.kill(owned["pid"], 0)
+        assert capture.listener_open(owned["port"]) is False
+        manifest = json.loads((output / "manifest.json").read_text())
+        assert manifest["status"] == "invalid"
+        assert manifest["phases"]["product"]["process"]["listener_gone"] is True
+        capture.verify_hash_map(output)
+    finally:
+        if harness.poll() is None:
+            harness.kill()
+            harness.wait(timeout=5)

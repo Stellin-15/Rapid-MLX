@@ -5,6 +5,8 @@
 - Branch/worktree: `harbor/glm53-product-capture` in a fresh `/private/tmp`
   clone.
 - Base: exact main `f4ad2c7b974497f8763b3ff8a386155475d0925c`.
+- Integration: current main `a94821ea02fe1331048284bcdfb1ab6fc426b865`
+  was merged normally before final verification; history was not rewritten.
 - Scope: a local-only capture harness, synthetic artifact-contract tests, and
   the qualification reproduction note. No engine optimization, release
   dispatch, benchmark claim, cache mutation, or host remediation is included.
@@ -46,6 +48,16 @@ credentials/private URLs, and PID contexts. Pre/post `memory_pressure`,
 and their listeners must disappear. The final sorted SHA-256 map covers every
 retained file except itself and is verified before success.
 
+Production launch is bound to inspected `rapid-mlx` and `tensorfold` console
+scripts whose shebangs resolve to the invoking interpreter and whose imports
+match that interpreter's distribution metadata. The source checkout must be
+clean. Product readiness is accepted only when models, health, status, active
+TensorFold MTP, accelerated compatibility, installed runtime, and target
+revision/readiness all match the qualified profile. Only validated projections
+of these server-derived values enter the manifest; sanitized raw bytes remain
+separate. SIGTERM, SIGHUP, and SIGINT unwind through cleanup, and forced,
+nonzero, premature, or listener-leaking shutdowns invalidate the result.
+
 ## Reference check
 
 Private implementation research reviewed the existing Rapid TensorFold audit
@@ -62,11 +74,13 @@ code or assets.
 ## Verification and remaining work
 
 - Synthetic product and direct HTTP servers cover the complete lifecycle and
-  artifact contract without loading a model.
-- Focused tests cover lock refusal, exact production commands/settings,
-  fixture translation, full-token SHA-256, opaque fingerprint labeling,
-  streamed TTFT, swap parsing, sanitization, listener shutdown, and complete
-  artifact hashing.
+  artifact contract without loading a model. Focused adversarial cases include
+  wrong health/model/profile/revision/status/backend/mode/readiness, malformed
+  completion/usage/token evidence, port collision, mid-phase failure, premature
+  exit, nonzero exit, forced shutdown, and SIGTERM/SIGHUP process-group cleanup.
+- Focused verification currently passes 79 tests across the capture contract,
+  GLM profile contract, and shared TensorFold HTTP contract, plus Ruff,
+  `compileall`, diff checking, and a private-path/credential/noise scan.
 - The first test attempt used system Python 3.9 and failed during repository
   fixture setup because Rapid requires Python 3.10+. Verification uses the
   existing Python 3.12 interpreter; this was an environment mismatch, not a
@@ -77,12 +91,11 @@ code or assets.
 - Orca's agent-to-agent messaging command/channel was unavailable in the
   delegated shell. The PR-start FYI was sent to the parent agent for relay to
   Atlas, Pixel, Echo, and ds0731; send the completion FYI the same way.
-- The required independent PR review was requested twice through the tracked
-  review loop after PR #3972 opened. The reviewer host (`spark2`) failed before
-  producing a comment or verdict because its Codex refresh token is invalid
-  (HTTP 401). A human must re-authenticate Codex on that host, then rerun
-  `~/.local/bin/pr-review 3972 raullenchai/Rapid-MLX`; no code finding is
-  currently pending disposition.
+- A local independent exact-head review requested lifecycle, provenance,
+  identity/schema validation, clean-shutdown, and adversarial-test hardening.
+  Those findings are implemented. The previously requested remote review host
+  could not authenticate; Atlas will arrange a fresh local exact-head review,
+  so no additional remote review round should be requested from this branch.
 
 Next action for Harbor after approval: run the documented command in a stable
 zero-swap window, verify `manifest.json` says `complete`, independently verify
