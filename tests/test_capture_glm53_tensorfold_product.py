@@ -488,6 +488,9 @@ def test_child_environment_is_offline_and_drops_credential_variables(
     monkeypatch.setenv("RAPID_MLX_TELEMETRY_DEBUG", "1")
     monkeypatch.setenv("RAPID_MLX_TELEMETRY", "1")
     monkeypatch.setenv("DO_NOT_TRACK", "0")
+    monkeypatch.setenv("TENSORFOLD_REQUEST_LOG", "/private/request-log.jsonl")
+    monkeypatch.setenv("TENSORFOLD_SNAPSHOT_DIR", "/private/snapshots")
+    monkeypatch.setenv("TENSORFOLD_FUTURE_OVERRIDE", "unsafe")
     monkeypatch.setenv("NORMAL_SETTING", "retained")
     environment = capture.offline_child_environment()
     assert "HF_TOKEN" not in environment
@@ -497,10 +500,14 @@ def test_child_environment_is_offline_and_drops_credential_variables(
     assert "RAPID_MLX_TENSORFOLD_AUDIT_PATH" not in environment
     assert "RAPID_MLX_LOG_LEVEL" not in environment
     assert "RAPID_MLX_TELEMETRY_DEBUG" not in environment
+    assert "TENSORFOLD_REQUEST_LOG" not in environment
+    assert "TENSORFOLD_SNAPSHOT_DIR" not in environment
+    assert "TENSORFOLD_FUTURE_OVERRIDE" not in environment
     assert environment["NORMAL_SETTING"] == "retained"
     assert environment["HF_HUB_OFFLINE"] == "1"
     assert environment["TRANSFORMERS_OFFLINE"] == "1"
     assert environment["RAPID_MLX_TELEMETRY"] == "0"
+    assert environment["RAPID_MLX_DISABLE_VERSION_CHECK"] == "1"
     assert environment["DO_NOT_TRACK"] == "1"
 
 
@@ -882,7 +889,7 @@ def test_product_phase_requires_full_token_audit_evidence(tmp_path: Path) -> Non
     capture.verify_hash_map(output)
 
 
-@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP, signal.SIGINT])
 def test_termination_signal_cleans_owned_server_and_listener(
     tmp_path: Path, signum: int
 ) -> None:

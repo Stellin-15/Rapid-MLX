@@ -15,10 +15,11 @@
 
 `scripts/capture_glm53_tensorfold_product.py` must itself run under
 `scripts/large-model-run.py`, so the product server and subsequent direct
-drafted/serial comparison share the same command-lifetime host lock. It rejects
-nonzero used swap before resolving the target, chooses collision-free loopback
-ports other than 8080/8891, sets all supported Hub consumers offline, and uses
-`snapshot_download(..., local_files_only=True)` against the default cache.
+drafted/serial comparison share the same command-lifetime host lock. Main first
+resolves the target with `snapshot_download(..., local_files_only=True)` from
+the default cache; `run_capture` then rejects nonzero used swap before either
+server starts. It chooses collision-free loopback ports other than 8080/8891
+and sets all supported Hub consumers offline.
 The reproduction command uses an explicit 190 GiB working set: 168.5 GiB
 observed resident weights plus the 16 GiB pass cache and bounded process
 overhead. The registry's generic 1.5x multiplier would exceed this host's
@@ -58,8 +59,9 @@ of these server-derived values enter the manifest; sanitized raw bytes remain
 separate. SIGTERM, SIGHUP, and SIGINT unwind through cleanup, and forced,
 nonzero, premature, or listener-leaking shutdowns invalidate the result.
 Child environments drop Python module-path overrides and all inherited Rapid
-runtime overrides, then explicitly force offline mode and telemetry off. Only
-the product process receives its private temporary token-audit destination.
+or TensorFold runtime overrides, then explicitly force offline mode, version
+checks off, and telemetry off. Only the product process receives its private
+temporary token-audit destination.
 Product completion requires the expected response object/model and full-token
 audit evidence; direct completion requires its exact served model. The direct
 argv pins `--snapshot-dir none` to prevent persistent snapshot/cache writes.
@@ -83,8 +85,9 @@ code or assets.
   artifact contract without loading a model. Focused adversarial cases include
   wrong health/model/profile/revision/status/backend/mode/readiness, malformed
   completion/usage/token evidence, port collision, mid-phase failure, premature
-  exit, nonzero exit, forced shutdown, and SIGTERM/SIGHUP process-group cleanup.
-- Focused verification currently passes 83 tests across the capture contract,
+  exit, nonzero exit, forced shutdown, and SIGTERM/SIGHUP/SIGINT process-group
+  cleanup.
+- Focused verification currently passes 84 tests across the capture contract,
   GLM profile contract, and shared TensorFold HTTP contract, plus Ruff,
   `compileall`, diff checking, and a private-path/credential/noise scan.
 - The first test attempt used system Python 3.9 and failed during repository

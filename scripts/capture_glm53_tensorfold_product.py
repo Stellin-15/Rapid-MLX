@@ -56,8 +56,10 @@ OFFLINE_ENV = {
 CHILD_ENV_OVERRIDES = {
     **OFFLINE_ENV,
     "RAPID_MLX_TELEMETRY": "0",
+    "RAPID_MLX_DISABLE_VERSION_CHECK": "1",
     "DO_NOT_TRACK": "1",
 }
+TENSORFOLD_CHILD_ENV_ALLOWLIST: frozenset[str] = frozenset()
 TOKEN_FIELDS = ("token_ids", "output_token_ids", "generated_token_ids")
 SENSITIVE_ENV_NAME = re.compile(
     r"(?:^|_)(?:TOKEN|PASSWORD|SECRET|API_KEY)(?:$|_)", re.IGNORECASE
@@ -1112,6 +1114,7 @@ def runtime_provenance() -> dict[str, Any]:
             "PYTHONHOME",
             "PYTHONPATH",
             "RAPID_MLX_* inherited values",
+            "TENSORFOLD_* inherited values except explicit allowlist",
             "credential-named inherited values",
         ],
     }
@@ -1124,6 +1127,9 @@ def offline_child_environment() -> dict[str, str]:
         if SENSITIVE_ENV_NAME.search(name) is None
         and name not in {"PYTHONHOME", "PYTHONPATH"}
         and not name.startswith("RAPID_MLX_")
+        and (
+            not name.startswith("TENSORFOLD_") or name in TENSORFOLD_CHILD_ENV_ALLOWLIST
+        )
     }
     environment.update(CHILD_ENV_OVERRIDES)
     return environment

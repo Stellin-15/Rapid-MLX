@@ -96,11 +96,12 @@ found on `PATH`. A terminating signal unwinds through owned-process cleanup;
 forced, nonzero, premature, or listener-leaking shutdowns invalidate the
 artifact set.
 
-Child servers receive offline and telemetry-disabled settings without inherited
-Python module overrides or Rapid runtime overrides. The product phase alone gets
-the private temporary full-token audit destination and fails if that promised
-evidence is absent. The direct runtime receives `--snapshot-dir none`, so the
-comparison does not persist runtime snapshots or caches.
+Child servers receive offline, version-check-disabled, and telemetry-disabled
+settings without inherited Python module overrides or Rapid/TensorFold runtime
+overrides. The product phase alone gets the private temporary full-token audit
+destination and fails if that promised evidence is absent. The direct runtime
+receives `--snapshot-dir none`, so the comparison does not persist runtime
+snapshots or caches.
 
 After a clean Rapid shutdown, the harness starts the pinned direct runtime with
 the same context, generation cap, lane, MTP, prefill, and pass-cache settings.
