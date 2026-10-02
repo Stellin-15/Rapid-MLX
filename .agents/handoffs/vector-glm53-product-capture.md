@@ -77,6 +77,12 @@ code or assets.
 - Orca's agent-to-agent messaging command/channel was unavailable in the
   delegated shell. The PR-start FYI was sent to the parent agent for relay to
   Atlas, Pixel, Echo, and ds0731; send the completion FYI the same way.
+- The required independent PR review was requested twice through the tracked
+  review loop after PR #3972 opened. The reviewer host (`spark2`) failed before
+  producing a comment or verdict because its Codex refresh token is invalid
+  (HTTP 401). A human must re-authenticate Codex on that host, then rerun
+  `~/.local/bin/pr-review 3972 raullenchai/Rapid-MLX`; no code finding is
+  currently pending disposition.
 
 Next action for Harbor after approval: run the documented command in a stable
 zero-swap window, verify `manifest.json` says `complete`, independently verify
