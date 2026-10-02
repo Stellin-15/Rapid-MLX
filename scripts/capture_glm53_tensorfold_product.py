@@ -713,6 +713,21 @@ def compare_summaries(left: dict[str, Any], right: dict[str, Any]) -> dict[str, 
         field: left.get(field) == right.get(field)
         for field in ("content_sha256", "reasoning_sha256", "finish_reason")
     }
+    left_usage = left.get("usage") or {}
+    right_usage = right.get("usage") or {}
+    result["usage_counts"] = all(
+        left_usage.get(field) == right_usage.get(field)
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens")
+    )
+    left_tokens = left.get("full_token_ids") or {}
+    right_tokens = right.get("full_token_ids") or {}
+    if (
+        left_tokens.get("availability") == "available"
+        and right_tokens.get("availability") == "available"
+    ):
+        result["full_token_ids_sha256"] = left_tokens.get("sha256") == right_tokens.get(
+            "sha256"
+        )
     left_opaque = left.get("opaque_token_fingerprint") or {}
     right_opaque = right.get("opaque_token_fingerprint") or {}
     if left_opaque.get("value") is not None and right_opaque.get("value") is not None:

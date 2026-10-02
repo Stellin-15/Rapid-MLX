@@ -386,3 +386,23 @@ def test_child_environment_is_offline_and_drops_credential_variables(
     assert environment["NORMAL_SETTING"] == "retained"
     assert environment["HF_HUB_OFFLINE"] == "1"
     assert environment["TRANSFORMERS_OFFLINE"] == "1"
+
+
+def test_comparison_uses_full_token_hash_when_both_paths_expose_ids() -> None:
+    base = {
+        "content_sha256": "content",
+        "reasoning_sha256": "reasoning",
+        "finish_reason": "stop",
+        "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+        "full_token_ids": {"availability": "available", "sha256": "left"},
+        "opaque_token_fingerprint": None,
+    }
+    comparison = capture.compare_summaries(
+        base,
+        {
+            **base,
+            "full_token_ids": {"availability": "available", "sha256": "right"},
+        },
+    )
+    assert comparison["full_token_ids_sha256"] is False
+    assert comparison["usage_counts"] is True
