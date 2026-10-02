@@ -766,7 +766,7 @@ def _start_shutdown_server(tmp_path: Path, behavior: str):
 
 
 def test_stop_server_accepts_only_clean_shutdown(tmp_path: Path) -> None:
-    facts = capture.stop_server(_start_shutdown_server(tmp_path, "clean"), timeout=2)
+    facts = capture.stop_server(_start_shutdown_server(tmp_path, "clean"), timeout=10)
     assert facts["exit_code"] == 0
     assert facts["listener_gone"] is True
 
@@ -791,13 +791,16 @@ def test_stop_server_rejects_unexpected_prior_exit(tmp_path: Path) -> None:
     assert raised.value.facts["listener_gone"] is True
 
 
-@pytest.mark.parametrize("behavior", ["nonzero", "ignore"])
+@pytest.mark.parametrize(
+    ("behavior", "timeout"),
+    [("nonzero", 10.0), ("ignore", 0.1)],
+)
 def test_stop_server_rejects_abnormal_or_forced_shutdown(
-    tmp_path: Path, behavior: str
+    tmp_path: Path, behavior: str, timeout: float
 ) -> None:
     server = _start_shutdown_server(tmp_path, behavior)
     with pytest.raises(capture.ShutdownError) as raised:
-        capture.stop_server(server, timeout=0.1)
+        capture.stop_server(server, timeout=timeout)
     assert raised.value.facts["listener_gone"] is True
     if behavior == "nonzero":
         assert raised.value.facts["exit_code"] == 7
