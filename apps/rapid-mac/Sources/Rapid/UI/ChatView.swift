@@ -1179,7 +1179,8 @@ struct ChatView: View {
         let disabled = SidebarView.residentUnloadDisabled(
             isOperating: server.isOperating || isUnloadingResidentModels,
             hasActiveModelWork: viewModel.isStreaming,
-            hasActiveRequests: hasActiveRequests
+            hasActiveRequests: hasActiveRequests,
+            hasResidentLoadInFlight: !server.residentLoadsInFlight.isEmpty
         )
         let accessibleLabel = SidebarView.residentUnloadLabel(
             modelCount: modelCount,

@@ -131,4 +131,14 @@ struct ComposerResidentUnloadTests {
         #expect(ChatView.composerResidentUnloadTitle(modelCount: 1) == "Unload")
         #expect(ChatView.composerResidentUnloadTitle(modelCount: 2) == "Unload all")
     }
+
+    @Test("An in-flight resident load disables the composer unload action")
+    func residentLoadInFlightDisablesUnload() {
+        #expect(SidebarView.residentUnloadDisabled(
+            isOperating: false,
+            hasActiveModelWork: false,
+            hasActiveRequests: false,
+            hasResidentLoadInFlight: true
+        ))
+    }
 }
