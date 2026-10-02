@@ -19,9 +19,11 @@ Architecture:
 import ast
 import contextlib
 import copy
+import importlib
 import inspect
 import logging
 import os
+import sys
 import textwrap
 import threading
 import time
@@ -546,20 +548,34 @@ def _singleton_regular_cache_leaves(
     # request, which would require promoting this layout mid-generation.
     if not allow_arrays_cache or not caches:
         return False
-    try:
-        from mlx_vlm.models.cache import ArraysCache, KVCache
-    except ImportError:
-        # mlx-vlm is optional; the MLLM lane cannot even run without it.
-        return False
-    qualified: tuple[type, ...] = (KVCache, ArraysCache)
-    if allow_arrays_cache:
-        try:
-            from mlx_lm.models.cache import ArraysCache as LMArraysCache
-            from mlx_lm.models.cache import KVCache as LMKVCache
+    # Vendored cache classes are the lane's own vocabulary; upstream
+    # mlx-vlm model classes still *create* caches with their own identical
+    # class objects (type unification lands with step 3's model vendoring),
+    # so both must stay recognized here.
+    # VENDOR-DEVIATION(dual-namespace): upstream recognition is transitional;
+    # one mechanical revert restores byte-verbatim once step 3 unifies types.
+    from .models.mlx_vlm_vendored.cache import ArraysCache, KVCache
 
-            qualified += (LMArraysCache, LMKVCache)
-        except ImportError:
-            pass
+    qualified: tuple[type, ...] = (KVCache, ArraysCache)
+    try:
+        from mlx_vlm.models.cache import ArraysCache as VLMArraysCache
+        from mlx_vlm.models.cache import KVCache as VLMKVCache
+
+        qualified += (VLMArraysCache, VLMKVCache)
+    except ImportError:
+        # mlx-vlm is optional; hybrid backbones then cannot occur either.
+        pass
+    # Preserve the lane's existing degraded-import contract: tests and partial
+    # installs can still operate on upstream/vendored leaves when the separate
+    # mlx-lm cache module is unavailable. When present, BOTH regular leaf types
+    # join the exact-type tuple (KVCache must not be omitted).
+    try:
+        from mlx_lm.models.cache import ArraysCache as LMArraysCache
+        from mlx_lm.models.cache import KVCache as LMKVCache
+
+        qualified += (LMArraysCache, LMKVCache)
+    except ImportError:
+        pass
     return all(type(leaf) in qualified for leaf in caches)
 
 
@@ -574,10 +590,22 @@ def _extract_detached_singleton_leaf(leaf: Any, idx: int) -> Any:
     afterwards, so build a fresh leaf from explicit allocated copies
     and evaluate them on the caller's (worker) stream before returning.
     """
-    from mlx_vlm.models.cache import ArraysCache, KVCache
+    from .models.mlx_vlm_vendored.cache import ArraysCache, KVCache
 
     arrays_types: tuple[type, ...] = (ArraysCache,)
     kv_types: tuple[type, ...] = (KVCache,)
+    # Upstream mlx-vlm model classes create caches with their own identical
+    # class objects; recognize those too until step 3 unifies the types.
+    # VENDOR-DEVIATION(dual-namespace): upstream recognition is transitional;
+    # one mechanical revert restores byte-verbatim once step 3 unifies types.
+    try:
+        from mlx_vlm.models.cache import ArraysCache as VLMArraysCache
+        from mlx_vlm.models.cache import KVCache as VLMKVCache
+
+        arrays_types += (VLMArraysCache,)
+        kv_types += (VLMKVCache,)
+    except ImportError:
+        pass
     try:
         from mlx_lm.models.cache import ArraysCache as LMArraysCache
         from mlx_lm.models.cache import KVCache as LMKVCache
@@ -638,6 +666,54 @@ def _extract_detached_singleton_leaf(leaf: Any, idx: int) -> Any:
         detached.offset = leaf.offset
         mx.eval(detached.keys, detached.values)
     return detached
+
+
+def _extract_batched_leaf(leaf: Any, idx: int) -> Any:
+    """Extract row ``idx`` of a batched cache leaf for the exact prefix cache.
+
+    A ``BatchKVCache`` leaf that no forward ever wrote stays ``keys is None``
+    (``merge`` of all-empty per-request caches builds it that way), and
+    upstream ``BatchKVCache.extract`` slices ``self.keys`` unguarded — unlike
+    the singleton ``KVCache.extract``, which returns an empty cache. GLM-5.3
+    Flash owns such a leaf on every attention layer: its ``projected_cache``
+    slot is only populated by the long-prompt prefill path, so a short prompt
+    finishing a sequence would abort the whole batch at cache store time.
+    Recurse through ``CacheList`` so that slot is found wherever it sits.
+    """
+    if not hasattr(leaf, "extract"):
+        return None
+    list_types, batch_kv_types = _batched_leaf_types()
+    if type(leaf) in list_types:
+        return type(leaf)(*(_extract_batched_leaf(c, idx) for c in leaf.caches))
+    # Exact-type match only: ``BatchPoolingCache`` / ``ArraysCache`` also carry
+    # ``left_padding`` without ``keys`` and must keep their own ``extract``.
+    if type(leaf) in batch_kv_types and leaf.keys is None:
+        # Same empty-row contract ``KVCache.extract`` returns for an unwritten
+        # singleton leaf, from the leaf's own namespace.
+        return sys.modules[type(leaf).__module__].KVCache()
+    return leaf.extract(idx)
+
+
+def _batched_leaf_types() -> tuple[tuple[type, ...], tuple[type, ...]]:
+    """``(CacheList types, BatchKVCache types)`` across both cache namespaces.
+
+    Upstream mlx-vlm model classes still create caches with their own class
+    objects; the vendored module owns identical ones, and mlx-lm text
+    backbones bring a third set. All are recognized, mirroring the
+    namespace contract of the singleton leaf extractor.
+    """
+    from .models.mlx_vlm_vendored.cache import BatchKVCache, CacheList
+
+    list_types: tuple[type, ...] = (CacheList,)
+    batch_kv_types: tuple[type, ...] = (BatchKVCache,)
+    for module_name in ("mlx_vlm.models.cache", "mlx_lm.models.cache"):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        list_types += (module.CacheList,)
+        batch_kv_types += (module.BatchKVCache,)
+    return list_types, batch_kv_types
 
 
 # A media boundary below this many processor-expanded tokens is never
@@ -752,16 +828,28 @@ def _media_clone_leaves(
     :func:`_extract_detached_singleton_leaf`).
     """
     try:
-        from mlx_vlm.apc_adapters import clone_cache_entry
+        from rapid_mlx.models.mlx_vlm_vendored.apc_adapters import clone_cache_entry
     except ImportError:
         return None
     eval_targets: list[Any] = []
-    cloned = [
-        clone_cache_entry(
-            leaf, min_capacity_tokens=min_capacity_tokens, eval_targets=eval_targets
-        )
-        for leaf in leaves
-    ]
+    try:
+        cloned = [
+            clone_cache_entry(
+                leaf,
+                min_capacity_tokens=min_capacity_tokens,
+                eval_targets=eval_targets,
+            )
+            for leaf in leaves
+        ]
+    except ModuleNotFoundError as exc:
+        # The vendored adapter remains importable in a text-only install, but
+        # this transition slice still resolves its array-copy helpers from the
+        # pinned upstream APC module.  Treat that lazy redirect being absent
+        # exactly like the old top-level mlx-vlm import failure: decline the
+        # snapshot and let the caller perform the cold full forward.
+        if exc.name not in {"mlx_vlm", "mlx_vlm.apc"}:
+            raise
+        return None
     if any(leaf is None for leaf in cloned):
         return None
     if eval_targets:
@@ -943,7 +1031,7 @@ class MLLMBatch:
         """
         if self.cache_layout == "singleton_regular":
             return [_extract_detached_singleton_leaf(c, idx) for c in self.cache]
-        return [c.extract(idx) if hasattr(c, "extract") else None for c in self.cache]
+        return [_extract_batched_leaf(c, idx) for c in self.cache]
 
 
 class MLLMBatchStats:
@@ -1171,8 +1259,8 @@ class MLLMBatchGenerator:
         # Get language model for text generation
         self.language_model = getattr(model, "language_model", model)
 
-        # Reuse mlx-vlm's shipped APC implementation rather than maintaining
-        # another cache format in Rapid. Hybrid/ArraysCache backbones select
+        # Reuse Rapid's source-pinned APC engine rather than maintaining
+        # another cache format in this lane. Hybrid/ArraysCache backbones select
         # APC's conservative exact-snapshot mode: recurrent state resumes only
         # at a stored token boundary and is never trimmed. Block storage is not
         # used by this path, so keep that pool empty while APC owns the bounded
@@ -1193,11 +1281,11 @@ class MLLMBatchGenerator:
         self._prefix_cache_enabled = bool(enable_prefix_cache)
         if enable_prefix_cache:
             try:
-                from mlx_vlm import apc as _apc
+                from rapid_mlx.models.mlx_vlm_vendored import apc as _apc
 
                 mode = _apc.model_apc_mode(self.language_model)
                 if mode == "exact":
-                    # mlx-vlm 0.7.1 enables APC's persistent disk tier by
+                    # mlx-vlm 0.7.2 enables APC's persistent disk tier by
                     # default.  Rapid's exact MLLM snapshots can be large and
                     # historically lived only inside the bounded in-process
                     # cache, so do not start writing a new home-directory
@@ -1329,7 +1417,9 @@ class MLLMBatchGenerator:
         )
         if self._supports_vision_feature_cache:
             try:
-                from mlx_vlm.vision_cache import VisionFeatureCache
+                from rapid_mlx.models.mlx_vlm_vendored.vision_cache import (
+                    VisionFeatureCache,
+                )
 
                 # Each entry pins a projected-features ``mx.array`` (Metal
                 # buffer) for the image's lifetime in the LRU, so bound this
@@ -1568,7 +1658,7 @@ class MLLMBatchGenerator:
             hit: str = cached
             return hit
         try:
-            from mlx_vlm import apc as _apc
+            from rapid_mlx.models.mlx_vlm_vendored import apc as _apc
 
             salt = str(
                 _apc.semantic_extra_hash(model=self.model, processor=self.processor)
@@ -2636,7 +2726,10 @@ class MLLMBatchGenerator:
         their offset (mlx-vlm's own ``trim``), recurrent layers restore the
         checkpoint recorded there. None when any layer cannot be rewound."""
         try:
-            from mlx_vlm.apc_adapters import Capability, resolve_capability
+            from rapid_mlx.models.mlx_vlm_vendored.apc_adapters import (
+                Capability,
+                resolve_capability,
+            )
         except ImportError:  # pragma: no cover - mlx-vlm absent
             return None
         out: list[Any] = []
@@ -2712,20 +2805,31 @@ class MLLMBatchGenerator:
         if rewound is None:
             return None
         try:
-            from mlx_vlm.apc_adapters import clone_cache_entry
+            from rapid_mlx.models.mlx_vlm_vendored.apc_adapters import (
+                clone_cache_entry,
+            )
         except ImportError:  # pragma: no cover - mlx-vlm absent
             return None
         eval_targets: list[Any] = []
         warm: list[Any] = []
-        for layer in rewound:
-            cloned = clone_cache_entry(
-                layer,
-                min_capacity_tokens=len(full_ids) + 1,
-                eval_targets=eval_targets,
-            )
-            if cloned is None:
-                return None
-            warm.append(cloned)
+        try:
+            for layer in rewound:
+                cloned = clone_cache_entry(
+                    layer,
+                    min_capacity_tokens=len(full_ids) + 1,
+                    eval_targets=eval_targets,
+                )
+                if cloned is None:
+                    return None
+                warm.append(cloned)
+        except ModuleNotFoundError as exc:
+            # See ``_media_clone_leaves``: the vendored adapter intentionally
+            # keeps its array-copy helper on the pinned upstream runtime until
+            # the producer cutover. Missing optional vision/APC dependencies
+            # are a cache miss, not a request failure.
+            if exc.name not in {"mlx_vlm", "mlx_vlm.apc"}:
+                raise
+            return None
         if eval_targets:
             mx.eval(eval_targets)
         holders = collect_checkpoints(rewound)
@@ -3007,7 +3111,7 @@ class MLLMBatchGenerator:
             return
 
         tic = time.perf_counter()
-        from mlx_vlm.utils import prepare_inputs
+        from rapid_mlx.models.mlx_vlm_vendored.inputs import prepare_inputs
 
         if request.images:
             from .models.mllm import FileSizeExceededError, process_image_input

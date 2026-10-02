@@ -404,6 +404,9 @@ def _spawn_foreground_serve(model: str, args) -> subprocess.Popen:
     # The parent already ran the download-consent gate; suppress the child's
     # own B2 re-prompt (chat spawner pattern).
     child_env["RAPID_MLX_CHAT_SPAWN"] = "1"
+    child_env.pop("RAPID_MLX_AUTO_SELECTED", None)
+    if not getattr(args, "_model_was_explicit", True):
+        child_env["RAPID_MLX_AUTO_SELECTED"] = "1"
     # If the start parent is SIGKILLed, the child self-terminates instead of
     # orphan-locking the model + port.
     child_env["RAPID_MLX_WATCHDOG_PPID"] = str(os.getpid())
@@ -670,6 +673,7 @@ def _attach_and_configure(base_url, model, profile, args) -> int:
             build_setup_plan,
             confirm_plan,
         )
+        from rapid_mlx.agents.telemetry import track_agent_configured
 
         try:
             plan = build_setup_plan(
@@ -678,6 +682,7 @@ def _attach_and_configure(base_url, model, profile, args) -> int:
                 model,
                 context_length=context_length,
                 supports_reasoning=supports_reasoning,
+                emit_telemetry=not args.dry_run,
             )
         except (OSError, ValueError) as exc:
             print(f"  {profile.display_name} setup failed: {exc}")
@@ -706,6 +711,7 @@ def _attach_and_configure(base_url, model, profile, args) -> int:
                 _print_instructions(profile, api_base_url, model)
                 return 1
             print(f"  Configured {profile.display_name} at {plan.path}.")
+            track_agent_configured(profile.name)
     else:
         from rapid_mlx.agents.adapter import setup_agent_config
 

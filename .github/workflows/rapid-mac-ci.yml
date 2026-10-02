@@ -430,7 +430,13 @@ jobs:
       needs.changes.outputs.desktop == 'true' &&
       needs.changes.outputs.full_gate == 'true' &&
       needs.queue-tree-evidence.outputs.reuse_mac != 'true'
-    runs-on: macos-15
+    # The expensive producer runs only after `full_gate` promotion. For PRs,
+    # that signal is limited to an exact internal Mergify candidate head; fork
+    # PRs remain false and therefore never execute repository code on the
+    # trusted Mac fleet. Main pushes use the same pinned Manzanita image as the
+    # artifact consumers, removing a second provider queue without changing
+    # the commit-bound build-once contract.
+    runs-on: manzanita-standard
     timeout-minutes: 20
     defaults:
       run:
@@ -442,6 +448,8 @@ jobs:
         env:
           SKIP_SIDECAR: "1"
           RAPID_BUILD_CONFIG: release
+          RAPID_MLX_TELEMETRY: "0"
+          DO_NOT_TRACK: "1"
         run: ./scripts/build.sh
 
       - name: Verify and package GUI app
@@ -517,7 +525,7 @@ jobs:
       # manifest groups. Every named step remains visible, but the harness
       # exits before launch for journeys owned by another lane. The harness
       # gives every selected journey its own HOME, defaults, ports, app
-      # processes, and result directory; separate hosted VMs isolate the two
+      # processes, and result directory; separate hosted VMs isolate the four
       # concurrent bundles from one another.
       GUI_FLOWS: ${{ matrix.gui_flows }}
     steps:

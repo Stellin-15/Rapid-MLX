@@ -65,6 +65,18 @@ def test_parse_dspark_speculative_config_accepts_native_depth() -> None:
     assert cfg.num_speculative_tokens == 5
 
 
+def test_parse_dspark_speculative_config_accepts_companion_model() -> None:
+    cfg = parse_speculative_config(
+        '{"method":"dspark","model":"LiquidAI/LFM2.5-VL-3B-DSpark",'
+        '"num_speculative_tokens":7}'
+    )
+
+    assert cfg is not None
+    assert cfg.method == "dspark"
+    assert cfg.model == "LiquidAI/LFM2.5-VL-3B-DSpark"
+    assert cfg.num_speculative_tokens == 7
+
+
 def test_parse_speculative_config_normalizes_registered_alias() -> None:
     cfg = parse_speculative_config('{"method":"ngram"}')
 
@@ -93,8 +105,10 @@ def test_parse_suffix_speculative_config_accepts_existing_knobs() -> None:
         ("[]", "JSON object"),
         ("{bad", "valid JSON"),
         ('{"model":"x"}', "requires string key 'method'"),
-        ('{"method":"mtp","num_speculative_tokens":0}', "positive integer"),
-        ('{"method":"mtp","num_speculative_tokens":true}', "positive integer"),
+        (
+            '{"method":"mtp","num_speculative_tokens":true}',
+            "non-negative integer",
+        ),
         ('{"method":"mtp","model":""}', "non-empty string"),
         ('{"method":"mtp","tree_budget":24}', "unsupported speculative-config"),
         ('{"method":"mtp","disable_auto_k":1}', "boolean"),
@@ -119,6 +133,43 @@ def test_parse_suffix_speculative_config_accepts_existing_knobs() -> None:
     ],
 )
 def test_parse_speculative_config_rejects_bad_payloads(raw: str, match: str) -> None:
+    with pytest.raises(SpeculativeConfigError, match=match):
+        parse_speculative_config(raw)
+
+
+def test_parse_mtp_accepts_fixed_zero_depth_validation_baseline() -> None:
+    cfg = parse_speculative_config(
+        '{"method":"mtp","model":"local/assistant",'
+        '"num_speculative_tokens":0,"disable_auto_k":true}'
+    )
+    assert cfg is not None
+    assert cfg.num_speculative_tokens == 0
+    assert cfg.disable_auto_k is True
+
+
+@pytest.mark.parametrize(
+    ("raw", "match"),
+    [
+        (
+            '{"method":"mtp","num_speculative_tokens":0}',
+            "requires disable_auto_k=true",
+        ),
+        (
+            '{"method":"mtp","num_speculative_tokens":0,"disable_auto_k":false}',
+            "requires disable_auto_k=true",
+        ),
+        (
+            '{"method":"mtp","num_speculative_tokens":0,'
+            '"disable_auto_k":true,"continuous_batching":true}',
+            "cannot use continuous_batching=true",
+        ),
+        (
+            '{"method":"mtp","num_speculative_tokens":-1,"disable_auto_k":true}',
+            "non-negative integer",
+        ),
+    ],
+)
+def test_parse_mtp_rejects_unsafe_zero_depth_modes(raw: str, match: str) -> None:
     with pytest.raises(SpeculativeConfigError, match=match):
         parse_speculative_config(raw)
 
@@ -295,6 +346,58 @@ def test_speculative_config_mtp_normalizes_to_legacy_spec_decode() -> None:
     assert args._speculative_config.disable_auto_k is True
 
 
+def test_speculative_config_dspark_keeps_legacy_and_companion_defaults() -> None:
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
+
+    legacy = _spec_config_args(speculative_config='{"method":"dspark"}')
+    _normalize_speculative_config_or_exit(legacy)
+    assert legacy.spec_decode == "dspark"
+    assert legacy.dspark_num_speculative_tokens == 5
+
+    companion = _spec_config_args(
+        speculative_config=(
+            '{"method":"dspark","model":"LiquidAI/LFM2.5-VL-3B-DSpark"}'
+        ),
+        mllm=True,
+    )
+    _normalize_speculative_config_or_exit(companion)
+    assert companion.spec_decode == "dspark"
+    assert companion.dspark_num_speculative_tokens == 7
+
+    recommended = _spec_config_args(
+        model="LiquidAI/LFM2.5-VL-3B",
+        speculative_config='{"method":"dspark"}',
+        mllm=True,
+    )
+    _normalize_speculative_config_or_exit(recommended)
+    assert recommended._speculative_config.model == ("LiquidAI/LFM2.5-VL-3B-DSpark")
+    assert recommended.dspark_num_speculative_tokens == 7
+
+
+def test_speculative_config_rejects_mllm_with_capability_event(monkeypatch) -> None:
+    from rapid_mlx.cli import _normalize_speculative_config_or_exit
+    from rapid_mlx.telemetry import inference
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        inference,
+        "emit_capability_rejected",
+        lambda value, *, model_type="other", **_context: calls.append(
+            (value, model_type)
+        ),
+    )
+    args = _spec_config_args(
+        speculative_config='{"method":"mtp"}',
+        mllm=True,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        _normalize_speculative_config_or_exit(args)
+
+    assert exc_info.value.code == 2
+    assert calls == [("speculative_decoding_unsupported", "vlm")]
+
+
 def test_speculative_config_mtp_populates_runtime_args() -> None:
     from rapid_mlx.cli import _normalize_speculative_config_or_exit
 
@@ -314,6 +417,31 @@ def test_speculative_config_mtp_populates_runtime_args() -> None:
     assert config_args.suffix_decoding is False
     assert config_args.enable_dflash is False
     assert config_args.enable_ddtree is False
+
+
+def test_speculative_config_mtp_preserves_fixed_zero_depth(monkeypatch) -> None:
+    """CLI normalization must not replace explicit K=0 with a truthy default."""
+    from rapid_mlx import cli
+
+    # Exercise the regression shape: an alias whose omitted continuous setting
+    # would normally resolve to True must still keep the K=0 baseline serial.
+    monkeypatch.setattr(cli, "_alias_continuous_mtp_tier", lambda _model: "verified")
+
+    args = _spec_config_args(
+        model="qualified/model",
+        speculative_config=(
+            '{"method":"mtp","model":"local/assistant",'
+            '"num_speculative_tokens":0,"disable_auto_k":true}'
+        ),
+    )
+
+    cli._normalize_speculative_config_or_exit(args)
+
+    assert args.spec_decode == "mtp"
+    assert args.mtp_sidecar == "local/assistant"
+    assert args.mtp_max_k == 0
+    assert args.mtp_disable_auto_k is True
+    assert args.mtp_continuous_batching is False
 
 
 def test_speculative_config_native_mtp_populates_explicit_backend() -> None:

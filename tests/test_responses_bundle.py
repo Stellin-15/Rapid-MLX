@@ -14,6 +14,7 @@ no MLX import — so the tests stay fast and CI-portable.
 import json
 import sys
 import types
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -73,6 +74,7 @@ def _make_function_call(name: str, args: str, call_id: str = "call_test"):
 
 class _Engine:
     preserve_native_tool_format = False
+    supports_guided_generation = False
 
     def __init__(
         self,
@@ -134,8 +136,14 @@ def _install_lightweight_engine_modules(monkeypatch):
     base_mod.BaseEngine = _BaseEngine
     base_mod.GenerationOutput = _GenerationOutput
 
+    batched_mod = types.ModuleType("rapid_mlx.engine.batched")
+    batched_mod._admission_engine_context = ContextVar(
+        "test_admission_engine_context", default=None
+    )
+
     monkeypatch.setitem(sys.modules, "rapid_mlx.engine", engine_pkg)
     monkeypatch.setitem(sys.modules, "rapid_mlx.engine.base", base_mod)
+    monkeypatch.setitem(sys.modules, "rapid_mlx.engine.batched", batched_mod)
 
 
 _IMPORTED_UNDER_LIGHTWEIGHT_ENGINE = (
@@ -143,6 +151,7 @@ _IMPORTED_UNDER_LIGHTWEIGHT_ENGINE = (
     "rapid_mlx.config.server_config",
     "rapid_mlx.engine",
     "rapid_mlx.engine.base",
+    "rapid_mlx.engine.batched",
     "rapid_mlx.middleware.auth",
     "rapid_mlx.service.helpers",
     "rapid_mlx.routes.responses",
@@ -152,6 +161,7 @@ _PARENT_ATTRS_UNDER_LIGHTWEIGHT_ENGINE = (
     ("rapid_mlx", "engine"),
     ("rapid_mlx.config", "server_config"),
     ("rapid_mlx.engine", "base"),
+    ("rapid_mlx.engine", "batched"),
     ("rapid_mlx.middleware", "auth"),
     ("rapid_mlx.service", "helpers"),
     ("rapid_mlx.routes", "responses"),
@@ -276,6 +286,56 @@ def _parse_sse(body: str) -> list[tuple[str, dict]]:
         if event_name and data_text is not None:
             events.append((event_name, json.loads(data_text)))
     return events
+
+
+def test_strict_stream_returns_normal_sse_without_capability_rejection(
+    monkeypatch, make_responses_client
+):
+    from rapid_mlx.telemetry import inference
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        inference,
+        "emit_capability_rejected",
+        lambda capability, *, model_type="other", **_context: calls.append(
+            (capability, model_type)
+        ),
+    )
+    state = make_responses_client(text='{"answer":"ok"}')
+    response = state.client.post(
+        "/v1/responses",
+        headers=_AUTH,
+        json=_payload(
+            stream=True,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "answer",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                        "additionalProperties": False,
+                    },
+                    "strict": True,
+                }
+            },
+        ),
+    )
+
+    assert response.status_code == 200, response.text
+    events = _parse_sse(response.text)
+    assert events[0][0] == "response.created"
+    assert events[-1][0] == "response.completed"
+    assert (
+        "".join(
+            payload["delta"]
+            for event, payload in events
+            if event == "response.output_text.delta"
+        )
+        == '{"answer":"ok"}'
+    )
+    assert calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -820,7 +880,7 @@ class TestF6ToolChoiceEnforcement:
         ), events
 
     def test_required_streaming_multi_tool_unfulfilled_emits_response_failed(
-        self, make_responses_client
+        self, make_responses_client, monkeypatch
     ):
         """Codex r2 BLOCKING (PR #817): the non-stream path 422s for
         multi-tool ``required`` with no model call, but the streaming
@@ -828,6 +888,14 @@ class TestF6ToolChoiceEnforcement:
         committed. Emit a ``response.failed`` event with the same
         error code/message so clients see a clean shutdown.
         """
+        from rapid_mlx.telemetry import inference
+
+        emit_calls: list[dict[str, object]] = []
+        monkeypatch.setattr(
+            inference,
+            "emit_completed_request",
+            lambda **kwargs: emit_calls.append(kwargs),
+        )
         state = make_responses_client(text="text-only", tool_calls=None)
 
         with state.client.stream(
@@ -851,6 +919,9 @@ class TestF6ToolChoiceEnforcement:
         assert failed[0]["response"]["error"]["code"] == (
             "tool_choice_required_unfulfilled"
         )
+        assert len(emit_calls) == 1
+        assert emit_calls[0]["endpoint"] == "/v1/responses"
+        assert emit_calls[0]["result"] == "failed"
 
     def test_required_streaming_with_real_tool_call_keeps_text(
         self, make_responses_client

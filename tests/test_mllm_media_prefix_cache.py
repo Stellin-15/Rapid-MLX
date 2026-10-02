@@ -944,7 +944,7 @@ class TestStorePath:
         assert out is not None
 
     def test_clone_failure_redoes_a_cold_full_forward(self, monkeypatch):
-        import mlx_vlm.apc_adapters as apc_adapters
+        import rapid_mlx.models.mlx_vlm_vendored.apc_adapters as apc_adapters
 
         monkeypatch.setattr(apc_adapters, "clone_cache_entry", lambda *a, **k: None)
         gen = _stub_generator()
@@ -1297,7 +1297,7 @@ class TestResumePath:
         assert gen.model.calls[0][0] == diverged[0]
 
     def test_resume_clone_failure_degrades_to_cold(self, monkeypatch):
-        import mlx_vlm.apc_adapters as apc_adapters
+        import rapid_mlx.models.mlx_vlm_vendored.apc_adapters as apc_adapters
 
         full_ids = _full_ids()
         gen, req, ids, _ = self._gen_with_entry(full_ids)
@@ -1873,7 +1873,7 @@ def probe():
         real_import = builtins.__import__
 
         def guarded_import(name, *args, **kwargs):
-            if name == "mlx_vlm.apc_adapters":
+            if name == "rapid_mlx.models.mlx_vlm_vendored.apc_adapters":
                 raise ImportError("held out")
             return real_import(name, *args, **kwargs)
 
@@ -1892,6 +1892,22 @@ def probe():
         assert _media_leaf_bytes(RaisingState()) is None
         holder = SimpleNamespace(first=mx.zeros((2,)), second=[mx.zeros((3,))])
         assert _media_leaf_bytes(holder) == 5 * mx.zeros((1,)).itemsize
+
+    def test_clone_uses_cache_owned_contract_without_upstream_apc_redirect(
+        self, monkeypatch
+    ):
+        """mlx-vlm 0.7.2 cache-owned snapshots need no lazy APC helper."""
+        import builtins
+
+        real_import = builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name == "mlx_vlm.apc":
+                raise ModuleNotFoundError(name=name)
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", guarded_import)
+        assert _media_clone_leaves(_kv_leaves(), min_capacity_tokens=32) is not None
 
     def test_tokenizer_boundary_and_semantics_fallbacks(self, monkeypatch):
         gen = _stub_generator()
@@ -1920,7 +1936,7 @@ def probe():
             is None
         )
 
-        import mlx_vlm.apc as apc
+        import rapid_mlx.models.mlx_vlm_vendored.apc as apc
 
         monkeypatch.setattr(
             apc,

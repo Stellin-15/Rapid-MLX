@@ -29,6 +29,9 @@ except ImportError:
     gr = None
 import requests
 
+from .client_header import RAPID_CLIENT_GRADIO
+from .http_auth import rapid_mlx_client_headers
+
 
 def encode_file_to_base64(file_path: str) -> tuple[str, str]:
     """
@@ -229,6 +232,7 @@ def create_chat_function(server_url: str, max_tokens: int, temperature: float):
         try:
             response = requests.post(
                 f"{server_url}/v1/chat/completions",
+                headers=rapid_mlx_client_headers(RAPID_CLIENT_GRADIO),
                 json={
                     "model": "default",
                     "messages": messages,
@@ -256,6 +260,10 @@ def main():
     if gr is None:
         import sys
 
+        from rapid_mlx.runtime.optional_runtime import optional_extra_install_hint
+
+        install_hint = optional_extra_install_hint("chat")
+
         if len(sys.argv) == 1:
             # The installer's quick-start (and muscle memory) reach for
             # `rapid-mlx-chat` on a base install, where the [chat] extra is
@@ -266,7 +274,7 @@ def main():
             # (a share link, another server-url) — no silent substitute.
             print(
                 "rapid-mlx-chat is the web chat UI and needs the [chat] extra:\n"
-                "    pip install 'rapid-mlx[chat]'\n"
+                f"{install_hint}\n"
                 "Starting the terminal chat against http://localhost:8000 instead...\n",
                 file=sys.stderr,
             )
@@ -276,7 +284,7 @@ def main():
             sys.exit(cli.main())
         print(
             "Error: gradio is required for the chat UI.\n"
-            "Install it with: pip install 'rapid-mlx[chat]'\n"
+            f"{install_hint}\n"
             "\n"
             "The rapid-mlx-chat command requires the [chat] extra which\n"
             "includes gradio and pytz. It is not installed by default to\n"
@@ -366,6 +374,7 @@ Note: Make sure the rapid-mlx server is running with a multimodal model:
             try:
                 response = requests.post(
                     f"{args.server_url}/v1/chat/completions",
+                    headers=rapid_mlx_client_headers(RAPID_CLIENT_GRADIO),
                     json={
                         "model": "default",
                         "messages": messages,

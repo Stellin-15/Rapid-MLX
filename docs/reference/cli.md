@@ -22,12 +22,23 @@
 | `rapid-mlx agents` | List, configure, and test agent integrations |
 | `rapid-mlx start` | Start an AI agent with a local model in one command |
 | `rapid-mlx doctor` | Diagnose the selected runtime; timeout/unverified checks are warnings, not broken-package failures |
-| `rapid-mlx telemetry` | Manage anonymous usage telemetry (opt-in) |
+| `rapid-mlx telemetry` | Inspect or change default-on anonymous usage telemetry (`status`, `on`, `off`, `reset-id`, `preview`, `reset`; `enable`/`disable` remain aliases) |
+| `rapid-mlx feedback` | Tell us what you want from Rapid-MLX (opens the community Discord; `--no-open` just prints the link) |
 | `rapid-mlx upgrade` | Upgrade rapid-mlx with its detected manager (brew / uv / pipx / pip / install.sh) |
 | `rapid-mlx version` | Show version number |
 | `rapid-mlx help <cmd>` | Show help for a subcommand |
 
 Run `rapid-mlx <cmd> --help` for the full flag list of any subcommand.
+
+## `rapid-mlx telemetry`
+
+Telemetry is anonymous, metadata-only, and on by default beginning with
+0.15.0. `status` is the default action. Use `on` or `off` to change consent,
+`reset-id` to rotate only the anonymous install ID, `preview` to print one
+exact v2 `app_opened` batch item without sending it, and `reset` to rotate the
+ID and delete the stored preference. The next run is treated as a new install.
+`reset` emits no telemetry event. `enable` and `disable` remain aliases for
+`on` and `off` for one release.
 
 ## `rapid-mlx doctor`
 
@@ -205,12 +216,13 @@ are the argparse defaults from `rapid_mlx/cli.py`.
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--port` | Server port | 8000 |
+| `--port` | Server port; when omitted, selects the first free port in 8000–8009; an explicit port never falls back | First free in 8000–8009 |
 | `--host` | Server host (loopback-only by default; pass `0.0.0.0` to expose on LAN — review the auth posture first) | 127.0.0.1 |
-| `--listen-fd` | File descriptor of a pre-bound listening socket (3-1023) for socket activation (launchd/systemd/parent-process supervision). When set, `--host`/`--port` are ignored for binding. | None |
+| `--listen-fd` | File descriptor of a pre-bound listening socket (3-1023) for socket activation (launchd/systemd/parent-process supervision). When set, `--host`/`--port` are ignored for binding. Native MTP, DSpark K4, DFlash, and DDTree reject this option with rc 2. | None |
 | `--log-level` | Log level for Python logging and uvicorn (`DEBUG`, `INFO`, `WARNING`, `ERROR`; case-insensitive) | INFO |
 | `--served-model-name` | Model name reported by the API; when unset the `model` argument is used | None |
 | `--watchdog-ppid` | Self-terminate when the parent process with this PID dies (defeats orphaned sidecars). Falls back to `RAPID_MLX_WATCHDOG_PPID`; 0 / unset disables. | None (disabled) |
+| `--yes` / `-y` | Assume yes in interactive or non-interactive sessions, such as when installing a missing optional extra | off |
 
 #### Security and limits
 
@@ -246,7 +258,7 @@ are the argparse defaults from `rapid_mlx/cli.py`.
 | `--prefix-cache-index` | Prefix-cache lookup index: `radix` (token trie, surfaces dedup-bytes-saved on `/metrics`) or `hash` (legacy bisect path) | radix |
 | `--prefix-cache-size` | Max entries in the prefix cache (legacy entry-count mode only) | 100 |
 | `--cache-memory-mb` | Cache memory limit in MB | Auto (~20% of RAM) |
-| `--cache-memory-percent` | Fraction of available RAM for cache when auto-detecting | 0.20 |
+| `--cache-memory-percent` | Fraction of available RAM for cache when auto-detecting. When the flag is not passed, the 0.20 default is raised to the agent-session floor (a third of the Metal headroom left after the weights, at most 4 GiB) when that is larger. An explicit value is always kept | 0.20 |
 | `--idle-cache-clear-seconds` | Clear reusable prefix/KV cache after this many idle seconds; model weights remain loaded. 0 disables. Falls back to `RAPID_MLX_IDLE_CACHE_CLEAR_SECONDS`. | Disabled |
 | `--no-memory-aware-cache` | Use the legacy entry-count cache instead of the memory-aware cache | off |
 | `--hybrid-cache-entries` | Opt-in trim-free prefix reuse: retain N non-trimmable prefix-cache entries (stable prefix + new suffix each turn) for hybrid (GatedDeltaNet/Mamba) and sliding-window (Gemma 4, GPT-OSS) models. 0 disables. | 0 |
@@ -431,6 +443,13 @@ rapid-mlx serve qwen3.5-9b-8bit --speculative-config '{"method":"ddtree"}' --por
 # DeepSeek V4 Flash checkpoint-native DSpark (block size is checkpoint-defined)
 rapid-mlx serve /path/to/DeepSeek-V4-Flash-0731-MLX \
   --speculative-config '{"method":"dspark","num_speculative_tokens":5}' --port 8000
+
+# Qualified BF16 LFM2.5-VL-3B + official DSpark companion (greedy, serial,
+# text + image, immutable revisions, seven proposals / width eight; requires
+# mlx-vlm 0.7.2)
+rapid-mlx serve LiquidAI/LFM2.5-VL-3B \
+  --speculative-config '{"method":"dspark","model":"LiquidAI/LFM2.5-VL-3B-DSpark","num_speculative_tokens":7}' \
+  --port 8000
 
 # MTP fixed-K parity bench mode
 rapid-mlx serve <mtp-eligible-qwen-checkpoint> \
@@ -733,7 +752,7 @@ flag always wins over its env-var fallback when both are set.
 | `RAPID_MLX_BODY_RECEIVE_TIMEOUT_SECONDS` | 15 | Max idle seconds between request-body chunks (slowloris defense); exceeded connections get HTTP 408. 0 disables. |
 | `RAPID_MLX_IDLE_CACHE_CLEAR_SECONDS` | 0 (disabled) | Fallback for `--idle-cache-clear-seconds`: clear reusable KV state after this many idle seconds, keeping model weights loaded. An explicit CLI value (including 0) wins. |
 | `RAPID_MLX_WATCHDOG_PPID` | unset (disabled) | Fallback for `--watchdog-ppid`: self-terminate when the parent with this PID dies |
-| `RAPID_MLX_TELEMETRY` | unset | Telemetry kill switch: `0` / `false` / `no` / `off` / empty force-disables telemetry regardless of stored consent. Truthy values do NOT force-enable (consent is interactive-only). |
+| `RAPID_MLX_TELEMETRY` | unset (reporting defaults on) | Telemetry kill switch: `0` / `false` / `no` / `off` / empty force-disables telemetry regardless of stored consent. Truthy values do not force-enable. |
 | `DO_NOT_TRACK` | unset | Cross-tool opt-out convention: `1` / `true` force-disables telemetry regardless of stored consent (other values are ignored). Same precedence as `RAPID_MLX_TELEMETRY=0`; `rapid-mlx telemetry status` reports it as the reason. |
 | `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, `CIRCLECI`, `TRAVIS`, `BUILDKITE`, `JENKINS_URL`, `TEAMCITY_VERSION` | unset | Any of these set to a non-empty value marks a build machine and force-disables telemetry (build machines are never users). `rapid-mlx telemetry status` reports `ci (<VAR> is set)`. |
 | `RAPID_MLX_KV_CHECKPOINT_MAX_BYTES` | 21474836480 (20 GiB) | Disk cap for `~/.cache/rapid-mlx/kv_checkpoints/` when `--kv-disk-checkpoint-interval` is enabled; oldest files evicted first. Read at scan time, so it can change without a restart. |

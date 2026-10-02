@@ -326,12 +326,13 @@ def pin_main_ref(repo_id: str, revision: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _variant_marker_path(repo_id: str) -> str:
-    """The HF-cache path holding a ``--bits/--format`` pulled variant name.
+def rapid_cache_marker_path(repo_id: str, name: str) -> str:
+    """Path of a Rapid-MLX marker file for ``repo_id`` inside the HF cache.
 
-    Lives under a Rapid-MLX-owned directory beside the Hub-managed
-    ``refs/``/``snapshots/`` trees, so Hub cache scans never interpret the
-    variant as a commit hash. Pure path computation — no network, no state.
+    Markers live under a Rapid-MLX-owned directory beside the Hub-managed
+    ``refs/``/``snapshots/`` trees, so Hub cache scans never interpret one
+    as a commit hash, and they are deleted together with the cached repo.
+    Pure path computation — no network, no state.
     """
     try:
         from huggingface_hub.constants import HF_HUB_CACHE
@@ -343,8 +344,13 @@ def _variant_marker_path(repo_id: str) -> str:
         HF_HUB_CACHE,
         f"models--{repo_id.replace('/', '--')}",
         ".rapid-mlx",
-        "variant",
+        name,
     )
+
+
+def _variant_marker_path(repo_id: str) -> str:
+    """The HF-cache path holding a ``--bits/--format`` pulled variant name."""
+    return rapid_cache_marker_path(repo_id, "variant")
 
 
 def persist_pulled_variant(repo_id: str, variant: str) -> bool:
@@ -478,6 +484,13 @@ def _model_info_with_timeout(repo_id: str, timeout: float):
         raise TimeoutError(f"model_info({repo_id!r}) exceeded {timeout}s")
     if "error" in result:
         raise result["error"]
+    # A metadata call that succeeds without a Hub token proves the repo is
+    # public: a gated or private repo answers 401/403 to an anonymous
+    # client. That is the ONLY evidence telemetry accepts before it may
+    # report a non-catalog ``org/name``. Never raises.
+    from .telemetry.model_id import note_hub_fetch
+
+    note_hub_fetch(repo_id)
     return result.get("info")
 
 
@@ -1435,6 +1448,8 @@ IMAGE_MODEL_REVISIONS: dict[str, str] = {
     "mflux-community/flux-1-schnell-mflux-q4": "bcdbe817ad51175959b2e691e64eca626db30558",
     "mflux-community/flux2-klein-4b-mflux-bf16": "4d8e1bae8eb47c7766705de2cda7dabd6cc4ba67",
     "mflux-community/qwen-image-mflux-q6": "c628fe4392d963557c3013c2709e6d3b67bca79d",
+    "mlx-community/Qwen-Image-2.1-mflux-q4": "746a58556820933a2df5c75887a2570f1ad200c0",
+    "Qwen/Qwen-Image-2.1": "790c92633540aa0cb11d9abf19eb46d861714758",
     "OsaurusAI/Qwen-Image-Edit-mflux-q8": "a458969f2a612433cf036bfc3d8d818ceba29fab",
     HIDREAM_O1_REPO: HIDREAM_O1_REVISION,
     SDXL_REPO: SDXL_REVISION,
@@ -1513,6 +1528,11 @@ def pinned_image_snapshot(repo_id: str) -> str | None:
 _MFLUX_EXTRA_TOKENIZERS: dict[str, tuple[str, ...]] = {
     "mflux-community/flux-1-schnell-mflux-q4": ("tokenizer_2",),
 }
+_MFLUX_TOKENIZER_DIRS: dict[str, tuple[str, ...]] = {
+    # Official Qwen 2.1 stores its Qwen3-VL tokenizer under processor/.
+    "Qwen/Qwen-Image-2.1": ("processor",),
+    "mlx-community/Qwen-Image-2.1-mflux-q4": ("processor",),
+}
 _MFLUX_EXTRA_COMPONENTS: dict[str, tuple[str, ...]] = {
     "mflux-community/flux-1-schnell-mflux-q4": ("text_encoder_2",),
 }
@@ -1525,6 +1545,14 @@ _MFLUX_SINGLE_FILE_COMPONENTS: dict[str, dict[str, str]] = {
     "mflux-community/flux2-klein-4b-mflux-bf16": {
         "transformer": "diffusion_pytorch_model.safetensors",
         "vae": "diffusion_pytorch_model.safetensors",
+    },
+    "Qwen/Qwen-Image-2.1": {
+        "vae": "diffusion_pytorch_model.safetensors",
+    },
+}
+_MFLUX_INDEX_FILES: dict[str, dict[str, str]] = {
+    "Qwen/Qwen-Image-2.1": {
+        "transformer": "diffusion_pytorch_model.safetensors.index.json",
     },
 }
 
@@ -1666,12 +1694,45 @@ def mflux_missing_weights(repo_id: str) -> list[str] | None:
     repo_root, snap_dir = resolved
 
     repo_root_real = os.path.realpath(repo_root)
+    owned_blobs = os.path.join(repo_root_real, "blobs")
+    shared_blobs = os.path.realpath(os.path.join(os.path.dirname(repo_root), "blobs"))
+
+    def _is_shared_cache_blob(path: str, real: str) -> bool:
+        # Some HF cache installations deduplicate blobs across repositories:
+        # snapshot -> this repo's blobs/<etag> -> hub/blobs/<prefix>/<digest>.
+        # Require both links and the shared store's exact digest layout so a
+        # crafted snapshot cannot borrow an arbitrary file elsewhere on disk.
+        if not os.path.islink(path):
+            return False
+        first_hop = os.path.abspath(
+            os.path.join(os.path.dirname(path), os.readlink(path))
+        )
+        if os.path.realpath(
+            os.path.dirname(first_hop)
+        ) != owned_blobs or not re.fullmatch(
+            r"(?:[0-9a-f]{40}|[0-9a-f]{64})", os.path.basename(first_hop)
+        ):
+            return False
+        second_hop = os.path.abspath(
+            os.path.join(os.path.dirname(first_hop), os.readlink(first_hop))
+        )
+        relative = os.path.relpath(real, shared_blobs).split(os.sep)
+        return (
+            os.path.realpath(second_hop) == real
+            and len(relative) == 2
+            and re.fullmatch(r"[0-9a-f]{64}", relative[1]) is not None
+            and relative[0] == relative[1][:2]
+        )
 
     def _is_nonempty_repo_file(path: str) -> bool:
         if not os.path.isfile(path):
             return False
         real = os.path.realpath(path)
-        if real != repo_root_real and not real.startswith(repo_root_real + os.sep):
+        if (
+            real != repo_root_real
+            and not real.startswith(repo_root_real + os.sep)
+            and not _is_shared_cache_blob(path, real)
+        ):
             return False
         try:
             return os.path.getsize(path) > 0
@@ -1700,7 +1761,9 @@ def mflux_missing_weights(repo_id: str) -> list[str] | None:
     # All supported mflux families use these common components. Some
     # checkpoints add family-specific encoders/tokenizers, which are part of
     # the same completeness contract.
-    tokenizers = ("tokenizer",) + _MFLUX_EXTRA_TOKENIZERS.get(repo_id, ())
+    tokenizers = _MFLUX_TOKENIZER_DIRS.get(
+        repo_id, ("tokenizer",)
+    ) + _MFLUX_EXTRA_TOKENIZERS.get(repo_id, ())
     for tokenizer in tokenizers:
         tokenizer_rel = f"{tokenizer}/tokenizer.json"
         if not _is_nonempty_repo_file(os.path.join(snap_dir, tokenizer_rel)):
@@ -1717,8 +1780,11 @@ def mflux_missing_weights(repo_id: str) -> list[str] | None:
             if not _is_nonempty_repo_file(os.path.join(component_dir, single_file)):
                 missing.append(single_rel)
             continue
-        index_rel = f"{component}/model.safetensors.index.json"
-        index_path = os.path.join(component_dir, "model.safetensors.index.json")
+        index_file = _MFLUX_INDEX_FILES.get(repo_id, {}).get(
+            component, "model.safetensors.index.json"
+        )
+        index_rel = f"{component}/{index_file}"
+        index_path = os.path.join(component_dir, index_file)
         if not _is_nonempty_repo_file(index_path):
             missing.append(index_rel)
             continue

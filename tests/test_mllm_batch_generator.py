@@ -1718,14 +1718,14 @@ def test_preprocess_request_derives_stable_content_key(monkeypatch):
     different key. This exercises the real request path (not a manually
     supplied key)."""
     pytest.importorskip("mlx_vlm.vision_cache")
-    import mlx_vlm.utils as _vlm_utils
+    import rapid_mlx.models.mlx_vlm_vendored.inputs as _vlm_inputs
 
     # Stub only the heavy processor call — we test key derivation, not
     # tokenization. ``_preprocess_request`` imports it as
-    # ``from mlx_vlm.utils import prepare_inputs`` at call time, so patching
-    # the module attribute takes effect.
+    # ``from rapid_mlx.models.mlx_vlm_vendored.inputs import prepare_inputs``
+    # at call time, so patching the module attribute takes effect.
     monkeypatch.setattr(
-        _vlm_utils,
+        _vlm_inputs,
         "prepare_inputs",
         lambda *a, **k: {
             "input_ids": mx.array([1, 2, 3]),
@@ -1761,10 +1761,10 @@ def test_preprocess_request_derives_stable_content_key(monkeypatch):
 def test_preprocess_request_no_key_for_unsupported_model(monkeypatch):
     """An unsupported model leaves ``vision_feature_key`` None (the key is only
     computed when the feature is actually wired in)."""
-    import mlx_vlm.utils as _vlm_utils
+    import rapid_mlx.models.mlx_vlm_vendored.inputs as _vlm_inputs
 
     monkeypatch.setattr(
-        _vlm_utils,
+        _vlm_inputs,
         "prepare_inputs",
         lambda *a, **k: {
             "input_ids": mx.array([1, 2, 3]),
@@ -2045,7 +2045,7 @@ def test_exact_prefix_cache_short_prompt_counts_miss_without_lookup():
 
 
 def test_generator_enables_exact_apc_from_pinned_runtime(monkeypatch):
-    from mlx_vlm import apc
+    from rapid_mlx.models.mlx_vlm_vendored import apc
 
     manager = _ExactPrefixCache()
     seen_overrides = None
@@ -2075,7 +2075,7 @@ def test_generator_enables_exact_apc_from_pinned_runtime(monkeypatch):
 
 
 def test_generator_preserves_explicit_apc_disk_setting(monkeypatch):
-    from mlx_vlm import apc
+    from rapid_mlx.models.mlx_vlm_vendored import apc
 
     manager = _ExactPrefixCache()
     seen_overrides = None
@@ -2099,7 +2099,7 @@ def test_generator_preserves_explicit_apc_disk_setting(monkeypatch):
 
 
 def test_generator_keeps_mllm_available_when_exact_apc_init_fails(monkeypatch):
-    from mlx_vlm import apc
+    from rapid_mlx.models.mlx_vlm_vendored import apc
 
     monkeypatch.setattr(
         apc,
@@ -2312,9 +2312,10 @@ def test_scheduler_prefix_cache_clear_rejects_active_requests():
 
 
 def _make_real_apc_generator(monkeypatch, *, entries: int | None = None):
-    """A bare generator wired to a real mlx-vlm ``APCManager`` in exact mode
+    """A bare generator wired to the vendored ``APCManager`` in exact mode
     (no disk, no block pool), the way ``__init__`` builds it."""
-    apc = pytest.importorskip("mlx_vlm.apc")
+    from rapid_mlx.models.mlx_vlm_vendored import apc
+
     if entries is None:
         monkeypatch.delenv("APC_EXACT_CACHE_ENTRIES", raising=False)
     else:
@@ -2498,8 +2499,8 @@ def test_exact_cache_capacity_stays_at_mlx_vlm_default_without_a_byte_budget(
     failed budget computation keeps mlx-vlm's own capacity (unless the
     operator asked for a count explicitly)."""
     from rapid_mlx import memory_cache
+    from rapid_mlx.models.mlx_vlm_vendored import apc
 
-    apc = pytest.importorskip("mlx_vlm.apc")
     default = apc.from_env(
         overrides={"enabled": True, "num_blocks": 0, "disk_enabled": False}
     )._exact_cache_max
@@ -2693,7 +2694,7 @@ def test_exact_prefix_snap_scans_whole_prefix_and_honours_min_position(monkeypat
 
 
 def test_exact_prefix_snap_refuses_when_rewind_or_clone_fails(monkeypatch):
-    import mlx_vlm.apc_adapters as adapters
+    import rapid_mlx.models.mlx_vlm_vendored.apc_adapters as adapters
 
     gen = _make_real_apc_generator(monkeypatch)
     cache = gen._prefix_cache
@@ -2711,9 +2712,28 @@ def test_exact_prefix_snap_refuses_when_rewind_or_clone_fails(monkeypatch):
     assert gen._snap_exact_text_prefix(cache, full_ids, 17, min_position=0) is None
 
 
+def test_exact_prefix_snap_uses_cache_owned_clone_without_upstream_apc(monkeypatch):
+    """mlx-vlm 0.7.2 cache-owned snapshots remove the lazy APC helper."""
+    import builtins
+
+    gen = _make_real_apc_generator(monkeypatch)
+    cache = gen._prefix_cache
+    _store_entry_with_checkpoints(gen, list(range(100)), [40, 80])
+    full_ids = list(range(90)) + [999] * 10
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "mlx_vlm.apc":
+            raise ModuleNotFoundError(name=name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    assert gen._snap_exact_text_prefix(cache, full_ids, 17, min_position=0) is not None
+
+
 def test_exact_prefix_snap_promotes_only_a_snapshot_that_served(monkeypatch):
     """LRU order must not move for a candidate whose rewind or clone failed."""
-    import mlx_vlm.apc_adapters as adapters
+    import rapid_mlx.models.mlx_vlm_vendored.apc_adapters as adapters
 
     gen = _make_real_apc_generator(monkeypatch)
     cache = gen._prefix_cache

@@ -44,6 +44,11 @@ from ..config import get_config
 from ..engine import BaseEngine
 from ..middleware.auth import check_rate_limit_or_x_api_key, verify_api_key_or_x_api_key
 from ..reasoning import finalize_streaming_compat
+from ..request import (
+    is_batch_cap_error,
+    is_chat_template_error,
+    is_media_input_error,
+)
 from ..service.helpers import (
     _TOOL_USE_REQUIRED_SUFFIX,
     SSE_RESPONSE_HEADERS,
@@ -70,11 +75,13 @@ from ..service.helpers import (
     _wait_with_disconnect,
     build_extended_sampling_kwargs,
     count_prompt_tokens,
+    enforce_context_length,
     enforce_context_length_for_messages,
     ensure_engine_ready,
     get_engine,
     maybe_auto_disable_thinking_for_casual_chat,
     maybe_auto_disable_thinking_for_tools,
+    reasoning_stop_scope_kwargs,
 )
 
 
@@ -628,6 +635,9 @@ async def create_anthropic_message(
     Translates Anthropic-format requests to OpenAI format, runs inference
     through the existing engine, and converts the response back.
     """
+    from rapid_mlx.telemetry import inference as _telemetry_inference
+
+    _caller_agent, _caller_client = _telemetry_inference.request_caller_headers(request)
     body = await request.json()
     # ``AnthropicRequest`` is constructed manually (not as a FastAPI body
     # parameter). The raw :class:`pydantic.ValidationError` it can raise
@@ -642,6 +652,11 @@ async def create_anthropic_message(
     if not (anthropic_request.model or "").startswith(("claude-", "gpt-")):
         _validate_model_name(anthropic_request.model)
     engine = get_engine(anthropic_request.model)
+    # Capture the model identity with the engine for the v2 inference event;
+    # resolving it at completion could observe a mid-request model swap.
+    from rapid_mlx.telemetry.model_id import engine_telemetry_id
+
+    _served_telemetry_id = engine_telemetry_id(engine)
     await ensure_engine_ready(engine)
 
     # Pre-flight admission gate (C4) — see routes/chat.py for rationale.
@@ -717,13 +732,40 @@ async def create_anthropic_message(
                         # at the offending block, not a generic union of
                         # everything the guard could in principle reject
                         # (codex r1 NIT).
-                        raise HTTPException(
-                            status_code=400,
-                            detail=(
-                                f"Model '{cfg_pre.model_name}' does not support "
-                                f"{_block_type} inputs."
-                            ),
+                        from rapid_mlx.telemetry.inference import (
+                            emit_capability_rejected,
+                            model_type_token,
                         )
+
+                        emit_capability_rejected(
+                            "image_input_unsupported",
+                            model_type=model_type_token(engine),
+                            model=_served_telemetry_id,
+                            caller_agent=_caller_agent,
+                            caller_client=_caller_client,
+                        )
+                        from rapid_mlx.api.utils import (
+                            image_rejection_guidance,
+                            public_model_label,
+                        )
+
+                        _detail = (
+                            f"Model '{public_model_label(cfg_pre.model_name)}' "
+                            f"does not support {_block_type} inputs."
+                        )
+                        # A vision model cannot read documents on this route
+                        # either, so only image blocks get lane guidance.
+                        _guidance = (
+                            image_rejection_guidance(
+                                getattr(engine, "serving_lane_reason", None),
+                                engine=engine,
+                            )
+                            if _block_type == "image"
+                            else None
+                        )
+                        if _guidance is not None:
+                            _detail = f"{_detail} {_guidance}"
+                        raise HTTPException(status_code=400, detail=_detail)
 
         # Convert Anthropic request -> OpenAI request. The adapter raises
         # ``AnthropicOutputConfigError`` (a ``ValueError`` subclass) on
@@ -738,7 +780,12 @@ async def create_anthropic_message(
         # the source of the H-17 leak (model class name + pydantic
         # version + attacker ``input_value`` echo).
         try:
-            openai_request = anthropic_to_openai(anthropic_request)
+            openai_request = anthropic_to_openai(
+                anthropic_request,
+                telemetry_model=_served_telemetry_id,
+                caller_agent=_caller_agent,
+                caller_client=_caller_client,
+            )
         except AnthropicOutputConfigError as e:
             raise HTTPException(status_code=400, detail=str(e))
         _apply_anthropic_thinking_defaults(openai_request)
@@ -763,6 +810,9 @@ async def create_anthropic_message(
         messages, images, videos = extract_multimodal_content(
             openai_request.messages,
             preserve_native_format=engine.preserve_native_tool_format,
+            telemetry_model=_served_telemetry_id,
+            caller_agent=_caller_agent,
+            caller_client=_caller_client,
         )
         # Dogfood C-05 / F-R2-04 / r5-B C-11 lane parity: auto-prepend the
         # canonical UI-TARS Computer-Use sysprompt on the Anthropic lane
@@ -816,7 +866,24 @@ async def create_anthropic_message(
                 openai_request.max_tokens,
                 _resolve_enable_thinking(openai_request),
             ),
+            telemetry_model=_served_telemetry_id,
+            caller_agent=_caller_agent,
+            caller_client=_caller_client,
         )
+        if _ctx_prompt_tokens is not None:
+            _clamped_max_tokens = enforce_context_length(
+                engine,
+                _ctx_prompt_tokens,
+                max_tokens=_resolve_max_tokens(
+                    openai_request.max_tokens,
+                    _resolve_enable_thinking(openai_request),
+                ),
+                telemetry_model=_served_telemetry_id,
+                caller_agent=_caller_agent,
+                caller_client=_caller_client,
+            )
+            if _clamped_max_tokens is not None:
+                openai_request.max_tokens = _clamped_max_tokens
 
         if anthropic_request.stream:
             _admission_committed = True
@@ -831,12 +898,18 @@ async def create_anthropic_message(
                     openai_request,
                     anthropic_request,
                     request_id_holder=_anth_rid_holder,
+                    served_telemetry_id=_served_telemetry_id,
                     prompt_tokens_estimate=_ctx_prompt_tokens,
                     prepared_messages=messages,
                     prepared_images=images,
                     prepared_videos=videos,
                     caller_agent=(
                         request.headers.get("user-agent")
+                        if request is not None
+                        else None
+                    ),
+                    caller_client=(
+                        request.headers.get("x-rapid-client")
                         if request is not None
                         else None
                     ),
@@ -868,6 +941,7 @@ async def create_anthropic_message(
                 _resolve_enable_thinking(openai_request),
             ),
             **_resolved_sampling_kwargs(openai_request),
+            **reasoning_stop_scope_kwargs(engine, openai_request),
         }
 
         if openai_request.tools:
@@ -909,13 +983,26 @@ async def create_anthropic_message(
         except HTTPException:
             raise
         except Exception as e:
+            from rapid_mlx.telemetry import inference as _telemetry_inference
+
+            _telemetry_inference.emit_completed_request(
+                model=_served_telemetry_id or "<custom>",
+                endpoint="/v1/messages",
+                caller_agent=(
+                    request.headers.get("user-agent") if request is not None else None
+                ),
+                caller_client=(
+                    request.headers.get("x-rapid-client")
+                    if request is not None
+                    else None
+                ),
+                result="failed",
+                error_class=_telemetry_inference.classify_inference_failure(
+                    e, abort_first=False
+                ),
+            )
             err_msg = str(e)
-            err_type = type(e).__name__
-            if (
-                "TemplateError" in err_type
-                or "template" in err_msg.lower()
-                or ("user" in err_msg.lower() and "found" in err_msg.lower())
-            ):
+            if is_chat_template_error(e):
                 raise HTTPException(
                     status_code=400, detail=f"Chat template error: {err_msg}"
                 )
@@ -926,11 +1013,7 @@ async def create_anthropic_message(
             # treats both as client errors; this route must map both to 400
             # or Anthropic-style clients get a 500 for what is really an
             # oversized-image / oversized-prompt user error.
-            if (
-                "Failed to process image" in err_msg
-                or "Failed to process video" in err_msg
-                or "exceeds the per-batch cap" in err_msg
-            ):
+            if is_media_input_error(e) or is_batch_cap_error(e):
                 raise HTTPException(status_code=400, detail=err_msg)
             raise
         if output is None:
@@ -1190,35 +1273,18 @@ async def create_anthropic_message(
             matched_stop=getattr(output, "matched_stop", None),
         )
 
-        # Opt-in telemetry (caller attribution, task C): record a bucketed
-        # ``request`` event for this completed non-streaming /v1/messages
-        # completion. ``caller_agent`` comes from the inbound User-Agent
-        # (bucketed to an allowlist in ``redact`` — never stored raw); every
-        # perf number is bucketed. ``emit.request`` is sampled +
-        # ``is_enabled()``-gated + ``@_safe``, so this is a cheap no-op when
-        # telemetry is off / not sampled and can never affect the response.
-        # TTFT == total latency here (a non-streaming response is delivered
-        # in one shot); the streaming path reports true TTFT.
-        from rapid_mlx.telemetry import emit as _telemetry_emit
-
-        _telemetry_emit.request(
-            endpoint="/v1/messages",
-            model_alias=anthropic_request.model,
-            stream=False,
-            tool_call_used=bool(tool_calls),
-            prompt_tokens=output.prompt_tokens,
-            completion_tokens=output.completion_tokens,
-            ttft_ms=elapsed * 1000.0,
-            tps=tokens_per_sec,
-            status=200,
-            caller_agent=(
-                request.headers.get("user-agent") if request is not None else None
-            ),
-        )
-        return Response(
+        response = Response(
             content=anthropic_response.model_dump_json(exclude_none=True),
             media_type="application/json",
         )
+        _telemetry_inference.emit_completed_request(
+            model=_served_telemetry_id or "<custom>",
+            endpoint="/v1/messages",
+            caller_agent=_caller_agent,
+            caller_client=_caller_client,
+            result="ok",
+        )
+        return response
     except asyncio.CancelledError as exc:
         _raise_lifecycle_cancel_or_reraise(engine, exc)
     finally:
@@ -1347,6 +1413,11 @@ async def count_anthropic_tokens(request: Request):
 
     engine = get_engine()
     await ensure_engine_ready(engine)
+    from rapid_mlx.telemetry import inference as _telemetry_inference
+    from rapid_mlx.telemetry.model_id import engine_telemetry_id
+
+    _caller_agent, _caller_client = _telemetry_inference.request_caller_headers(request)
+    _served_telemetry_id = engine_telemetry_id(engine)
 
     # F12: count_tokens must apply the SAME chat template + tools
     # rendering that ``/v1/messages`` applies before tokenizing,
@@ -1403,7 +1474,12 @@ async def count_anthropic_tokens(request: Request):
     # propagates as a 500, which is the right shape for a server-side
     # regression (better than a silent fallback to legacy counting).
     try:
-        openai_request = anthropic_to_openai(anthropic_request)
+        openai_request = anthropic_to_openai(
+            anthropic_request,
+            telemetry_model=_served_telemetry_id,
+            caller_agent=_caller_agent,
+            caller_client=_caller_client,
+        )
     except AnthropicOutputConfigError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     _apply_anthropic_thinking_defaults(openai_request)
@@ -1419,6 +1495,9 @@ async def count_anthropic_tokens(request: Request):
             preserve_native_format=getattr(
                 engine, "preserve_native_tool_format", False
             ),
+            telemetry_model=_served_telemetry_id,
+            caller_agent=_caller_agent,
+            caller_client=_caller_client,
         )
     except Exception:
         _ctx_messages = None
@@ -1612,6 +1691,8 @@ async def _stream_anthropic_messages(
     prepared_images: list | None = None,
     prepared_videos: list | None = None,
     caller_agent: str | None = None,
+    caller_client: str | None = None,
+    served_telemetry_id: str | None = None,
 ) -> AsyncIterator[str]:
     """Stream Anthropic Messages API SSE events.
 
@@ -1648,16 +1729,9 @@ async def _stream_anthropic_messages(
             Pre-r5 the streaming helper discarded these to ``[]``
             when ``prepared_messages`` was supplied, silently
             dropping every multimodal stream's media inputs.
-        caller_agent: inbound HTTP ``User-Agent`` from the route request,
-            passed straight to ``emit.request`` (bucketed to an allowlist
-            in ``redact`` — never stored raw). Task C caller attribution.
     """
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     start_time = time.perf_counter()
-    # First client-visible output timestamp so the task-C streaming emit can
-    # report true TTFT. Raw engine deltas may be held or suppressed by the
-    # reasoning/tool routers, so this is latched only at an SSE output yield.
-    _first_token_ts: float | None = None
 
     if prepared_messages is not None:
         # Caller (the route entry-point) already extracted +
@@ -1689,6 +1763,7 @@ async def _stream_anthropic_messages(
             _resolve_enable_thinking(openai_request),
         ),
         **_resolved_sampling_kwargs(openai_request),
+        **reasoning_stop_scope_kwargs(engine, openai_request),
     }
     # C-01: thread the request_id holder to the engine so disconnect
     # detection can force-call scheduler.abort_request.
@@ -1962,11 +2037,6 @@ async def _stream_anthropic_messages(
     )
     pre_filter_buffer: list[str] = []
 
-    def _latch_first_visible_output() -> None:
-        nonlocal _first_token_ts
-        if _first_token_ts is None:
-            _first_token_ts = time.perf_counter()
-
     def _capture(event: str) -> str | None:
         """Either buffer ``event`` and return ``None``, or return
         ``event`` unchanged.
@@ -1981,20 +2051,10 @@ async def _stream_anthropic_messages(
         don't allow ``yield from`` against a sync generator helper,
         so this returns a scalar rather than an iterator.
 
-        Content-block start/delta events are client-visible output. Their TTFT
-        timestamp is taken only when the event actually reaches the wire;
-        buffered forced-tool events therefore latch during replay, not while
-        the model is still being validated. Keeping this classification here
-        prevents individual yield sites from accidentally forgetting the
-        telemetry latch when a new streaming branch is added.
         """
         if _buffer_for_pinned_tool:
             pre_filter_buffer.append(event)
             return None
-        if event.startswith(
-            ("event: content_block_start", "event: content_block_delta")
-        ):
-            _latch_first_visible_output()
         return event
 
     accumulated_text = ""
@@ -2218,7 +2278,16 @@ async def _stream_anthropic_messages(
         _reasoning_cap_hit = True
         return text[:keep_chars], text[keep_chars:]
 
-    async for output in engine.stream_chat(messages=messages, **chat_kwargs):
+    from rapid_mlx.telemetry import inference as _telemetry_inference
+
+    _generation_stream = _telemetry_inference.emit_failed_on_stream_error(
+        engine.stream_chat(messages=messages, **chat_kwargs),
+        model=served_telemetry_id or "<custom>",
+        endpoint="/v1/messages",
+        caller_agent=caller_agent,
+        caller_client=caller_client,
+    )
+    async for output in _generation_stream:
         delta_text = output.new_text
 
         if hasattr(output, "prompt_tokens") and output.prompt_tokens:
@@ -2976,10 +3045,6 @@ async def _stream_anthropic_messages(
         tool_choice_error or tool_validation_error or synthesized_pinned_call
     ):
         for buffered_event in pre_filter_buffer:
-            if buffered_event.startswith(
-                ("event: content_block_start", "event: content_block_delta")
-            ):
-                _latch_first_visible_output()
             yield buffered_event
         pre_filter_buffer.clear()
 
@@ -3065,7 +3130,6 @@ async def _stream_anthropic_messages(
                     "input": {},
                 },
             }
-            _latch_first_visible_output()
             yield f"event: content_block_start\ndata: {json.dumps(tool_block_start)}\n\n"
             # R-07 tracking: tool_use blocks count as content_blocks
             # for the malformed-message guard below.
@@ -3211,40 +3275,12 @@ async def _stream_anthropic_messages(
 
     yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
 
-    # Opt-in telemetry (caller attribution, task C): record a bucketed
-    # ``request`` event for this completed /v1/messages stream. Fired only
-    # AFTER the terminal ``message_stop`` marker is yielded + the generator
-    # resumes cleanly — matching the chat lane's documented emit-after-
-    # terminal-marker placement. A stream the client cancels or that raises
-    # while delivering that final marker raises out before this line and is
-    # deliberately NOT counted (under-counting is conservative; emitting
-    # before ``message_stop`` would record a false status-200 success).
-    # ``caller_agent`` is the inbound User-Agent bucketed to an allowlist in
-    # ``redact`` (never stored raw); ``ttft_ms`` is true first-token latency.
-    # ``emit.request`` is sampled + ``is_enabled()``-gated + ``@_safe``, so
-    # this is a cheap no-op when telemetry is off / not sampled.
-    if _first_token_ts is not None:
-        _ttft_seconds = max(0.0, _first_token_ts - start_time)
-    else:
-        _ttft_seconds = elapsed
-    _decode_seconds = elapsed - _ttft_seconds
-    _decode_tps = (
-        completion_tokens / _decode_seconds if _decode_seconds > 0 else tokens_per_sec
-    )
-    from rapid_mlx.telemetry import emit as _telemetry_emit
+    from rapid_mlx.telemetry import inference as _telemetry_inference
 
-    _telemetry_emit.request(
+    _telemetry_inference.emit_completed_request(
+        model=served_telemetry_id or "<custom>",
         endpoint="/v1/messages",
-        model_alias=anthropic_request.model,
-        stream=True,
-        tool_call_used=bool(tool_calls),
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        # TTFT == true first-token latency when a text token was produced;
-        # on a stream with no text delta (tool-only / empty completion) fall
-        # back to total stream time rather than reporting a false 0.0ms.
-        ttft_ms=_ttft_seconds * 1000.0,
-        tps=_decode_tps,
-        status=200,
         caller_agent=caller_agent,
+        caller_client=caller_client,
+        result="ok",
     )

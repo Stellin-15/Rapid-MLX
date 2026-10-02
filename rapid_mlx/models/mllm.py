@@ -29,6 +29,7 @@ import stat
 import sys
 import tempfile
 import threading
+import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import Enum
@@ -42,6 +43,7 @@ from requests.adapters import HTTPAdapter
 
 from rapid_mlx.mllm_cache import MLLMPrefixCacheManager
 from rapid_mlx.model_metadata import MULTIMODAL_TENSOR_PREFIXES
+from rapid_mlx.runtime.optional_runtime import OptionalRuntimeStatus
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +155,7 @@ def _all_missing_are_multimodal(missing_names: list[str]) -> bool:
 # The bare-mlx-vlm line is pinned to the same validated runtime as the
 # ``rapid-mlx[vision]`` extra. Keeping both recovery paths aligned avoids
 # resolver-dependent behavior between direct installs and the packaged app.
-VALIDATED_MLX_VLM_VERSION = "0.7.1"
+VALIDATED_MLX_VLM_VERSION = "0.7.2"
 
 
 def _managed_desktop_runtime_kind() -> str | None:
@@ -216,17 +218,26 @@ def _managed_desktop_runtime_root() -> Path:
     return Path(sys.executable).resolve().parents[2]
 
 
-def _vision_install_hint() -> str:
+def _vision_install_hint(
+    *, include_paths: bool = True, status: OptionalRuntimeStatus = "absent"
+) -> str:
     """Return a repair path that cannot accidentally target another Python.
 
     A signed Desktop runtime is immutable product state: mutating it with pip
     invalidates the tested dependency set (and can invalidate a bundle seal).
     Standalone environments use the active interpreter explicitly so a
     two-venv installation cannot repair the wrong environment.
+
+    ``include_paths=False`` keeps the same wording with every filesystem path
+    replaced by a generic name, for text sent to HTTP clients.
     """
     managed_kind = _managed_desktop_runtime_kind()
     if managed_kind == "runtime-override":
-        runtime_root = _managed_desktop_runtime_root()
+        runtime_root = (
+            _managed_desktop_runtime_root()
+            if include_paths
+            else "the Desktop runtime-override folder"
+        )
         return (
             "Install the current Rapid-MLX Desktop.app first (its DMG ships a "
             "validated sidecar), then remove "
@@ -239,14 +250,10 @@ def _vision_install_hint() -> str:
             "Reinstall Rapid-MLX Desktop.app to restore its validated vision "
             "runtime. Do not pip-install into the code-signed bundled sidecar."
         )
-    python = shlex.quote(sys.executable)
-    return (
-        "Install the validated vision stack into this runtime with:\n"
-        f"    {python} -m pip install --upgrade --force-reinstall "
-        "'rapid-mlx[vision]'\n"
-        "or repair mlx-vlm directly (pinned to Rapid-MLX's validated set):\n"
-        f"    {python} -m pip install --upgrade --force-reinstall "
-        f"'mlx-vlm=={VALIDATED_MLX_VLM_VERSION}'"
+    from rapid_mlx.runtime.optional_runtime import optional_extra_install_hint
+
+    return optional_extra_install_hint(
+        "vision", include_paths=include_paths, status=status
     )
 
 
@@ -399,7 +406,7 @@ def _vlm_broken_install_hint(detail: str | None) -> str:
         pip_name = _pip_name_for_module(detail)
         hint = (
             f"`mlx-vlm` is installed but its dependency {detail!r} is not, so "
-            f"the vision runtime cannot load. {_vision_install_hint()}"
+            f"the vision runtime cannot load. {_vision_install_hint(status='broken')}"
         )
         if _managed_desktop_runtime():
             return hint
@@ -410,7 +417,7 @@ def _vlm_broken_install_hint(detail: str | None) -> str:
     suffix = f" ({detail})" if detail else ""
     return (
         f"`mlx-vlm` is installed but its import chain is broken, so the "
-        f"vision runtime cannot load{suffix}. {_vision_install_hint()}"
+        f"vision runtime cannot load{suffix}. {_vision_install_hint(status='broken')}"
     )
 
 
@@ -460,40 +467,56 @@ def require_mlx_vlm_or_exit(model_name: str, *, text_diffusion: bool = False) ->
     status, detail = vision_runtime_status()
     if status is VisionRuntimeStatus.OK:
         return
+    from rapid_mlx.runtime.optional_runtime import (
+        OptionalRuntimeMissing,
+        OptionalRuntimeStatus,
+    )
+
+    runtime_status: OptionalRuntimeStatus
     if status is VisionRuntimeStatus.INCOMPATIBLE:
-        print(
+        message = (
             f"error: model {model_name!r} requires the Rapid-MLX vision lane, "
             f"but mlx-vlm {detail!r} is incompatible; this release validates "
             f"exactly {VALIDATED_MLX_VLM_VERSION}. This is a vision-runtime "
             f"compatibility error, not a Metal out-of-memory error.\n"
-            + _vision_install_hint(),
-            file=sys.stderr,
+            + _vision_install_hint()
         )
+        marker_reason = "runtime_incompatible"
+        runtime_status = "incompatible"
     elif status is VisionRuntimeStatus.BROKEN:
-        print(
+        message = (
             f"error: model {model_name!r} is a vision/multimodal alias, but "
-            f"the vision runtime cannot load.\n" + _vlm_broken_install_hint(detail),
-            file=sys.stderr,
+            f"the vision runtime cannot load.\n" + _vlm_broken_install_hint(detail)
         )
+        marker_reason = "runtime_broken"
+        runtime_status = "broken"
     elif text_diffusion:
-        print(
+        message = (
             f"error: model {model_name!r} is a text-diffusion alias and runs "
             f"on the mlx-vlm DiffusionGemma runtime, which requires the "
             f"optional `mlx-vlm` dependency (shipped with the [vision] "
-            f"extra).\n" + VLM_EXTRA_INSTALL_HINT,
-            file=sys.stderr,
+            f"extra).\n" + VLM_EXTRA_INSTALL_HINT
         )
+        marker_reason = "runtime_extra_missing"
+        runtime_status = "absent"
     else:
-        print(
+        message = (
             f"error: model {model_name!r} is a vision/multimodal alias and "
             f"requires the optional `mlx-vlm` dependency (shipped with the "
             f"[vision] extra).\n" + VLM_EXTRA_INSTALL_HINT + "\n"
             "Or, if this checkpoint has a text-capable backbone and you only "
             "need text output, `--no-mllm` boots the text-only lane straight "
-            "from the base wheel (no mlx-vlm, drops image/vision input).",
-            file=sys.stderr,
+            "from the base wheel (no mlx-vlm, drops image/vision input)."
         )
-    sys.exit(2)
+        marker_reason = "runtime_extra_missing"
+        runtime_status = "absent"
+    raise OptionalRuntimeMissing(
+        extra="vision",
+        install_hint=_vision_install_hint(status=runtime_status),
+        detail=message,
+        status=runtime_status,
+        marker_reason=marker_reason,
+    )
 
 
 def _require_mlx_vlm(model_name: str | None = None) -> None:
@@ -512,22 +535,40 @@ def _require_mlx_vlm(model_name: str | None = None) -> None:
     status, detail = vision_runtime_status()
     if status is VisionRuntimeStatus.OK:
         return
+    from rapid_mlx.runtime.optional_runtime import OptionalRuntimeMissing
+
     model_context = f" for model {model_name!r}" if model_name else ""
     if status is VisionRuntimeStatus.INCOMPATIBLE:
-        raise ImportError(
-            f"Vision/multimodal runtime{model_context} is incompatible: "
-            f"installed mlx-vlm {detail!r}, validated version "
-            f"{VALIDATED_MLX_VLM_VERSION}. This is not a Metal "
-            "out-of-memory error.\n" + _vision_install_hint()
+        raise OptionalRuntimeMissing(
+            extra="vision",
+            install_hint=_vision_install_hint(),
+            status="incompatible",
+            detail=(
+                f"Vision/multimodal runtime{model_context} is incompatible: "
+                f"installed mlx-vlm {detail!r}, validated version "
+                f"{VALIDATED_MLX_VLM_VERSION}. This is not a Metal "
+                "out-of-memory error.\n" + _vision_install_hint()
+            ),
         )
     if status is VisionRuntimeStatus.BROKEN:
-        raise ImportError(
-            f"Vision/multimodal models{model_context} cannot load the vision "
-            "runtime.\n" + _vlm_broken_install_hint(detail)
+        broken_hint = _vlm_broken_install_hint(detail)
+        raise OptionalRuntimeMissing(
+            extra="vision",
+            install_hint=broken_hint,
+            status="broken",
+            detail=(
+                f"Vision/multimodal models{model_context} cannot load the vision "
+                "runtime.\n" + broken_hint
+            ),
         )
-    raise ImportError(
-        f"Vision/multimodal models{model_context} require the optional `mlx-vlm` "
-        "dependency.\n" + VLM_EXTRA_INSTALL_HINT
+    raise OptionalRuntimeMissing(
+        extra="vision",
+        install_hint=VLM_EXTRA_INSTALL_HINT,
+        status="absent",
+        detail=(
+            f"Vision/multimodal models{model_context} require the optional `mlx-vlm` "
+            "dependency.\n" + VLM_EXTRA_INSTALL_HINT
+        ),
     )
 
 
@@ -1486,6 +1527,38 @@ def save_frames_to_temp(frames: list[np.ndarray]) -> list[str]:
     return paths
 
 
+def _warn_legacy_generation(
+    model: "MLXMultimodalLM", method: str, stacklevel: int = 3
+) -> None:
+    """Flag the legacy mlx-vlm generation surface, once per model instance.
+
+    These methods ride mlx-vlm's ``generate``/``stream_generate`` runtime.
+    The serving path (BatchedEngine → MLLMScheduler → MLLMBatchGenerator)
+    loads models through this class but generates exclusively on the native
+    serialized lane, so the only remaining callers are direct embedders and
+    scripts. Deprecated with a full minor release of notice before removal.
+
+    Convenience wrappers (``describe_image`` etc.) warn at their own frame
+    before delegating; the per-instance dedupe keeps that delegation from
+    warning a second time.
+    """
+    with model._legacy_generation_warning_lock:
+        if model._legacy_generation_warned:
+            return
+        warnings.warn(
+            f"MLXMultimodalLM.{method}() uses mlx-vlm's legacy generation "
+            "runtime and is deprecated. Serve vision models through the native "
+            "BatchedEngine lane (rapid_mlx.server), which does not use this "
+            "path. The method will be removed in an upcoming release.",
+            DeprecationWarning,
+            stacklevel=stacklevel,
+        )
+        # Mark the notice consumed only after ``warnings.warn`` returns.  A
+        # caller may promote DeprecationWarning to an exception; in that mode
+        # generation never starts, and a later retry still deserves the notice.
+        model._legacy_generation_warned = True
+
+
 class MLXMultimodalLM:
     """
     Wrapper around mlx-vlm for multimodal inference.
@@ -1539,6 +1612,10 @@ class MLXMultimodalLM:
         self.config = None
         self._loaded = False
         self._video_native = False
+        # Warned about the deprecated legacy generation surface yet? The
+        # warning fires once per instance (see _warn_legacy_generation).
+        self._legacy_generation_warned = False
+        self._legacy_generation_warning_lock = threading.Lock()
 
         # Initialize MLLM prefix cache manager (with vision embedding caching)
         self._cache_manager: MLLMPrefixCacheManager | None = None
@@ -1666,9 +1743,11 @@ class MLXMultimodalLM:
                 logger.info("Native video pipeline enabled (temporal 3D conv + M-RoPE)")
 
         except ImportError:
+            from rapid_mlx.runtime.optional_runtime import optional_extra_install_hint
+
             raise ImportError(
                 "Vision dependencies are required for multimodal inference. "
-                "Install with: pip install 'rapid-mlx[vision]'"
+                + optional_extra_install_hint("vision")
             )
         except ValueError as e:
             # mlx's strict `load_weights` raises `ValueError: Missing N
@@ -2125,7 +2204,12 @@ class MLXMultimodalLM:
 
             # With base64 video
             output = model.generate("Describe", videos=["data:video/mp4;base64,AAAA..."])
+
+        Deprecated:
+            Rides mlx-vlm's legacy generation runtime. Serve vision models
+            through the native BatchedEngine lane instead.
         """
+        _warn_legacy_generation(self, "generate")
         if not self._loaded:
             self.load()
 
@@ -2260,7 +2344,12 @@ class MLXMultimodalLM:
 
         Yields:
             Generated text chunks
+
+        Deprecated:
+            Rides mlx-vlm's legacy generation runtime. Serve vision models
+            through the native BatchedEngine lane instead.
         """
+        _warn_legacy_generation(self, "stream_generate")
         if not self._loaded:
             self.load()
 
@@ -2340,7 +2429,12 @@ class MLXMultimodalLM:
 
         Returns:
             MLLMOutput with assistant's response
+
+        Deprecated:
+            Rides mlx-vlm's legacy generation runtime. Serve vision models
+            through the native BatchedEngine lane instead.
         """
+        _warn_legacy_generation(self, "chat")
         if not self._loaded:
             self.load()
 
@@ -2728,7 +2822,12 @@ class MLXMultimodalLM:
 
         Yields:
             MLLMOutput with incremental text chunks
+
+        Deprecated:
+            Rides mlx-vlm's legacy generation runtime. Serve vision models
+            through the native BatchedEngine lane instead.
         """
+        _warn_legacy_generation(self, "stream_chat")
         if not self._loaded:
             self.load()
 
@@ -3035,6 +3134,7 @@ class MLXMultimodalLM:
         Returns:
             Image description text
         """
+        _warn_legacy_generation(self, "describe_image")
         output = self.generate(
             prompt=prompt,
             images=[image],
@@ -3062,6 +3162,7 @@ class MLXMultimodalLM:
         Returns:
             Answer text
         """
+        _warn_legacy_generation(self, "answer_about_image")
         output = self.generate(
             prompt=question,
             images=[image],
@@ -3102,6 +3203,7 @@ class MLXMultimodalLM:
             # OpenAI format
             model.describe_video({"url": "https://example.com/video.mp4"})
         """
+        _warn_legacy_generation(self, "describe_video")
         output = self.generate(
             prompt=prompt,
             videos=[video],

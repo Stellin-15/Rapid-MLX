@@ -266,7 +266,6 @@ def test_product_alias_pulls_pinned_target_and_mixed_sidecar(monkeypatch):
         "huggingface_hub.snapshot_download", lambda *a, **k: "/snapshot"
     )
     monkeypatch.setattr(artifacts, "verify_mtp_snapshot", lambda path: Path(path))
-    monkeypatch.setattr(cli, "_emit_pull_activation", lambda: None)
     monkeypatch.setattr(
         cli,
         "_check_disk_space",
@@ -1073,9 +1072,13 @@ def test_product_server_reuses_guarded_serial_boundary(monkeypatch):
         default_max_tokens=4096,
         cors_origins=[],
         uvicorn_log_level="warning",
+        default_reasoning_effort="low",
     )
 
     assert calls["app"]["backend_name"] == "DeepSeek V4.1 DSpark K4"
+    # #3714: the serve-wide default must reach the shared serial app, which
+    # writes it onto the config singleton (a missing kwarg would reset it).
+    assert calls["app"]["default_reasoning_effort"] == "low"
     assert calls["app"]["tool_call_parser"] is None
     assert calls["app"]["generation_kwargs_fn"] is generation_kwargs
     assert calls["app"]["validate_request_fn"] is validate_request
@@ -1255,7 +1258,7 @@ def test_serve_command_runs_complete_product_owned_dispatch(monkeypatch, capsys)
     from rapid_mlx import server as server_module
     from rapid_mlx.models.deepseek_v41_native import server as product_server
 
-    args = _product_serve_args()
+    args = _product_serve_args("--default-reasoning-effort", "low")
     calls = {"memory": [], "disk": [], "downloads": [], "run": []}
     monkeypatch.setattr(_version_check, "prompt_upgrade_if_available", lambda: False)
     monkeypatch.setattr(
@@ -1293,10 +1296,10 @@ def test_serve_command_runs_complete_product_owned_dispatch(monkeypatch, capsys)
     assert calls["disk"][1][1]["revision_override"] == artifacts.MTP_REVISION
     assert calls["run"][0]["default_max_tokens"] == 4096
     assert calls["run"][0]["served_model_name"] == "deepseek-v41-flash-reap-2bit"
+    assert calls["run"][0]["default_reasoning_effort"] == "low"
     assert "dspark-k4: experimental single-user" in capsys.readouterr().out
 
 
-@pytest.mark.requires_mlx
 @pytest.mark.parametrize(
     ("extra", "message"),
     [
@@ -1306,8 +1309,10 @@ def test_serve_command_runs_complete_product_owned_dispatch(monkeypatch, capsys)
 )
 def test_serve_command_rejects_product_limits(monkeypatch, capsys, extra, message):
     from rapid_mlx import _version_check
+    from rapid_mlx.telemetry import inference
 
     args = _product_serve_args(*extra)
+    telemetry_calls = []
     monkeypatch.setattr(_version_check, "prompt_upgrade_if_available", lambda: False)
     monkeypatch.setattr(
         _version_check, "print_staleness_warning_if_any", lambda **_kwargs: None
@@ -1317,8 +1322,17 @@ def test_serve_command_rejects_product_limits(monkeypatch, capsys, extra, messag
     monkeypatch.setattr(cli, "_check_disk_space", lambda *_a, **_k: None)
     monkeypatch.setattr(artifacts, "download_target_snapshot", lambda: None)
     monkeypatch.setattr(artifacts, "download_mtp_snapshot", lambda: None)
+    monkeypatch.setattr(
+        inference,
+        "emit_capability_rejected",
+        lambda capability, *, model_type="other", **_context: telemetry_calls.append(
+            (capability, model_type)
+        ),
+    )
 
     with pytest.raises(SystemExit) as exc:
         cli.serve_command(args)
     assert exc.value.code == 2
     assert message in capsys.readouterr().err
+    expected = [("mcp_unsupported", "llm")] if extra[0] == "--mcp-config" else []
+    assert telemetry_calls == expected

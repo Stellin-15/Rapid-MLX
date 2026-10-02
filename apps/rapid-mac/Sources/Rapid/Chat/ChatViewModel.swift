@@ -1750,7 +1750,16 @@ final class ChatViewModel {
             event: .abandoned,
             epoch: conversationEpoch
         )
-        let message = "Couldn't start \(alias). Try again, or pick a different model in the box below."
+        let genericMessage = "Couldn't start \(alias). Try again, or pick a different model in the box below."
+        let message: String
+        if let server,
+           let startupFailure = server.startupFailure,
+           case .crashed(let failedAlias, _) = server.state,
+           failedAlias == alias {
+            message = startupFailure.message
+        } else {
+            message = genericMessage
+        }
         if var placeholder = currentMessage(index: placeholderIndex) {
             placeholder.status = .failed
             if placeholder.content.isEmpty { placeholder.content = message }
@@ -2939,6 +2948,8 @@ final class ChatViewModel {
                     topP: resolved.topP,
                     maxTokens: resolved.maxTokens,
                     repetitionPenalty: resolved.repetitionPenalty,
+                    repetitionPenaltyIsImplicitDefault:
+                        resolved.repetitionPenaltyIsImplicitDefault,
                     tools: definitions.isEmpty ? nil : definitions,
                     enableThinking: resolved.enableThinking,
                     supportsImageInput: supportsImageInput
@@ -4006,7 +4017,11 @@ Your previous draft refused the question by claiming you lack real-time access o
                                 messages: self.messages,
                                 placeholderIndex: placeholderIndex
                             ),
-                            promptHadAttachment: wireCarriesAttachmentGrounding
+                            promptHadAttachment: wireCarriesAttachmentGrounding,
+                            // The roster this REQUEST carried, read off the
+                            // encoded array — a tool the user disabled, or one
+                            // the budget withheld, was not "available".
+                            advertisedToolNames: request.tools?.map(\.function.name)
                         )
                         // Issue #513 (defense-in-depth, layer 3): when
                         // the request offered tools but the model emitted
