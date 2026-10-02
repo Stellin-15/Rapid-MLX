@@ -23,6 +23,7 @@ summary statistics, and limitations.
 - [Stable Diffusion 3.5 Large Server and Desktop-path dogfood](2026-09-05-sd35-large-dogfood.md)
 - [SDXL Base Server and Desktop-path dogfood](2026-09-05-sdxl-base-dogfood.md)
 - [Qwen4 fp32-input fast RMSNorm qualification](2026-09-06-qwen4-fast-rmsnorm.md)
+- [Qwen3.8 27B MTP FP16 checkpoint qualification](2026-09-07-qwen38-mtp-fp16.md)
 - [Qwen3.8 MTP GDN verify fusion](2026-09-07-qwen38-mtp-gdn-verify.md)
 - [NeoHorse 1 9B Chat qualification](2026-09-08-neohorse-9b-chat-qualification.md)
 - [Qwen3.8 27B Abliterated qualification](2026-09-09-qwen38-27b-abliterated-qualification.md)
