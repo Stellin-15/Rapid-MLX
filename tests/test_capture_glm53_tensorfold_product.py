@@ -725,7 +725,7 @@ def _write_shutdown_server(path: Path) -> None:
             import argparse
             import signal
             import sys
-            from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+            from http.server import BaseHTTPRequestHandler, HTTPServer
 
             parser = argparse.ArgumentParser()
             parser.add_argument("--port", type=int, required=True)
@@ -740,7 +740,12 @@ def _write_shutdown_server(path: Path) -> None:
             class Handler(BaseHTTPRequestHandler):
                 def log_message(self, *_args):
                     pass
-            ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+            # Keep the shutdown fixture single-threaded. ``listener_open``
+            # creates short probe connections; worker threads from
+            # ThreadingHTTPServer can still be finalizing when the signal
+            # handler raises SystemExit, which makes CPython abort during
+            # interpreter teardown and hides the requested 0/7 exit code.
+            HTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
             """
         )
     )
