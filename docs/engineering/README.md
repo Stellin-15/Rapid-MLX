@@ -6,4 +6,5 @@ rapid-mlx-eng team. Prefer concise, evidence-backed documents over raw agent log
 - `decisions/`: architecture and cross-cutting decisions
 - `performance/`: reproducible benchmarks and performance conclusions
 - `operations/`: runbooks, deployment behavior, and rollback procedures
+- `community/`: reusable support knowledge and community patterns
 
