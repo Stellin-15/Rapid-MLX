@@ -330,6 +330,9 @@ def test_vendored_mllm_coverage_omit_is_file_scoped() -> None:
     for guarded_path in (
         "rapid_mlx/models/mlx_vlm_vendored/future_module.py",
         "rapid_mlx/mllm_cache_compat.py",
+        "rapid_mlx/speculative/dflash/runtime.py",
+        "rapid_mlx/speculative/native_mtp/glm5_compat.py",
+        "rapid_mlx/speculative/native_mtp/runtime.py",
     ):
         assert not any(
             fnmatch.fnmatchcase(guarded_path, pattern) for pattern in omit_patterns
