@@ -31,9 +31,8 @@ own key in Settings → Tools).
 ## What we collect (telemetry)
 
 Anonymous, metadata-only usage telemetry. Starting in 0.15.0, it is **on by
-default after a one-time in-app acknowledgement notice**. This includes
-installs that turned telemetry off before 0.15.0, which are told about the
-change in that notice. A refusal recorded in 0.15.0 or later is never reversed.
+default**. This includes legacy telemetry decisions recorded before 0.15.0.
+A refusal recorded in 0.15.0 or later is never reversed.
 You can turn telemetry off in Settings → Privacy, with
 `rapid-mlx telemetry off`, or with the `RAPID_MLX_TELEMETRY=0` or
 `DO_NOT_TRACK=1` kill switch. The desktop app and its embedded `rapid-mlx`
@@ -104,6 +103,11 @@ service:
   * `~/.rapid-mlx/state/serve-failed-recent.json` keeps up to 64 recent,
     privacy-reduced serve-failure keys and their timestamps on the device for
     ten-minute duplicate suppression; the file itself is never sent.
+  * `~/.rapid-mlx/state/serve-start-recent.json` and
+    `~/.rapid-mlx/state/app-opened-recent.json` keep the same kind of
+    privacy-reduced keys and timestamps on the device so a restart loop
+    re-running `rapid-mlx serve` every few seconds cannot flood duplicate
+    `server_start_state` or `app_opened` events; both files are never sent.
   * For a failed model serve caused by a missing optional runtime, the closed
     extra name (`vision`, `video`, `audio`, or `image`) and a closed recovery
     outcome (`accepted`, `declined`, `no_answer`, `interrupted`,

@@ -586,7 +586,7 @@ multiplication. The regular `qwen3.8-27b-4bit` alias remains unchanged for M3
 and newer Macs; Rapid does not silently swap checkpoint precision.
 
 → [Full RAM tier map + serve flags per tier](https://rapidmlx.com/docs/hardware-tiers.html)
-→ [Every alias, quant, and family (197 text + 12 image + 10 video + 44 audio aliases, 263 total)](https://rapidmlx.com/docs/aliases.html) · interactive at [models.rapidmlx.com](https://models.rapidmlx.com/)
+→ [Every alias, quant, and family (198 text + 12 image + 10 video + 44 audio aliases, 264 total)](https://rapidmlx.com/docs/aliases.html) · interactive at [models.rapidmlx.com](https://models.rapidmlx.com/)
 
 ---
 
@@ -682,8 +682,8 @@ Top three things that go wrong:
 - **Show support:** [Star this repository](https://github.com/raullenchai/Rapid-MLX) to follow releases and help others discover the project.
 
 **Privacy:** Anonymous, metadata-only telemetry is on by default in 0.15.0 and
-starts after a one-time in-app acknowledgement notice. The desktop app sends
-its events to rapidmlx.com's telemetry service, while the engine sends
+is documented in Settings → Privacy. The desktop app sends its events to
+rapidmlx.com's telemetry service, while the engine sends
 privacy-hardened batches to PostHog Cloud (US). Turn it off in Settings →
 Privacy, with `rapid-mlx telemetry off`, `RAPID_MLX_TELEMETRY=0`, or
 `DO_NOT_TRACK=1`. Prompts, completions, paths, IP addresses, locations, and API

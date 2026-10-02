@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import concurrent.futures
+import inspect
 import json
 import logging
 import threading
@@ -876,7 +877,12 @@ def _build_app(
     )
     async def list_models() -> ModelsResponse:
         if model_info is not None:
-            return ModelsResponse(data=[model_info])
+            info = model_info.model_copy()
+            if cfg.context_length is not None:
+                info.max_model_len = min(
+                    cfg.context_length, info.context_window or cfg.context_length
+                )
+            return ModelsResponse(data=[info])
         return ModelsResponse(
             data=[
                 ModelInfo(
@@ -884,6 +890,7 @@ def _build_app(
                     created=int(time.time()),
                     owned_by="rapid-mlx",
                     speculative_decoding=published_speculative_info,
+                    max_model_len=cfg.context_length,
                 )
             ]
         )
@@ -928,7 +935,12 @@ def _build_app(
         if model_id != served_model_name:
             raise HTTPException(status_code=404, detail="Model not found")
         if model_info is not None:
-            return model_info
+            info = model_info.model_copy()
+            if cfg.context_length is not None:
+                info.max_model_len = min(
+                    cfg.context_length, info.context_window or cfg.context_length
+                )
+            return info
         from ...routes.models import _build_model_info
 
         info = _build_model_info(model_id)
@@ -1195,6 +1207,14 @@ def _build_app(
                 request.max_tokens
                 if request.max_tokens is not None
                 else default_max_tokens
+            )
+            from ...service.helpers import enforce_rendered_context_length
+
+            max_tokens = enforce_rendered_context_length(
+                model,
+                getattr(processor, "tokenizer", processor),
+                prompt,
+                max_tokens,
             )
             temperature = (
                 request.temperature if request.temperature is not None else 0.0
@@ -2320,9 +2340,29 @@ async def _non_stream_completion(
 
         parser_cls = get_parser(cfg.reasoning_parser_name)
         reasoning_parser = parser_cls()
+        from ...service.helpers import _should_start_in_thinking
+
+        chat_template = getattr(processor, "chat_template", None)
+        if chat_template is None:
+            chat_template = getattr(
+                getattr(processor, "tokenizer", None), "chat_template", None
+            )
+        prompt_thinking_active = _should_start_in_thinking(
+            chat_template,
+            enable_thinking,
+            unconditional=bool(
+                getattr(reasoning_parser, "implicit_reasoning_until_close", False)
+            ),
+            tools_requested=bool(request.tools),
+        )
+        extraction_kwargs: dict[str, Any] = {"enable_thinking": prompt_thinking_active}
+        if (
+            "prompt_thinking_active"
+            in inspect.signature(reasoning_parser.extract_reasoning).parameters
+        ):
+            extraction_kwargs["prompt_thinking_active"] = prompt_thinking_active
         reasoning_content, parsed_content = reasoning_parser.extract_reasoning(
-            result.text,
-            enable_thinking=enable_thinking,
+            result.text, **extraction_kwargs
         )
         if parsed_content is not None:
             content = parsed_content
