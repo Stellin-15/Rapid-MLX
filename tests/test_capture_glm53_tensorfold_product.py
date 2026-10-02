@@ -153,17 +153,23 @@ def _write_fake_server(path: Path) -> None:
                         assert "thinking_budget" not in request
                         token_ids = [11, 22, 33]
                         digest = hashlib.sha256(b"11,22,33").hexdigest()
-                        with open(os.environ["RAPID_MLX_TENSORFOLD_AUDIT_PATH"], "w") as f:
-                            f.write(json.dumps({
-                                "request_id":"rapid-private-id",
-                                "token_ids":token_ids,
-                                "token_sha256":digest,
-                            }) + "\\n")
+                        if args.scenario != "missing_audit":
+                            with open(os.environ["RAPID_MLX_TENSORFOLD_AUDIT_PATH"], "w") as f:
+                                f.write(json.dumps({
+                                    "request_id":"rapid-private-id",
+                                    "token_ids":token_ids,
+                                    "token_sha256":digest,
+                                }) + "\\n")
                     else:
                         assert request["model"] == "glm53-tf-v06"
                         assert request["thinking_budget"] == 256
                     response = {
                         "id":"chatcmpl-fixture",
+                        "object":"chat.completion",
+                        "model":(
+                            "glm5.3-flash-tensorfold"
+                            if args.mode == "product" else "glm53-tf-v06"
+                        ),
                         "choices":[{"index":0,"message":{
                             "role":"assistant",
                             "reasoning_content":"reason",
@@ -281,6 +287,7 @@ def test_production_commands_pin_alias_and_direct_settings(tmp_path: Path) -> No
     assert direct[direct.index("--mtp-drafts") + 1] == "3"
     assert direct[direct.index("--prefill-pass") + 1] == "8"
     assert direct[direct.index("--pass-cache-gib") + 1] == "16"
+    assert direct[direct.index("--snapshot-dir") + 1] == "none"
     assert "--no-update-check" in direct
 
 
@@ -431,9 +438,13 @@ def test_console_binding_requires_current_interpreter_and_distribution_metadata(
     )
     binding = capture.resolve_console_binding("rapid-mlx", "rapid-mlx")
     assert binding.executable == executable.resolve()
-    assert binding.executable_sha256 == hashlib.sha256(executable.read_bytes()).hexdigest()
+    assert (
+        binding.executable_sha256 == hashlib.sha256(executable.read_bytes()).hexdigest()
+    )
 
-    executable.write_text("#!/usr/bin/python3\nfrom rapid_mlx.cli import main\nmain()\n")
+    executable.write_text(
+        "#!/usr/bin/python3\nfrom rapid_mlx.cli import main\nmain()\n"
+    )
     with pytest.raises(capture.CaptureError, match="capture interpreter"):
         capture.resolve_console_binding("rapid-mlx", "rapid-mlx")
 
@@ -470,13 +481,27 @@ def test_child_environment_is_offline_and_drops_credential_variables(
 ) -> None:
     monkeypatch.setenv("HF_TOKEN", "private")
     monkeypatch.setenv("SOME_API_KEY", "private")
+    monkeypatch.setenv("PYTHONPATH", "/private/shadow-modules")
+    monkeypatch.setenv("PYTHONHOME", "/private/shadow-runtime")
+    monkeypatch.setenv("RAPID_MLX_TENSORFOLD_AUDIT_PATH", "/private/audit.jsonl")
+    monkeypatch.setenv("RAPID_MLX_LOG_LEVEL", "DEBUG")
+    monkeypatch.setenv("RAPID_MLX_TELEMETRY_DEBUG", "1")
+    monkeypatch.setenv("RAPID_MLX_TELEMETRY", "1")
+    monkeypatch.setenv("DO_NOT_TRACK", "0")
     monkeypatch.setenv("NORMAL_SETTING", "retained")
     environment = capture.offline_child_environment()
     assert "HF_TOKEN" not in environment
     assert "SOME_API_KEY" not in environment
+    assert "PYTHONPATH" not in environment
+    assert "PYTHONHOME" not in environment
+    assert "RAPID_MLX_TENSORFOLD_AUDIT_PATH" not in environment
+    assert "RAPID_MLX_LOG_LEVEL" not in environment
+    assert "RAPID_MLX_TELEMETRY_DEBUG" not in environment
     assert environment["NORMAL_SETTING"] == "retained"
     assert environment["HF_HUB_OFFLINE"] == "1"
     assert environment["TRANSFORMERS_OFFLINE"] == "1"
+    assert environment["RAPID_MLX_TELEMETRY"] == "0"
+    assert environment["DO_NOT_TRACK"] == "1"
 
 
 def test_comparison_uses_full_token_hash_when_both_paths_expose_ids() -> None:
@@ -535,9 +560,7 @@ def _valid_product_identity():
         (lambda _h, s, _m: s.update(model="wrong"), "identity"),
         (lambda _h, s, _m: s["profile"].update(id="wrong"), "profile"),
         (
-            lambda _h, s, _m: s["profile"]["models"]["target"].update(
-                revision="wrong"
-            ),
+            lambda _h, s, _m: s["profile"]["models"]["target"].update(revision="wrong"),
             "provenance",
         ),
         (lambda _h, s, _m: s.update(status="loading"), "readiness"),
@@ -551,9 +574,7 @@ def _valid_product_identity():
             "compatibility",
         ),
         (
-            lambda _h, s, _m: s["profile"]["models"]["target"].update(
-                ready=False
-            ),
+            lambda _h, s, _m: s["profile"]["models"]["target"].update(ready=False),
             "readiness",
         ),
     ],
@@ -585,9 +606,12 @@ def test_models_identity_rejects_wrong_model_backend_and_readiness() -> None:
             }
         ]
     }
-    assert capture.require_models_identity(
-        valid, capture.ALIAS, require_tensorfold_mtp=True
-    )["id"] == capture.ALIAS
+    assert (
+        capture.require_models_identity(
+            valid, capture.ALIAS, require_tensorfold_mtp=True
+        )["id"]
+        == capture.ALIAS
+    )
     wrong_model = json.loads(json.dumps(valid))
     wrong_model["data"][0]["id"] = "wrong"
     with pytest.raises(capture.CaptureError, match="did not expose"):
@@ -618,6 +642,8 @@ def _timing() -> object:
 def _valid_completion() -> dict:
     return {
         "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "model": capture.DIRECT_SERVED_NAME,
         "choices": [
             {
                 "index": 0,
@@ -634,6 +660,8 @@ def _valid_completion() -> dict:
     "mutation",
     [
         lambda value: value.update(choices=[]),
+        lambda value: value.update(object="wrong"),
+        lambda value: value.update(model="wrong"),
         lambda value: value.update(usage={}),
         lambda value: value["usage"].update(completion_tokens="1"),
         lambda value: value["usage"].update(total_tokens=99),
@@ -647,7 +675,23 @@ def test_response_summary_rejects_malformed_completion_and_usage(mutation) -> No
     mutation(completion)
     with pytest.raises(capture.CaptureError):
         capture.response_summary(
-            completion, _timing(), require_opaque_fingerprint=True
+            completion,
+            _timing(),
+            expected_model=capture.DIRECT_SERVED_NAME,
+            require_opaque_fingerprint=True,
+        )
+
+
+def test_response_summary_rejects_http_and_audit_token_mismatch() -> None:
+    completion = _valid_completion()
+    completion["token_ids"] = [1]
+    with pytest.raises(capture.CaptureError, match="did not match"):
+        capture.response_summary(
+            completion,
+            _timing(),
+            expected_model=capture.DIRECT_SERVED_NAME,
+            audit_tokens=([2], "test-audit"),
+            require_opaque_fingerprint=True,
         )
 
 
@@ -793,7 +837,48 @@ def test_phase_validation_failure_still_cleans_listener_and_sanitizes_raw_status
     assert manifest["status"] == "invalid"
     assert manifest["phases"]["product"]["process"]["exit_code"] == 0
     assert manifest["final_listeners_gone"] is True
-    assert "/Users/private" not in (output / "product/status.sanitized.body").read_text()
+    assert (
+        "/Users/private" not in (output / "product/status.sanitized.body").read_text()
+    )
+    capture.verify_hash_map(output)
+
+
+def test_product_phase_requires_full_token_audit_evidence(tmp_path: Path) -> None:
+    fake = tmp_path / "fake_server.py"
+    _write_fake_server(fake)
+    output = tmp_path / "missing-audit-artifacts"
+    target = tmp_path / "target"
+    target.mkdir()
+
+    def product_builder(port: int) -> list[str]:
+        return [
+            sys.executable,
+            str(fake),
+            "--mode",
+            "product",
+            "--scenario",
+            "missing_audit",
+            "--port",
+            str(port),
+        ]
+
+    with pytest.raises(capture.CaptureError, match="full-token audit evidence"):
+        capture.run_capture(
+            output,
+            target=target,
+            product_builder=product_builder,
+            direct_builder=lambda _port, _target: ["must-not-run"],
+            launch_provenance=LAUNCH_PROVENANCE,
+            source_provenance=SOURCE_PROVENANCE,
+            load_timeout=5,
+            request_timeout=5,
+            probe=_fake_probe,
+        )
+
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["status"] == "invalid"
+    assert manifest["phases"]["product"]["process"]["exit_code"] == 0
+    assert manifest["final_listeners_gone"] is True
     capture.verify_hash_map(output)
 
 

@@ -57,6 +57,12 @@ revision/readiness all match the qualified profile. Only validated projections
 of these server-derived values enter the manifest; sanitized raw bytes remain
 separate. SIGTERM, SIGHUP, and SIGINT unwind through cleanup, and forced,
 nonzero, premature, or listener-leaking shutdowns invalidate the result.
+Child environments drop Python module-path overrides and all inherited Rapid
+runtime overrides, then explicitly force offline mode and telemetry off. Only
+the product process receives its private temporary token-audit destination.
+Product completion requires the expected response object/model and full-token
+audit evidence; direct completion requires its exact served model. The direct
+argv pins `--snapshot-dir none` to prevent persistent snapshot/cache writes.
 
 ## Reference check
 
@@ -78,7 +84,7 @@ code or assets.
   wrong health/model/profile/revision/status/backend/mode/readiness, malformed
   completion/usage/token evidence, port collision, mid-phase failure, premature
   exit, nonzero exit, forced shutdown, and SIGTERM/SIGHUP process-group cleanup.
-- Focused verification currently passes 79 tests across the capture contract,
+- Focused verification currently passes 83 tests across the capture contract,
   GLM profile contract, and shared TensorFold HTTP contract, plus Ruff,
   `compileall`, diff checking, and a private-path/credential/noise scan.
 - The first test attempt used system Python 3.9 and failed during repository

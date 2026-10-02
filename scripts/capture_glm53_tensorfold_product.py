@@ -53,6 +53,11 @@ OFFLINE_ENV = {
     "TRANSFORMERS_OFFLINE": "1",
     "HF_DATASETS_OFFLINE": "1",
 }
+CHILD_ENV_OVERRIDES = {
+    **OFFLINE_ENV,
+    "RAPID_MLX_TELEMETRY": "0",
+    "DO_NOT_TRACK": "1",
+}
 TOKEN_FIELDS = ("token_ids", "output_token_ids", "generated_token_ids")
 SENSITIVE_ENV_NAME = re.compile(
     r"(?:^|_)(?:TOKEN|PASSWORD|SECRET|API_KEY)(?:$|_)", re.IGNORECASE
@@ -359,7 +364,10 @@ def resolve_console_binding(command: str, distribution_name: str) -> LaunchBindi
         shebang = shlex.split(first_line[2:])
     except ValueError as exc:
         raise CaptureError(f"{command} console script has an invalid shebang") from exc
-    if len(shebang) != 1 or Path(shebang[0]).resolve() != Path(sys.executable).resolve():
+    if (
+        len(shebang) != 1
+        or Path(shebang[0]).resolve() != Path(sys.executable).resolve()
+    ):
         raise CaptureError(
             f"{command} is not bound to the capture interpreter {Path(sys.executable).name}"
         )
@@ -633,9 +641,7 @@ def require_product_identity(
     compatibility = profile.get("compatibility")
     runtime = profile.get("runtime")
     profile_models = profile.get("models")
-    target = (
-        profile_models.get("target") if isinstance(profile_models, dict) else None
-    )
+    target = profile_models.get("target") if isinstance(profile_models, dict) else None
     if profile.get("mode") != "accelerated":
         raise CaptureError("product profile mode is not accelerated")
     if not isinstance(compatibility, dict) or (
@@ -734,9 +740,14 @@ def response_summary(
     value: dict[str, Any],
     timing: HTTPResult,
     *,
+    expected_model: str,
     audit_tokens: tuple[list[int], str] | None = None,
     require_opaque_fingerprint: bool = False,
 ) -> dict[str, Any]:
+    if value.get("object") != "chat.completion":
+        raise CaptureError("completion response object was not chat.completion")
+    if value.get("model") != expected_model:
+        raise CaptureError("completion response model identity mismatch")
     if not isinstance(value.get("id"), str) or not value["id"]:
         raise CaptureError("completion response did not contain a response ID")
     choices = value.get("choices")
@@ -770,11 +781,22 @@ def response_summary(
     for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
         item = usage_raw.get(field)
         if type(item) is not int or item < 0:
-            raise CaptureError(f"completion usage {field} was not a nonnegative integer")
+            raise CaptureError(
+                f"completion usage {field} was not a nonnegative integer"
+            )
         usage[field] = item
     if usage["total_tokens"] != usage["prompt_tokens"] + usage["completion_tokens"]:
-        raise CaptureError("completion usage total did not match prompt plus completion")
-    exposed = _find_token_ids(value) or audit_tokens
+        raise CaptureError(
+            "completion usage total did not match prompt plus completion"
+        )
+    response_tokens = _find_token_ids(value)
+    if (
+        response_tokens is not None
+        and audit_tokens is not None
+        and response_tokens[0] != audit_tokens[0]
+    ):
+        raise CaptureError("HTTP and audit token IDs did not match")
+    exposed = audit_tokens or response_tokens
     if exposed is None:
         tokens: dict[str, Any] = {
             "availability": "unavailable",
@@ -800,9 +822,10 @@ def response_summary(
         raise CaptureError("TensorFold response metadata was not an object")
     if isinstance(tensorfold, dict) and tensorfold.get("token_sha") is not None:
         fingerprint = tensorfold.get("token_sha")
-        if not isinstance(fingerprint, str) or re.fullmatch(
-            r"[0-9a-f]{12}", fingerprint
-        ) is None:
+        if (
+            not isinstance(fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{12}", fingerprint) is None
+        ):
             raise CaptureError("TensorFold opaque token fingerprint was not 12-hex")
         opaque = {
             "value": fingerprint,
@@ -949,9 +972,7 @@ def stop_server(server: ManagedServer, *, timeout: float = 120) -> dict[str, Any
         "listener_gone": gone,
     }
     if not was_running or not termination_sent:
-        raise ShutdownError(
-            f"{server.name} exited before requested shutdown", facts
-        )
+        raise ShutdownError(f"{server.name} exited before requested shutdown", facts)
     if forced:
         raise ShutdownError(f"{server.name} required a forced kill", facts)
     if server.process.returncode != 0:
@@ -1002,6 +1023,8 @@ def direct_command(executable: Path, port: int, target: Path) -> list[str]:
         "8",
         "--pass-cache-gib",
         "16",
+        "--snapshot-dir",
+        "none",
         "--port",
         str(port),
         "--no-update-check",
@@ -1084,6 +1107,13 @@ def runtime_provenance() -> dict[str, Any]:
         "tensorfold": package_provenance("tensorfold"),
         "mlx": package_provenance("mlx"),
         "offline_environment": OFFLINE_ENV,
+        "child_environment_overrides": CHILD_ENV_OVERRIDES,
+        "child_environment_removed": [
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "RAPID_MLX_* inherited values",
+            "credential-named inherited values",
+        ],
     }
 
 
@@ -1092,8 +1122,10 @@ def offline_child_environment() -> dict[str, str]:
         name: value
         for name, value in os.environ.items()
         if SENSITIVE_ENV_NAME.search(name) is None
+        and name not in {"PYTHONHOME", "PYTHONPATH"}
+        and not name.startswith("RAPID_MLX_")
     }
-    environment.update(OFFLINE_ENV)
+    environment.update(CHILD_ENV_OVERRIDES)
     return environment
 
 
@@ -1259,8 +1291,15 @@ def run_capture(
             )
             completion = parsed_json(completion_result, "product completion")
             audit_tokens = load_audit_token_ids(audit_path)
+            if audit_tokens is None:
+                raise CaptureError(
+                    "product completion omitted required full-token audit evidence"
+                )
             product_summary = response_summary(
-                completion, completion_result, audit_tokens=audit_tokens
+                completion,
+                completion_result,
+                expected_model=ALIAS,
+                audit_tokens=audit_tokens,
             )
             raw_contract["completion"] = retain_http(
                 phase_dir, "completion", completion_result, sanitizer
@@ -1302,9 +1341,7 @@ def run_capture(
                 timeout=load_timeout,
             )
             direct_models = parsed_json(direct_models_result, "direct /v1/models")
-            direct_identity = require_models_identity(
-                direct_models, DIRECT_SERVED_NAME
-            )
+            direct_identity = require_models_identity(direct_models, DIRECT_SERVED_NAME)
             drafted_result = http_request(
                 f"http://127.0.0.1:{direct_port}/v1/chat/completions",
                 origin_ns=origin_ns,
@@ -1320,11 +1357,13 @@ def run_capture(
             drafted = response_summary(
                 parsed_json(drafted_result, "direct drafted completion"),
                 drafted_result,
+                expected_model=DIRECT_SERVED_NAME,
                 require_opaque_fingerprint=True,
             )
             serial = response_summary(
                 parsed_json(serial_result, "direct serial completion"),
                 serial_result,
+                expected_model=DIRECT_SERVED_NAME,
                 require_opaque_fingerprint=True,
             )
             direct_dir = output / "direct"
