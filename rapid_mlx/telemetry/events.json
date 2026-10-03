@@ -208,12 +208,23 @@
       ]
     },
     "serve_error_class": {
-      "_about": "Closed model_serve_failed categories. local_path_missing distinguishes a user-supplied local path or required local file from Hub/download availability; no path or filename is sent. unsupported_format is the pre-download BYOM preflight refusal of a GGUF- or PyTorch-.bin-only model.",
+      "_about": [
+        "Closed model_serve_failed categories. local_path_missing distinguishes a",
+        "user-supplied local path or required local file from Hub/download",
+        "availability; no path or filename is sent. unsupported_format is the",
+        "pre-download BYOM preflight refusal of a GGUF- or PyTorch-.bin-only",
+        "model. invalid_model_ref is a",
+        "reference no Hub resolution can accept (HFValidationError), and",
+        "backend_load_failed is a typed generative-lane backend error",
+        "(WanBackendError / LTX25BackendError / VideoBackendUnavailableError)",
+        "raised while the lane engine object was being prepared."
+      ],
       "values": [
         "unsupported_architecture", "unsupported_format", "insufficient_memory",
         "corrupt_weights", "download_failed", "local_path_missing", "missing_extra",
         "invalid_config", "tokenizer_load_failed", "incompatible_weights",
-        "quantization_mismatch", "other"
+        "quantization_mismatch", "invalid_model_ref", "backend_load_failed",
+        "other"
       ]
     },
     "optional_extra": {
@@ -550,7 +561,10 @@
         "when a real allow-list exists; error_class already separates",
         "unsupported_architecture from the other failure modes. For",
         "missing_extra only, extra_recovery records the closed recovery",
-        "decision after prompting and before any installer runs."
+        "decision after prompting and before any installer runs.",
+        "failure_stage names the closed startup boundary the failure crossed",
+        "(same enum as server_start_state); it is emitted only when the caller",
+        "states it explicitly — telemetry never guesses a stage."
       ],
       "twin_of": "model_served",
       "props": {
@@ -559,6 +573,7 @@
         "auto_selected": {"kind": "bool", "required": false},
         "quant": {"kind": "enum", "enum": "quant", "required": false},
         "error_class": {"kind": "enum", "enum": "serve_error_class", "required": true},
+        "failure_stage": {"kind": "enum", "enum": "failure_stage", "required": false},
         "extra": {
           "kind": "enum",
           "enum": "optional_extra",
