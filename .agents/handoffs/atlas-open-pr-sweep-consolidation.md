@@ -1,10 +1,12 @@
 # Atlas handoff: reviewed open-PR sweep consolidation
 
-- Owner: Atlas, with Harbor owning queue and CI operation after the PR opens.
+- Owner: Atlas, with Harbor owning CI and direct merge operation after the PR
+  opens.
 - Branch/worktree: `harbor/open-pr-sweep-consolidation` in
   `/private/tmp/rapid-mlx-open-pr-sweep-consolidation`.
-- Intention: drain nine independently reviewed internal PRs through one CI and
-  merge-queue candidate while preserving every exact reviewed head in history.
+- Intention: drain nine independently reviewed internal PRs through one CI
+  candidate and one direct merge commit while preserving every exact reviewed
+  head in history.
 - Scope: PRs #3972, #3290, #3987, #3950, #3569, #3962, #3963, #3587, and
   #3973. The community-authored warning-policy PR #3988 remains separate so its
   contribution record is preserved.
@@ -29,13 +31,17 @@
 - The only CUA-named paths are two stale research documents deleted by #3963;
   no CUA implementation is added or changed.
 
-## Queue and next action
+## Final merge and next action
 
-PR #4055 put the managed merge queue into singleton mode. PR #3988 is already
-running as the current candidate. Push and open the consolidation PR without a
-queue label, let its head-bound CI finish, then authorize and enqueue that exact
-head after #3988 lands. Once the consolidation merges, close or verify automatic
-closure of the nine source PRs and leave the later feature cohort deferred.
+Do not authorize or enqueue PR #4057 through Mergify. Both configured queue
+rules squash their candidates, which would replace the consolidated commits and
+break the contract that every source PR exact head remain reachable from
+`main` so GitHub can mark those PRs as indirectly merged. After head-bound CI
+and independent review pass, Atlas or Harbor must bypass Mergify and merge PR
+#4057 directly with GitHub's **merge commit** method (never squash or rebase),
+guarded to the reviewed exact head. Then fetch `main`, verify that all nine
+source heads are ancestors, and confirm each source PR reports `merged=true`
+before closing anything manually. Leave the later feature cohort deferred.
 
 The dedicated role-messaging channel was unavailable in this shell. This file
 records the required start/completion FYI for Pixel, Vector, Harbor, Echo, and
