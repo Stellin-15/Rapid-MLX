@@ -16,7 +16,8 @@
 - Every source PR exact head is an ancestor of the consolidation head.
 - The nine source diffs have zero overlapping paths and merged without a
   conflict. The resulting source union changes 232 paths; this handoff is the
-  only consolidation-specific path.
+  consolidation adds this handoff and the singleton queue contract correction
+  required by the already-merged #4055 configuration.
 - `git diff --check` and Ruff check/format pass for all 38 changed Python files.
 - Focused Python verification passes: 84 GLM capture/contract tests; 3,729
   telemetry, memory-gate, alias, and LTX tests; and 340 drafter/runtime/CI tests
